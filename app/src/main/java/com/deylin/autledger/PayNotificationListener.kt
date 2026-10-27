@@ -70,10 +70,10 @@ class PayNotificationListener : NotificationListenerService() {
         db.close()
         if (id <= 0) return
 
-        showConfirmNotification(id, amount, merchant)
+        showConfirmNotification(id, amount, merchant, Category.of(merchant, body))
     }
 
-    private fun showConfirmNotification(id: Long, amount: Double, merchant: String) {
+    private fun showConfirmNotification(id: Long, amount: Double, merchant: String, category: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel(CHAN, "消费提醒", NotificationManager.IMPORTANCE_HIGH)
@@ -82,6 +82,7 @@ class PayNotificationListener : NotificationListenerService() {
         val intent = Intent(this, ConfirmActivity::class.java)
             .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .putExtra("id", id)
+            .putExtra("category", category)
         val pi = PendingIntent.getActivity(
             this, id.toInt(), intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -90,7 +91,7 @@ class PayNotificationListener : NotificationListenerService() {
         val n = Notification.Builder(this, CHAN)
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
             .setContentTitle("检测到消费 ¥" + String.format("%.2f", amount))
-            .setContentText("$merchant · 点击确认分类")
+            .setContentText("$merchant · 预分类：$category · 点击确认")
             .setContentIntent(pi)
             .setAutoCancel(true)
             .build()
