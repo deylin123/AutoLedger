@@ -103,6 +103,7 @@ class PageMine(private val act: MainActivity) {
         autoCard.addView(permRow("账单页抓取", "打开账单详情页时识别金额", hasAccessibility()) { act.openAccessibility() })
         autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
         autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", true) { act.openBattery() })
+        autoCard.addView(rowItem("测试弹窗", "点一下验证悬浮窗能不能弹") { testOverlay() })
         val acp = Ui.lp(Ui.MP, Ui.WC)
         acp.topMargin = Ui.dp(c, 10f)
         body.addView(autoCard, acp)
@@ -111,7 +112,7 @@ class PageMine(private val act: MainActivity) {
         val dataCard = card("数据")
         dataCard.addView(rowItem("导出账单 CSV", "") { exportCsv() })
         dataCard.addView(rowItem("抓取诊断日志", "") { showDiag() })
-        dataCard.addView(rowItem("关于", "版本 2.0", arrow = false) {})
+        dataCard.addView(rowItem("关于", "版本 " + verName(), arrow = false) {})
         val dcp = Ui.lp(Ui.MP, Ui.WC)
         dcp.topMargin = Ui.dp(c, 10f)
         body.addView(dataCard, dcp)
@@ -124,6 +125,64 @@ class PageMine(private val act: MainActivity) {
         sv.addView(body, Ui.lp(Ui.MP, Ui.WC))
         root.addView(sv, Ui.lp(Ui.MP, 0, 1f))
         return root
+    }
+
+    // ---------- 版本与弹窗自检 ----------
+
+    private fun verName(): String = try {
+        val pi = act.packageManager.getPackageInfo(act.packageName, 0)
+        val name = pi.versionName ?: "?"
+        val code = if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+        "$name (build $code)"
+    } catch (_: Exception) {
+        "未知"
+    }
+
+    /** 不依赖抓取，直接验证悬浮窗是否真的能弹出来 */
+    private fun testOverlay() {
+        if (!Settings.canDrawOverlays(act)) {
+            Toast.makeText(c, "悬浮窗权限未开启，无法弹窗", Toast.LENGTH_SHORT).show()
+            act.openOverlay()
+            return
+        }
+        try {
+            val wm = act.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+            val box = Ui.card(c, 16f, 14f)
+            box.setBackground(Ui.round(c, Ui.CARD, 18f, 1f, Ui.LINE))
+            box.addView(Ui.tv(c, "弹窗测试成功", 15f, Ui.TEXT, true), Ui.lp(Ui.WC, Ui.WC))
+            box.addView(
+                Ui.tv(c, "看到这个卡片说明悬浮窗可用，抓取后就能自动弹", 12f, Ui.SUB),
+                Ui.lp(Ui.WC, Ui.WC)
+            )
+            val holder = android.widget.FrameLayout(c)
+            holder.setPadding(Ui.dp(c, 16f), 0, Ui.dp(c, 16f), 0)
+            holder.addView(
+                box,
+                android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            val p = android.view.WindowManager.LayoutParams(
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                android.graphics.PixelFormat.TRANSLUCENT
+            )
+            p.gravity = Gravity.BOTTOM
+            p.y = Ui.dp(c, 120f)
+            wm.addView(holder, p)
+            Toast.makeText(c, "已弹出，3 秒后自动消失", Toast.LENGTH_SHORT).show()
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    wm.removeView(holder)
+                } catch (_: Exception) {
+                }
+            }, 3500)
+        } catch (e: Exception) {
+            Toast.makeText(c, "弹窗失败：" + e.javaClass.simpleName, Toast.LENGTH_LONG).show()
+        }
     }
 
     // ---------- 组件 ----------

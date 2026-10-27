@@ -23,6 +23,11 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Restore fixed keystore
+        run: |
+          base64 -d keystore.p12.b64 > keystore.p12
+          ls -l keystore.p12
+
       - name: Build APK
         run: gradle assembleDebug --no-daemon
 
