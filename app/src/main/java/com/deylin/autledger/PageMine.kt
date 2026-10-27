@@ -103,6 +103,7 @@ class PageMine(private val act: MainActivity) {
         autoCard.addView(permRow("账单页抓取", "打开账单详情页时识别金额", hasAccessibility()) { act.openAccessibility() })
         autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
         autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", true) { act.openBattery() })
+        autoCard.addView(rowItem("小米 / 红米 必看", "4 处设置，缺一项就不弹", true) { miuiGuide() })
         autoCard.addView(rowItem("测试弹窗", "点一下验证悬浮窗能不能弹") { testOverlay() })
         val acp = Ui.lp(Ui.MP, Ui.WC)
         acp.topMargin = Ui.dp(c, 10f)
@@ -136,6 +137,36 @@ class PageMine(private val act: MainActivity) {
         "$name (build $code)"
     } catch (_: Exception) {
         "未知"
+    }
+
+    /** 小米/红米的额外拦截说明：只开「悬浮窗」不够，必须再开「后台弹出界面」 */
+    private fun miuiGuide() {
+        val msg = "小米/红米（MIUI、HyperOS）除「悬浮窗」外，还有一个独立权限会拦截后台弹窗。任一项没开，\n" +
+            "在支付宝页面消费时都不会弹卡片。\n\n" +
+            "① 设置 → 应用设置 → 应用管理 → 自动记账 → 权限管理 → 其它权限 →「后台弹出界面」→ 始终允许\n" +
+            "② 同一页 →「显示悬浮窗」→ 允许\n" +
+            "③ 应用设置 → 应用管理 → 自动记账 → 自启动 → 打开；并在最近任务列表里下拉本App锁定\n" +
+            "④ 应用设置 → 应用管理 → 自动记账 → 省电策略 → 无限制\n\n" +
+            "关键：①②是两个不同权限，只开②不够。\n\n" +
+            "另外，v2.3 起通知栏提醒已改为无条件发送 —— 通知不受上述权限限制，\n" +
+            "即使卡片被拦，下拉通知栏也能看到并点进去确认，账不会丢。"
+        AlertDialog.Builder(act)
+            .setTitle("小米 / 红米 必看设置")
+            .setMessage(msg)
+            .setPositiveButton("打开本应用设置") { _, _ ->
+                try {
+                    act.startActivity(
+                        Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:" + act.packageName)
+                        )
+                    )
+                } catch (_: Exception) {
+                    Toast.makeText(act, "请手动进入系统设置", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("知道了", null)
+            .show()
     }
 
     /** 不依赖抓取，直接验证悬浮窗是否真的能弹出来 */

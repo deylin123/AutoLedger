@@ -246,6 +246,14 @@ class DbHelper(context: Context) :
         return 0
     }
 
+    /** 全库笔数，用于待确认页自检：区分「数据没落库」与「渲染没出来」 */
+    fun totalCount(): Int {
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM records", null).use {
+            if (it.moveToFirst()) return it.getInt(0)
+        }
+        return 0
+    }
+
     fun existsSimilar(amount: Double, note: String, ts: Long): Boolean {
         readableDatabase.rawQuery(
             "SELECT 1 FROM records WHERE amount=? AND note=? AND abs(ts-?)<120000 LIMIT 1",

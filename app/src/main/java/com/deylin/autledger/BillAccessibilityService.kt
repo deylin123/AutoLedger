@@ -258,9 +258,14 @@ class BillAccessibilityService : AccessibilityService() {
     // ---------- 悬浮卡片 ----------
 
     private fun showCard(id: Long, amount: Double, note: String, cat: String) {
+        // 通道一：通知栏，无条件发送。
+        // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、只是窗口不可见，
+        // 代码会误判为“已显示”。通知不受该权限限制，是唯一可靠通道，因此不再作为降级方案而是主通道。
+        notifyPending(id, amount, note, cat)
+
+        // 通道二：悬浮卡片，仅作增强
         if (!Settings.canDrawOverlays(this)) {
-            Diag.log(this, "弹窗未显示：悬浮窗权限未开启 → 已改发通知（请在App首页顶部开启）")
-            notifyPending(id, amount, note, cat)
+            Diag.log(this, "悬浮卡片跳过：悬浮窗权限未开（通知已发）")
             return
         }
         removeCard()
@@ -351,10 +356,9 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             wm.addView(holder, params)
             card = holder
-            Diag.log(this, "悬浮卡片已显示")
+            Diag.log(this, "悬浮卡片已提交显示（通知已同时发出）")
         } catch (e: Exception) {
-            Diag.log(this, "悬浮卡片显示失败（${e.javaClass.simpleName}）→ 改发通知")
-            notifyPending(id, amount, note, cat)
+            Diag.log(this, "悬浮卡片显示失败（${e.javaClass.simpleName}），通知已发")
             return
         }
         handler.postDelayed({ removeCard() }, 60000)
@@ -369,27 +373,40 @@ class BillAccessibilityService : AccessibilityService() {
     }
 
     private fun notifyPending(id: Long, amount: Double, note: String, cat: String) {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel("bill_capture", "自动记账提醒", NotificationManager.IMPORTANCE_HIGH)
-        )
-        val pi = PendingIntent.getActivity(
-            this, id.toInt(),
-            Intent(this, PendingActivity::class.java)
-                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                .putExtra("focus", id),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val n = Notification.Builder(this, "bill_capture")
-            .setSmallIcon(android.R.drawable.sym_def_app_icon)
-            .setContentTitle("识别到消费 ¥" + Ui.money(amount))
-            .setContentText("$note · 分类：$cat · 点击确认")
-            .setContentIntent(pi)
-            .setAutoCancel(true)
-            .build()
         try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            // 渠道一旦创建，重要性不可修改，故 v2.3 使用新渠道 id 以确保「弹窗+响铃+震动」生效
+            val chId = "bill_capture_v2"
+            if (nm.getNotificationChannel(chId) == null) {
+                val ch = NotificationChannel(chId, "自动记账提醒", NotificationManager.IMPORTANCE_HIGH)
+                ch.description = "识别到消费时提醒确认"
+                ch.enableVibration(true)
+                ch.vibrationPattern = longArrayOf(0, 220, 120, 220)
+                ch.enableLights(true)
+                nm.createNotificationChannel(ch)
+            }
+            val pi = PendingIntent.getActivity(
+                this, id.toInt(),
+                Intent(this, PendingActivity::class.java)
+                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra("focus", id),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val n = Notification.Builder(this, chId)
+                .setSmallIcon(android.R.drawable.sym_def_app_icon)
+                .setContentTitle("识别到消费 ¥" + Ui.money(amount))
+                .setContentText("$note · 分类：$cat · 点此确认")
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setCategory(Notification.CATEGORY_REMINDER)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(true)
+                .build()
             nm.notify(id.toInt(), n)
-        } catch (_: Exception) {
+            Diag.log(this, "已发送通知提醒：¥$amount $note")
+        } catch (e: Exception) {
+            Diag.log(this, "通知发送失败（${e.javaClass.simpleName}）：请检查通知权限是否开启")
         }
     }
 
