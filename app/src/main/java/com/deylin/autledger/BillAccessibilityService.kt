@@ -299,7 +299,7 @@ class BillAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(hideTask)
         removeCard()
 
-        val v = layoutInflater.inflate(R.layout.view_card, null)
+        val v = android.view.LayoutInflater.from(this).inflate(R.layout.view_card, null)
         (v.findViewById<View>(R.id.tvAmount) as TextView).text = "-¥" + Ui.money(amount)
         (v.findViewById<View>(R.id.tvNote) as TextView).text = note
         (v.findViewById<View>(R.id.tvCat) as TextView).text = "分类：" + cat
