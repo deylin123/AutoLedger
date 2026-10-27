@@ -261,6 +261,18 @@ class DbHelper(context: Context) :
         ).use { return it.moveToFirst() }
     }
 
+    /**
+     * 只按金额 + 时间窗判重，用于「页面抓取」与「通知监听」两条通道之间互相去重：
+     * 同一笔消费会同时被账单页和支付通知命中，两边提取出的商户名往往不同，
+     * 用 [existsSimilar] 比不中，会入库两条。窗口取 20 秒。
+     */
+    fun existsAmountWithin(amount: Double, ts: Long, windowMs: Long): Boolean {
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM records WHERE amount=? AND abs(ts-?)<? LIMIT 1",
+            arrayOf(amount.toString(), ts.toString(), windowMs.toString())
+        ).use { return it.moveToFirst() }
+    }
+
     // ---------- 预算 ----------
 
     fun budget(month: String): Double {

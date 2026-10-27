@@ -15,254 +15,264 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 
 /**
- * 账单页抓取：只在支付宝/微信「账单详情」页读屏。
+ * 账单页抓取。
+ *
+ * 支持范围由 [PayApps] 统一维护：支付宝、微信、淘宝/天猫、京东、拼多多、抖音、
+ * 美团/点评/饿了么、去哪儿/携程/飞猪、滴滴、12306 等消费类应用，
+ * 以及未注册 App 的通用兜底（严格判定）。
+ *
  * 抓到后**先落成待确认账单**（数据不会丢），再尝试弹悬浮卡片；没弹出来也能在「待确认」里处理。
  */
 class BillAccessibilityService : AccessibilityService() {
 
     companion object {
-        const val PKG_ALIPAY = "com.eg.android.AlipayGphone"
-        const val PKG_WECHAT = "com.tencent.mm"
+        /**
+         * 进入新页面后的重试时间点（毫秒）。
+         *
+         * 这是 v2.5 修掉「打开支付宝账单页不弹、手动滑一下才弹」的核心机制：
+         *  1. 进入页面的瞬间，rootInActiveWindow 往往还是旧页面或只有骨架，文本不足；
+         *  2. 页面渲染完成的那一刻会发一次 CONTENT_CHANGED，但常被节流丢掉；
+         *  3. 之后页面静止，不再产生任何事件 —— 除非用户手动滑动。
+         * 所以不能"收到事件扫一次"，必须进页面后按时间点反复扫，拿到即停。
+         */
+        private val BURST_DELAYS = longArrayOf(0, 200, 500, 1000, 1800, 3000, 4500, 6500)
 
-        private val TIME_LINE =
-            Regex("(20[0-9]{2}[-/年.][0-9]{1,2}[-/月.][0-9]{1,2}[^0-9][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
+        /** 内容变化事件的节流间隔 */
+        private const val CONTENT_THROTTLE = 700L
 
-        private val AMOUNT_LABELED = Regex(
-            "^(?:支出|付款|支付|扣款|消费|实付|付款金额|支付金额|扣款金额|交易金额|支出金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$"
-        )
-        private val AMOUNT_SIGNED =
-            Regex("^(-|\\+)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
-        private val AMOUNT_SYMBOL =
-            Regex("^[¥￥]\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
-        private val AMOUNT_PLAIN = Regex("^(\\d{1,6}(?:,\\d{3})*\\.\\d{1,2})\\s*元?$")
-        private val AMOUNT_IN_TEXT = Regex("(?:支出|付款|支付|扣款|消费|实付|金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:\\.\\d{1,2})?)\\s*元")
-        private val CURRENCY_IN_TEXT = Regex("[¥￥]\\s*(\\d{1,6}(?:\\.\\d{1,2})?)")
+        /** 同一包名的"疑似未接入"日志间隔，避免刷屏 */
+        private const val SUSPECT_LOG_GAP = 10 * 60 * 1000L
 
-        private val BILL_PAGE_WORDS = listOf("账单详情", "付款详情", "交易详情", "转账详情")
-        private val RESULT_WORDS = listOf("支付成功", "付款成功", "扣款成功", "交易成功", "已付款", "付款金额", "支付金额")
-        private val EXPENSE_WORDS = listOf(
-            "付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额",
-            "支付时间", "付款时间", "当前状态", "支出"
+        /** 单页最多收集多少条文本 */
+        private const val MAX_TEXTS = 260
+
+        /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
+        private val FIELD_NOISE = listOf(
+            "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
+            "数量", "件数", "单价", "航班", "车次", "座位", "里程", "积分", "备注"
         )
-        private val INCOME_WORDS = listOf("退款", "已存入", "已到账", "已收钱", "收款到账", "退款成功")
-        private val STATUS_WORDS = listOf(
-            "自动扣款成功", "付款成功", "支付成功", "交易成功", "已付款",
-            "转账成功", "扣款成功", "待付款"
-        )
-        private val FIELD_KEYS = listOf("收款方全称", "收款方", "商户全称", "商户", "对方账户", "商品说明", "账单分类")
     }
 
-    private var lastScan = 0L
-    private var lastOtherScan = 0L
-    private var lastKey = ""
-    private var lastAt = 0L
     private val handler = Handler(Looper.getMainLooper())
+
+    /** burst 代次：新的页面切换会自增，旧代次的定时任务自动作废 */
+    private var burstToken = 0
+
+    /** 本代次已成功抓取，后续重试不再执行 */
+    private var hitToken = -1
+
+    private var lastContentAt = 0L
+    private var lastAmount = -1.0
+    private var lastAmountAt = 0L
+
+    private val suspectLogged = HashMap<String, Long>()
+    private val labelCache = HashMap<String, String>()
+
     private var card: View? = null
+    private var lastCardId = -1L
+
+    private val hideTask = Runnable { removeCard() }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Diag.log(this, "无障碍服务已连接（v2.5 通用识别版）")
+    }
+
+    // ---------------- 事件分派 ----------------
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName) return
-        val et = event.eventType
-        if (et != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            et != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-        ) return
+        if (pkg == "com.android.systemui" || pkg == "android") return
 
-        val whitelist = pkg == PKG_ALIPAY || pkg == PKG_WECHAT
-        val now = System.currentTimeMillis()
-        if (whitelist) {
-            if (now - lastScan < 1500) return
-            lastScan = now
-        } else {
-            if (now - lastOtherScan < 5000) return
-            lastOtherScan = now
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> startBurst(pkg)
+
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                val now = System.currentTimeMillis()
+                if (now - lastContentAt < CONTENT_THROTTLE) return
+                lastContentAt = now
+                val token = burstToken
+                // 内容变化后补两次，覆盖「先出标题、再加载金额」的页面
+                handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 150)
+                handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 1000)
+            }
         }
+    }
 
-        val root = rootInActiveWindow ?: return
+    /** 新页面：立即按时间点排一串扫描任务，任一命中即停 */
+    private fun startBurst(pkg: String) {
+        burstToken++
+        val token = burstToken
+        for (d in BURST_DELAYS) {
+            handler.postDelayed({
+                if (token != burstToken) return@postDelayed
+                if (hitToken == token) return@postDelayed
+                runScan(pkg, token)
+            }, d)
+        }
+    }
+
+    // ---------------- 扫描 ----------------
+
+    private fun runScan(pkg: String, token: Int) {
         try {
-            val texts = ArrayList<String>()
-            collect(root, texts)
+            val texts = grabTexts()
             if (texts.size < 3) return
-            if (texts.any { it.contains("自动记账") || it.contains("待确认") || it.contains("本月预算") }) return
-            val isBill = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
-            val isPayResult = texts.any { t -> RESULT_WORDS.any { t.contains(it) } }
-            // 支付宝：账单详情页、付款结果页都抓；微信及其他 App：只认账单详情页，避免聊天/列表内容误判
-            if (!isBill && !(pkg == PKG_ALIPAY && isPayResult)) return
+            // 排除本应用自己的界面（明细/待确认里的文字）
+            if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return
 
-            if (!whitelist) {
-                val hasAmount = texts.any { hasAmountIn(it.trim()) }
-                if (hasAmount) Diag.log(this, "其他App($pkg) 疑似账单页 → 未接入，仅记包名")
+            val app = PayApps.of(pkg)
+            if (!PayApps.hasTitle(texts, app)) {
+                if (app == null) noteSuspect(pkg, texts)
                 return
             }
-            scan(pkg, texts)
+            // 未注册的 App：必须有支出方向佐证才敢认定，避免"订单详情"浏览页误抓
+            if (app == null && !PayApps.hasExpenseSignal(texts)) return
+
+            if (scan(pkg, texts, app)) hitToken = token
         } catch (e: Exception) {
             Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
         }
     }
 
-    private fun scan(pkg: String, texts: ArrayList<String>) {
+    private fun scan(pkg: String, texts: ArrayList<String>, app: PayApps.App?): Boolean {
+        val appName = app?.name ?: appLabel(pkg)
         val joined = texts.joinToString("|")
-        val appName = if (pkg == PKG_WECHAT) "微信" else "支付宝"
 
-        val amt = findAmount(texts)
+        val amt = PayApps.findAmount(texts)
         if (amt == null) {
-            Diag.log(this, "$appName 账单页 → 未识别到金额（文字：${texts.take(12).joinToString("/").take(160)}）")
-            return
+            Diag.log(this, "$appName 账单页 → 未识别到金额（${texts.take(14).joinToString("/").take(180)}）")
+            return false
         }
         val amount = amt.value
-        if (!amt.expense && INCOME_WORDS.any { joined.contains(it) }) {
+
+        if (!amt.expense && PayApps.hasIncomeSignal(texts)) {
             Diag.log(this, "$appName ¥$amount → 跳过：退款/收入")
-            return
+            return false
         }
-        if (!amt.expense && EXPENSE_WORDS.none { joined.contains(it) }) {
+        if (!amt.expense && !PayApps.hasExpenseSignal(texts)) {
             Diag.log(this, "$appName ¥$amount → 跳过：不像支出")
-            return
+            return false
         }
 
-        val fieldVals = HashMap<String, String>()
-        for (k in FIELD_KEYS) {
-            val i = texts.indexOf(k)
-            if (i >= 0 && i + 1 < texts.size) fieldVals[k] = texts[i + 1].trim()
-        }
-        val merchant = fieldVals["收款方全称"]
-            ?: fieldVals["商户全称"]
-            ?: fieldVals["收款方"]
-            ?: fieldVals["商户"]
-            ?: fieldVals["对方账户"]
+        val merchant = PayApps.fieldOf(texts, PayApps.MERCHANT_KEYS)
             ?: goodsNear(texts, amt.idx, appName)
+        val goods = PayApps.fieldOf(texts, PayApps.GOODS_KEYS) ?: ""
+        val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
+        val ts = PayApps.TIME.find(joined)?.groupValues?.getOrNull(1)
+            ?.let { PayApps.parseTime(it) } ?: System.currentTimeMillis()
 
-        val goods = fieldVals["商品说明"] ?: ""
-        val catHint = fieldVals["账单分类"] ?: ""
-        val ts = parseTime(TIME_LINE.find(joined)?.groupValues?.getOrNull(1)) ?: System.currentTimeMillis()
-        val cat = Category.of(merchant, goods, catHint)
+        val cat = Category.of(merchant, goods, catHint, appName)
+        val note = if (goods.isNotBlank() && goods != merchant) "$merchant·$goods" else merchant
+
+        // 同一笔在多次重试之间保持幂等：8 秒内同金额不再入库
+        val now = System.currentTimeMillis()
+        if (amount == lastAmount && now - lastAmountAt < 8000) return false
 
         val db = DbHelper(this)
-        if (db.existsSimilar(amount, merchant, ts)) {
-            db.close()
-            Diag.log(this, "$appName ¥$amount $merchant → 跳过：2分钟内已记录")
-            return
-        }
-        val key = "$amount|$merchant|${ts / 60000}"
-        if (key == lastKey && System.currentTimeMillis() - lastAt < 15000) {
-            db.close()
-            return
-        }
-        lastKey = key
-        lastAt = System.currentTimeMillis()
-
-        val id = db.addRecord(
-            Rec(
-                amount = amount, type = 0, cat = cat, note = merchant, ts = ts,
-                book = bookOf(), status = 0, src = appName
+        try {
+            if (db.existsSimilar(amount, note, ts)) {
+                Diag.log(this, "$appName ¥$amount $note → 跳过：2分钟内已记录")
+                return false
+            }
+            // 页面与通知两条通道会同时命中同一笔，商户名提取不一致，用金额+20秒兜一层
+            if (db.existsAmountWithin(amount, ts, 20000)) {
+                Diag.log(this, "$appName ¥$amount → 跳过：20秒内同金额已有记录（另一通道已抓）")
+                return false
+            }
+            val id = db.addRecord(
+                Rec(
+                    amount = amount, type = 0, cat = cat, note = note, ts = ts,
+                    book = bookOf(), status = 0, src = appName
+                )
             )
-        )
-        db.close()
-        Diag.log(this, "$appName ¥$amount $merchant → 已存为待确认（预分类：$cat）")
-        if (id > 0) showCard(id, amount, merchant, cat)
-    }
-
-    private fun goodsNear(texts: List<String>, idx: Int, appName: String): String {
-        for (j in (idx - 1) downTo maxOf(0, idx - 4)) {
-            val s = texts[j].trim()
-            if (s.length in 2..20 && !hasAmountIn(s) &&
-                STATUS_WORDS.none { s.contains(it) } && !s.contains("账单")
-            ) return s
+            if (id <= 0) return false
+            lastAmount = amount
+            lastAmountAt = now
+            Diag.log(this, "$appName ¥$amount $note → 已存为待确认（预分类：$cat）")
+            showCard(id, amount, note, cat)
+            return true
+        } finally {
+            db.close()
         }
-        return appName + "支付"
     }
 
-    private class Amt(val value: Double, val expense: Boolean, val score: Int, val idx: Int)
-
-    private fun toNum(s: String?): Double? = s?.replace(",", "")?.replace(" ", "")?.toDoubleOrNull()
-
-    private fun hasAmountIn(s: String): Boolean =
-        AMOUNT_LABELED.containsMatchIn(s) || AMOUNT_SIGNED.containsMatchIn(s) ||
-            AMOUNT_SYMBOL.containsMatchIn(s) || AMOUNT_PLAIN.containsMatchIn(s)
-
-    private fun findAmount(texts: List<String>): Amt? {
-        var best: Amt? = null
-        for (i in texts.indices) {
-            val s = texts[i].trim()
-            if (s.isEmpty() || s.length > 30) continue
-            if (s.contains("时间") || s.contains("单号") || s.contains("订单") ||
-                s.contains("余额") || s.contains("次数") || s.contains("笔数")
-            ) continue
-            if (TIME_LINE.containsMatchIn(s)) continue
-
-            var cand: Amt? = null
-            AMOUNT_LABELED.find(s)?.let { m ->
-                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 100, i) }
-            }
-            if (cand == null) AMOUNT_SIGNED.find(s)?.let { m ->
-                toNum(m.groupValues.getOrNull(2))?.let {
-                    cand = Amt(it, m.groupValues.getOrNull(1) == "-", 90, i)
-                }
-            }
-            if (cand == null) AMOUNT_SYMBOL.find(s)?.let { m ->
-                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, false, 85, i) }
-            }
-            if (cand == null) AMOUNT_PLAIN.find(s)?.let { m ->
-                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, false, 75, i) }
-            }
-
-            val c = cand ?: continue
-            if (c.value <= 0.0 || c.value > 500000.0) continue
-            val cur = best
-            if (cur == null || c.score > cur.score) best = c
-        }
-        if (best != null) return best
-
-        for (i in texts.indices) {
-            val s = texts[i].trim()
-            if (s.isEmpty() || TIME_LINE.containsMatchIn(s)) continue
-            val v = toNum(AMOUNT_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
-                ?: toNum(CURRENCY_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
-            if (v != null && v >= 0.01 && v <= 500000.0) return Amt(v, true, 50, i)
-        }
-        return null
+    /** 未登记 App 的疑似消费页：只记一次包名，方便后续在 PayApps 里补登记 */
+    private fun noteSuspect(pkg: String, texts: List<String>) {
+        if (!texts.any { PayApps.hasAmountIn(it) }) return
+        if (!PayApps.hasExpenseSignal(texts)) return
+        val now = System.currentTimeMillis()
+        if (now - (suspectLogged[pkg] ?: 0L) < SUSPECT_LOG_GAP) return
+        suspectLogged[pkg] = now
+        Diag.log(this, "未接入App($pkg) 疑似消费页 → 仅记包名，可在 PayApps.kt 登记")
     }
 
-    private fun collect(node: AccessibilityNodeInfo?, out: MutableList<String>) {
-        node ?: return
-        node.text?.toString()?.takeIf { it.isNotBlank() }?.let { out.add(it) }
-        if (out.size > 150) return
-        for (i in 0 until node.childCount) collect(node.getChild(i), out)
-    }
-
-    private fun parseTime(s: String?): Long? {
-        if (s == null) return null
-        val fmts = arrayOf(
-            "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy/MM/dd HH:mm:ss",
-            "yyyy年MM月dd日 HH:mm:ss", "yyyy.MM.dd HH:mm:ss"
-        )
-        for (f in fmts) {
+    /**
+     * 读当前页面文字：优先活动窗口；活动窗口内容太少时（常见于支付宝，
+     * 详情页在另一个 window 里），再把所有窗口的文本合并读一遍。
+     */
+    private fun grabTexts(): ArrayList<String> {
+        val set = LinkedHashSet<String>()
+        rootInActiveWindow?.let { collect(it, set) }
+        if (set.size < 4) {
             try {
-                val p = java.text.SimpleDateFormat(f, java.util.Locale.CHINA)
-                p.isLenient = false
-                return p.parse(s)!!.time
+                val ws = windows
+                ws?.forEach { w ->
+                    val r = w?.root ?: return@forEach
+                    collect(r, set)
+                }
             } catch (_: Exception) {
             }
         }
-        return null
+        return ArrayList(set)
     }
 
-    private fun bookOf(): String {
-        return getSharedPreferences("cfg", MODE_PRIVATE).getString("book", "日常账本") ?: "日常账本"
+    private fun collect(node: AccessibilityNodeInfo?, out: MutableSet<String>) {
+        node ?: return
+        if (out.size > MAX_TEXTS) return
+        node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        // 部分 App（含自绘/电商页）把文字放在 contentDescription 里，只读 text 会漏
+        node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        for (i in 0 until node.childCount) collect(node.getChild(i), out)
     }
 
-    // ---------- 悬浮卡片 ----------
+    private fun goodsNear(texts: List<String>, idx: Int, appName: String): String {
+        for (j in (idx - 1) downTo maxOf(0, idx - 5)) {
+            val s = texts[j].trim()
+            if (s.length in 2..24 && !PayApps.hasAmountIn(s) &&
+                PayApps.TIME.find(s) == null &&
+                !PayApps.hasExpenseSignal(listOf(s)) &&
+                FIELD_NOISE.none { s.contains(it) } &&
+                !s.contains("账单") && !s.contains("详情")
+            ) return s
+        }
+        return appName + "消费"
+    }
 
-    private val hideTask = Runnable { removeCard() }
+    private fun appLabel(pkg: String): String {
+        labelCache[pkg]?.let { return it }
+        val name = try {
+            val pm = packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+        } catch (_: Exception) {
+            pkg.substringAfterLast('.')
+        }
+        labelCache[pkg] = name
+        return name
+    }
+
+    private fun bookOf(): String =
+        getSharedPreferences("cfg", MODE_PRIVATE).getString("book", "日常账本") ?: "日常账本"
+
+    // ---------------- 悬浮卡片 ----------------
 
     /** 同一笔只弹一次，避免重复触发反复重建窗口造成闪烁 */
-    private var lastCardId = -1L
-
     private fun showCard(id: Long, amount: Double, note: String, cat: String) {
         // 通道一：通知栏，无条件发送。
         // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、

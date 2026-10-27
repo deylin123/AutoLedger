@@ -99,10 +99,11 @@ class PageMine(private val act: MainActivity) {
                 act.startActivity(Intent(act, PendingActivity::class.java))
             }
         )
-        autoCard.addView(permRow("通知监听", "读取微信/支付宝支付通知", hasNotifListener()) { act.openNotifListener() })
-        autoCard.addView(permRow("账单页抓取", "打开账单详情页时识别金额", hasAccessibility()) { act.openAccessibility() })
+        autoCard.addView(permRow("通知监听", "读取各 App 的支付成功通知", hasNotifListener()) { act.openNotifListener() })
+        autoCard.addView(permRow("账单页抓取", "支付宝/微信/电商/外卖/出行等账单页", hasAccessibility()) { act.openAccessibility() })
         autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
         autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", true) { act.openBattery() })
+        autoCard.addView(rowItem("支持范围", "26 个消费类 App + 通用兜底", true) { supportGuide() })
         autoCard.addView(rowItem("小米 / 红米 必看", "4 处设置，缺一项就不弹", true) { miuiGuide() })
         autoCard.addView(rowItem("测试弹窗", "点一下验证悬浮窗能不能弹") { testOverlay() })
         val acp = Ui.lp(Ui.MP, Ui.WC)
@@ -139,10 +140,30 @@ class PageMine(private val act: MainActivity) {
         "未知"
     }
 
+    /** 支持范围说明：让用户知道哪些 App 已覆盖、哪些抓不到，不用猜 */
+    private fun supportGuide() {
+        val names = PayApps.APPS.joinToString("、") { it.name }
+        val msg = "【已单独适配】\n$names\n\n" +
+            "【通用兜底】\n不在上面名单里的 App，只要页面出现「账单详情 / 交易详情 / 订单详情 / 支付凭证」" +
+            "这类结构词，且有金额和支出特征，也会识别。首次遇到会记一条诊断日志（同一 App 只记一次），" +
+            "方便后续补进名单。\n\n" +
+            "【通知兜底】\n任何 App 只要推了「支付成功 / 付款成功 / 已支付 / 扣款成功」类通知且带金额，" +
+            "都会被记录 —— 这条覆盖了大量页面读不到文字的自绘 / 网页型 App。\n\n" +
+            "【抓不到的】\n① 现金、银行卡刷卡、云闪付、Apple Pay（支付动作没经过这些 App）；\n" +
+            "② 完全自绘且不发通知的页面；\n" +
+            "③ 手动关掉通知或无障碍权限时。\n\n" +
+            "抓不到可以手记，两者进同一个账本。"
+        AlertDialog.Builder(act)
+            .setTitle("自动识别支持范围")
+            .setMessage(msg)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
     /** 小米/红米的额外拦截说明：只开「悬浮窗」不够，必须再开「后台弹出界面」 */
     private fun miuiGuide() {
         val msg = "小米/红米（MIUI、HyperOS）除「悬浮窗」外，还有一个独立权限会拦截后台弹窗。任一项没开，\n" +
-            "在支付宝页面消费时都不会弹卡片。\n\n" +
+            "在任意 App 里消费都不会弹卡片。\n\n" +
             "① 设置 → 应用设置 → 应用管理 → 自动记账 → 权限管理 → 其它权限 →「后台弹出界面」→ 始终允许\n" +
             "② 同一页 →「显示悬浮窗」→ 允许\n" +
             "③ 应用设置 → 应用管理 → 自动记账 → 自启动 → 打开；并在最近任务列表里下拉本App锁定\n" +
