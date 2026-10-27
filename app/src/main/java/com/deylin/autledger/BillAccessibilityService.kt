@@ -43,12 +43,26 @@ class BillAccessibilityService : AccessibilityService() {
         const val PKG_ALIPAY = "com.eg.android.AlipayGphone"
         const val PKG_WECHAT = "com.tencent.mm"
 
-        private val AMOUNT_LINE = Regex("^-?[¥￥]?\\s*-?[0-9]{1,7}(?:,[0-9]{3})*\\.[0-9]{2}$")
         private val TIME_LINE = Regex("(20[0-9]{2}[-/年.][0-9]{1,2}[-/月.][0-9]{1,2}[^0-9][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
 
+        // 金额识别分级（取命中里分数最高的那条），兼容支付宝「支出6.5元」与小票式「-47.52」两种排版
+        // ① 带支出标记：支出6.5元 / 付款金额 ¥6.50 / 实付19元
+        private val AMOUNT_LABELED = Regex(
+            "^(?:支出|付款|支付|扣款|消费|实付|付款金额|支付金额|扣款金额|交易金额|支出金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$"
+        )
+        // ② 带正负号：-6.50 / -¥47.52
+        private val AMOUNT_SIGNED = Regex("^(-|\\+)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
+        // ③ 带货币符号：¥6.50 / ￥19
+        private val AMOUNT_SYMBOL = Regex("^[¥￥]\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
+        // ④ 纯小数：6.50 / 6.5元
+        private val AMOUNT_PLAIN = Regex("^(\\d{1,6}(?:,\\d{3})*\\.\\d{1,2})\\s*元?$")
+        // 兜底：整句里抠金额
+        private val AMOUNT_IN_TEXT = Regex("(?:支出|付款|支付|扣款|消费|实付|金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:\\.\\d{1,2})?)\\s*元")
+        private val CURRENCY_IN_TEXT = Regex("[¥￥]\\s*(\\d{1,6}(?:\\.\\d{1,2})?)")
+
         private val BILL_PAGE_WORDS = listOf("账单详情", "付款详情", "交易详情", "转账详情")
-        private val EXPENSE_WORDS = listOf("付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额", "支付时间", "付款时间", "当前状态")
-        private val INCOME_WORDS = listOf("退款", "已存入", "已到账", "已收钱", "收入", "收款到账")
+        private val EXPENSE_WORDS = listOf("付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额", "支付时间", "付款时间", "当前状态", "支出")
+        private val INCOME_WORDS = listOf("退款", "已存入", "已到账", "已收钱", "收款到账", "退款成功")
         private val STATUS_WORDS = listOf("自动扣款成功", "付款成功", "支付成功", "交易成功", "已付款", "转账成功", "扣款成功", "待付款")
         private val FIELD_KEYS = listOf("收款方全称", "收款方", "商户全称", "商户", "对方账户", "商品说明", "账单分类")
     }
@@ -92,11 +106,13 @@ class BillAccessibilityService : AccessibilityService() {
             val texts = ArrayList<String>()
             collect(root, texts)
             if (texts.size < 3) return
+            // 排除把自己 App 首页误判成账单页（首页也有「账单」「支出」等字样）
+            if (texts.any { it.contains("抓取诊断") || it.contains("权限1") || it.contains("本月已确认支出") }) return
             val hasBillPage = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
             if (!hasBillPage) return
 
             if (!whitelist) {
-                val hasAmount = texts.any { AMOUNT_LINE.matches(it.trim()) }
+                val hasAmount = texts.any { hasAmountIn(it.trim()) }
                 if (hasAmount) Diag.log(this, "其他App($pkg) 疑似账单详情页 → 未接入，仅记录包名")
                 return
             }
@@ -111,32 +127,27 @@ class BillAccessibilityService : AccessibilityService() {
         val joined = texts.joinToString("|")
         val appName = if (pkg == PKG_WECHAT) "微信" else "支付宝"
 
-        var amount = -1.0
-        var amountNeg = false
-        var amountIdx = -1
-        for ((i, t) in texts.withIndex()) {
-            val s = t.trim()
-            if (AMOUNT_LINE.matches(s)) {
-                val v = s.replace(Regex("[¥￥,\\s]"), "").replace("-", "").toDoubleOrNull() ?: continue
-                if (v > 0.0) {
-                    amount = v
-                    amountNeg = s.contains("-")
-                    amountIdx = i
-                    break
-                }
-            }
-        }
-        if (amount <= 0.0 || amountIdx < 0) {
-            Diag.log(this, "$appName 账单页 → 未找到金额行（片段：${texts.take(6).joinToString("/").take(40)}）")
+        val amt = findAmount(texts)
+        if (amt == null) {
+            Diag.log(
+                this,
+                "$appName 账单页 → 仍未识别到金额（页面文字：${texts.take(12).joinToString("/").take(160)}）"
+            )
             return
         }
-        if (INCOME_WORDS.any { joined.contains(it) }) {
+        val amount = amt.value
+        val amountIdx = amt.idx
+
+        if (!amt.expense && INCOME_WORDS.any { joined.contains(it) }) {
             Diag.log(this, "$appName 账单页 ¥$amount → 跳过：疑似收入/退款")
             return
         }
-        val isExpense = amountNeg || EXPENSE_WORDS.any { joined.contains(it) }
+        val isExpense = amt.expense || EXPENSE_WORDS.any { joined.contains(it) }
         if (!isExpense) {
-            Diag.log(this, "$appName 账单页 ¥$amount → 跳过：不像支出")
+            Diag.log(
+                this,
+                "$appName 账单页 ¥$amount → 跳过：不像支出（页面文字：${texts.take(10).joinToString("/").take(120)}）"
+            )
             return
         }
 
@@ -155,7 +166,7 @@ class BillAccessibilityService : AccessibilityService() {
                 var found = ""
                 for (j in (amountIdx - 1) downTo maxOf(0, amountIdx - 4)) {
                     val s = texts[j].trim()
-                    if (s.length in 2..20 && !AMOUNT_LINE.matches(s) &&
+                    if (s.length in 2..20 && !hasAmountIn(s) &&
                         STATUS_WORDS.none { s.contains(it) } && !s.contains("账单")
                     ) {
                         found = s
@@ -185,6 +196,63 @@ class BillAccessibilityService : AccessibilityService() {
         val category = Category.of(merchant, goods, catHint)
         Diag.log(this, "$appName 账单页 ¥$amount $merchant → 已弹窗（预分类：$category）")
         showForm(amount, merchant, ts, category)
+    }
+
+    private class Amt(val value: Double, val expense: Boolean, val score: Int, val idx: Int)
+
+    private fun toNum(s: String?): Double? =
+        s?.replace(",", "")?.replace(" ", "")?.toDoubleOrNull()
+
+    private fun hasAmountIn(s: String): Boolean =
+        AMOUNT_LABELED.containsMatchIn(s) || AMOUNT_SIGNED.containsMatchIn(s) ||
+            AMOUNT_SYMBOL.containsMatchIn(s) || AMOUNT_PLAIN.containsMatchIn(s)
+
+    /**
+     * 多级识别金额，取可信度最高的一条：
+     * 带支出标记(100) > 带正负号(90) > 带¥符号(85) > 纯小数(75) > 整句抠取(50)
+     */
+    private fun findAmount(texts: List<String>): Amt? {
+        var best: Amt? = null
+        for (i in texts.indices) {
+            val s = texts[i].trim()
+            if (s.isEmpty() || s.length > 30) continue
+            if (s.contains("时间") || s.contains("单号") || s.contains("订单") ||
+                s.contains("余额") || s.contains("次数") || s.contains("笔数")
+            ) continue
+            if (TIME_LINE.containsMatchIn(s)) continue
+
+            var cand: Amt? = null
+            AMOUNT_LABELED.find(s)?.let { m ->
+                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 100, i) }
+            }
+            if (cand == null) AMOUNT_SIGNED.find(s)?.let { m ->
+                toNum(m.groupValues.getOrNull(2))?.let {
+                    cand = Amt(it, m.groupValues.getOrNull(1) == "-", 90, i)
+                }
+            }
+            if (cand == null) AMOUNT_SYMBOL.find(s)?.let { m ->
+                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, false, 85, i) }
+            }
+            if (cand == null) AMOUNT_PLAIN.find(s)?.let { m ->
+                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, false, 75, i) }
+            }
+
+            val c = cand ?: continue
+            if (c.value <= 0.0 || c.value > 500000.0) continue
+            val cur = best
+            if (cur == null || c.score > cur.score) best = c
+        }
+        if (best != null) return best
+
+        // 兜底：整句里抠（如「交易成功 支出 6.5 元」或「¥6.50」夹在句子里）
+        for (i in texts.indices) {
+            val s = texts[i].trim()
+            if (s.isEmpty() || TIME_LINE.containsMatchIn(s)) continue
+            val v = toNum(AMOUNT_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
+                ?: toNum(CURRENCY_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
+            if (v != null && v >= 0.01 && v <= 500000.0) return Amt(v, true, 50, i)
+        }
+        return null
     }
 
     private fun collect(node: AccessibilityNodeInfo?, out: MutableList<String>) {
