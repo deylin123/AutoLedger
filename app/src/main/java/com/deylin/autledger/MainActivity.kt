@@ -89,6 +89,9 @@ class MainActivity : Activity() {
         findViewById<TextView>(R.id.tvTotal).text =
             "本月已确认支出：¥" + String.format("%.2f", db.monthTotal())
 
+        // 抓取诊断：直接看到无障碍服务到底有没有收到页面、卡在哪一步
+        findViewById<TextView>(R.id.tvDiag).text = Diag.dump(this, 8)
+
         val box = findViewById<LinearLayout>(R.id.listBox)
         box.removeAllViews()
         val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
