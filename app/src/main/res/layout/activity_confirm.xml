@@ -16,8 +16,8 @@
         android:id="@+id/tvAmount"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:textSize="36sp"
+        android:layout_marginTop="12dp"
+        android:textSize="32sp"
         android:textStyle="bold"
         android:text="¥0.00" />
 
@@ -31,22 +31,28 @@
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="20dp"
-        android:text="选择消费类别（选中的会加粗）："
-        android:textSize="14sp" />
+        android:layout_marginTop="12dp"
+        android:text="选择消费类别（选中的加粗，可滚动）："
+        android:textSize="13sp" />
 
-    <GridLayout
-        android:id="@+id/gridCats"
-        android:columnCount="3"
+    <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp" />
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="4dp">
+
+        <GridLayout
+            android:id="@+id/gridCats"
+            android:columnCount="3"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+    </ScrollView>
 
     <LinearLayout
         android:orientation="horizontal"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="24dp">
+        android:layout_marginTop="12dp">
 
         <Button
             android:id="@+id/btnIgnore"
