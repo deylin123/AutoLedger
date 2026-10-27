@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -27,6 +28,21 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.btnPerm).setOnClickListener {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
+        findViewById<Button>(R.id.btnAcc).setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        findViewById<Button>(R.id.btnOverlay).setOnClickListener {
+            if (!Settings.canDrawOverlays(this)) {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } else {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        }
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -45,12 +61,30 @@ class MainActivity : Activity() {
         return s.split(":").any { it.contains(packageName) }
     }
 
+    private fun accEnabled(): Boolean {
+        val s = Settings.Secure.getString(contentResolver, "enabled_accessibility_services") ?: return false
+        return s.contains("$packageName/.BillAccessibilityService") ||
+                s.contains("$packageName.BillAccessibilityService")
+    }
+
     private fun refresh() {
         findViewById<TextView>(R.id.tvStatus).text =
             if (listenerEnabled())
-                "✅ 通知监听已开启，正在自动监控微信/支付宝消费"
+                "✅ 通知监听已开启：支付推送自动记录"
             else
-                "❌ 尚未开启通知监听权限。点击下方按钮，在列表中找到「自动记账」并允许"
+                "❌ 通知监听未开启：点下方「权限1」开启（支付到账推送实时记录用）"
+
+        findViewById<TextView>(R.id.tvStatus2).text =
+            if (accEnabled())
+                "✅ 账单页抓取已开启：打开支付宝/微信「账单详情」页即自动弹窗"
+            else
+                "❌ 账单页抓取未开启：点下方「权限2」→ 已下载的服务 → 找到「自动记账」并开启"
+
+        findViewById<TextView>(R.id.tvStatus3).text =
+            if (Settings.canDrawOverlays(this))
+                "✅ 悬浮窗已允许：抓取后屏幕顶部弹确认条"
+            else
+                "提示：点「权限3」允许「显示在其他应用上层」，弹窗体验更好（不允许可用通知提醒）"
 
         findViewById<TextView>(R.id.tvTotal).text =
             "本月已确认支出：¥" + String.format("%.2f", db.monthTotal())
@@ -59,7 +93,8 @@ class MainActivity : Activity() {
         box.removeAllViews()
         val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
         val inf = LayoutInflater.from(this)
-        for (r in db.recent(100)) {
+        val records = db.recent(100)
+        for (r in records) {
             val v = inf.inflate(R.layout.item_record, box, false)
             v.findViewById<TextView>(R.id.tvLine1).text =
                 "${r.merchant}　¥" + String.format("%.2f", r.amount)
@@ -67,9 +102,9 @@ class MainActivity : Activity() {
                 "${fmt.format(Date(r.ts))} · ${r.category} · ${statusText(r.status)}"
             box.addView(v)
         }
-        if (db.recent(1).isEmpty()) {
+        if (records.isEmpty()) {
             val empty = TextView(this)
-            empty.text = "暂无记录。支付一笔试试～"
+            empty.text = "暂无记录。支付一笔或打开账单详情页试试～"
             empty.setPadding(0, 24, 0, 0)
             box.addView(empty)
         }

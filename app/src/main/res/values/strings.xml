@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="acc_desc">账单抓取：仅在检测到你打开支付宝/微信的「账单详情」页时，读取页面文字中的消费金额、收款方和时间，弹出确认窗口供你记录。不读取其他页面，不上传任何数据。</string>
+</resources>

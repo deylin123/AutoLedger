@@ -43,6 +43,26 @@ class DbHelper(context: Context) : SQLiteOpenHelper(context, "ledger.db", null, 
         return writableDatabase.insert("records", null, cv)
     }
 
+    /** 抓屏链路：点确认后才入库（直接已确认） */
+    fun insertFinal(amount: Double, merchant: String, category: String, ts: Long): Long {
+        val cv = ContentValues().apply {
+            put("amount", amount)
+            put("merchant", merchant)
+            put("category", category)
+            put("ts", ts)
+            put("status", 1)
+        }
+        return writableDatabase.insert("records", null, cv)
+    }
+
+    /** 防重：同金额+同商户+2分钟内视为同一笔 */
+    fun existsSimilar(amount: Double, merchant: String, ts: Long): Boolean {
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM records WHERE amount=? AND merchant=? AND status<2 AND abs(ts-?)<120000 LIMIT 1",
+            arrayOf(amount.toString(), merchant, ts.toString())
+        ).use { return it.moveToFirst() }
+    }
+
     fun get(id: Long): Rec? =
         readableDatabase.rawQuery(
             "SELECT id,amount,merchant,category,ts,status FROM records WHERE id=?",

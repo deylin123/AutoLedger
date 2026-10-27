@@ -12,12 +12,56 @@
         android:textSize="14sp"
         android:text="检查权限中…" />
 
-    <Button
-        android:id="@+id/btnPerm"
+    <TextView
+        android:id="@+id/tvStatus2"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="去开启通知监听权限" />
+        android:layout_marginTop="6dp"
+        android:textSize="14sp"
+        android:text="检查权限中…" />
+
+    <TextView
+        android:id="@+id/tvStatus3"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textSize="14sp"
+        android:text="检查权限中…" />
+
+    <LinearLayout
+        android:orientation="horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp">
+
+        <Button
+            android:id="@+id/btnPerm"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:textSize="12sp"
+            android:text="权限1·通知监听" />
+
+        <Button
+            android:id="@+id/btnAcc"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="4dp"
+            android:textSize="12sp"
+            android:text="权限2·账单抓取" />
+
+        <Button
+            android:id="@+id/btnOverlay"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:textSize="12sp"
+            android:text="权限3·悬浮窗" />
+    </LinearLayout>
 
     <TextView
         android:id="@+id/tvTotal"
