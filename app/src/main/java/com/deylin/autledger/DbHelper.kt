@@ -43,12 +43,13 @@ class DbHelper(context: Context) : SQLiteOpenHelper(context, "ledger.db", null, 
         return writableDatabase.insert("records", null, cv)
     }
 
-    /** 抓屏链路：点确认后才入库（直接已确认） */
-    fun insertFinal(amount: Double, merchant: String, category: String, ts: Long): Long {
+    /** 抓屏链路：点保存后才入库（直接已确认） */
+    fun insertFinal(amount: Double, merchant: String, category: String, ts: Long, note: String = ""): Long {
         val cv = ContentValues().apply {
             put("amount", amount)
             put("merchant", merchant)
             put("category", category)
+            put("note", note)
             put("ts", ts)
             put("status", 1)
         }

@@ -44,6 +44,22 @@ class MainActivity : Activity() {
             }
         }
 
+        findViewById<Button>(R.id.btnBattery).setOnClickListener {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (e: Exception) {
+                try {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (_: Exception) {
+                }
+            }
+        }
+
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {

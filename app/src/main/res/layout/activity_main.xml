@@ -63,6 +63,14 @@
             android:text="权限3·悬浮窗" />
     </LinearLayout>
 
+    <Button
+        android:id="@+id/btnBattery"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textSize="12sp"
+        android:text="权限4·后台保活（关掉省电限制，避免后台被系统杀掉）" />
+
     <TextView
         android:id="@+id/tvTotal"
         android:layout_width="match_parent"
