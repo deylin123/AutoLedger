@@ -32,7 +32,7 @@ class ConfirmActivity : Activity() {
             amount = intent.getDoubleExtra("amount", 0.0)
             merchant = intent.getStringExtra("merchant") ?: ""
             ts = intent.getLongExtra("ts", System.currentTimeMillis())
-            selected = intent.getStringExtra("category") ?: "其他"
+            selected = intent.getStringExtra("category") ?: "其它"
         } else {
             // 通知链路：已入库为待确认，改类别后确认
             recId = intent.getLongExtra("id", -1L)
@@ -45,7 +45,9 @@ class ConfirmActivity : Activity() {
             amount = rec.amount
             merchant = rec.merchant
             ts = rec.ts
-            selected = if (rec.category == "待确认") "其他" else rec.category
+            selected = intent.getStringExtra("category")
+                ?.takeIf { it.isNotBlank() && it != "待确认" }
+                ?: if (rec.category == "待确认") "其它" else rec.category
         }
 
         val fmt = SimpleDateFormat("MM月dd日 HH:mm", Locale.CHINA)
@@ -54,8 +56,7 @@ class ConfirmActivity : Activity() {
             "$merchant · ${fmt.format(Date(ts))}"
 
         val grid = findViewById<GridLayout>(R.id.gridCats)
-        val cats = listOf("餐饮", "交通", "购物", "日用", "娱乐", "居住", "医疗", "人情", "其他")
-        for (c in cats) {
+        for (c in Category.ALL) {
             val b = Button(this)
             b.text = c
             b.setOnClickListener {
