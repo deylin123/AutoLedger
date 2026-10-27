@@ -15,6 +15,15 @@ import java.util.Locale
  */
 object PayApps {
 
+    /**
+     * 同一笔消费被判为「重复识别」的时间窗，页面抓取与通知监听共用。
+     *
+     * 支付是有过程的行为：输金额 → 收银台 → 密码/指纹 → 成功页，中间可能隔几十秒。
+     * 窗口取 90 秒既能覆盖整个支付流程，又不至于把「两笔真实的同金额消费」误合并。
+     */
+    const val MERGE_WINDOW_MS = 90_000L
+
+
     /** 一个消费类应用。titleWords 命中其一，才认为当前页面是「支付明细 / 结果页」 */
     class App(val pkg: String, val name: String, val titleWords: List<String>)
 
@@ -22,7 +31,7 @@ object PayApps {
     /** 电商 / 商城：订单详情、支付成功页 */
     private val ECOM = listOf(
         "订单详情", "订单信息", "支付成功", "付款成功", "购买成功",
-        "交易成功", "已支付", "支付详情", "付款详情", "收银台"
+        "交易成功", "已支付", "支付详情", "付款详情"
     )
     /** 出行 / 票务：订单详情、预订成功页 */
     private val TRIP = listOf(
@@ -282,8 +291,71 @@ object PayApps {
 
     // ---------------- 页面判定 ----------------
 
-    fun hasTitle(texts: List<String>, app: App?): Boolean {
-        val words = app?.titleWords ?: COMMON_TITLE_WORDS
+    /**
+     * 支付已完成的强证据：出现其一就说明这笔钱已经扣掉了。
+     */
+    private val PAID_WORDS = listOf(
+        "支付成功", "付款成功", "交易成功", "扣款成功", "扣费成功", "消费成功",
+        "购买成功", "下单成功", "支付完成", "付款完成", "转账成功", "缴费成功",
+        "已支付", "已付款", "已扣款", "支付结果", "付款结果"
+    )
+
+    /**
+     * 详情页的结构证据：这些字段只出现在「已经发生过的账单」里。
+     * 用于那些页面本身没写「支付成功」、但确实是账单详情的情况（京东订单详情、支付宝账单详情等）。
+     *
+     * 刻意不含「收款方」：微信/支付宝的转账输入页也会出现「收款方」，放进来会把输金额页判成已支付。
+     */
+    private val DETAIL_WORDS = listOf(
+        "账单详情", "交易详情", "付款详情", "支付详情", "账单分类",
+        "交易单号", "商户单号", "转账单号", "账单号", "付款时间", "支付时间",
+        "交易时间", "商品说明", "订单编号", "订单号"
+    )
+
+    /**
+     * 支付**尚未完成**的强信号：还在输金额、选支付方式、等密码。
+     *
+     * 这是 v2.6 修「输入金额时就记一次、支付成功又记一次」的核心：
+     * 收银台页面同样有「实付款 ¥89.00」这种强标签金额，不拦住就会被当成账单。
+     * 注意这里刻意不放「支付方式」「优惠」等成功页上也会出现的词。
+     */
+    private val UNSETTLED_WORDS = listOf(
+        "确认支付", "立即支付", "去支付", "立即付款", "确认付款", "请付款",
+        "请输入支付密码", "输入支付密码", "请输入密码", "请输入交易密码",
+        "指纹支付", "面容支付", "待支付", "待付款", "等待付款", "等待支付",
+        "请尽快支付", "订单已提交", "提交订单", "去结算", "确认订单",
+        "请选择支付方式", "选择付款方式", "收银台", "订单待支付",
+        "确认转账", "立即转账"
+    )
+
+    const val STATE_UNKNOWN = 0
+    const val STATE_UNPAID = 1
+    const val STATE_PAID = 2
+
+    /**
+     * 判断当前页面处于什么阶段：
+     *  [STATE_PAID]    已扣款 —— 可以记账
+     *  [STATE_UNPAID]  还在支付流程里（输金额 / 收银台 / 等密码）—— 绝不能记账
+     *  [STATE_UNKNOWN] 看不出支付痕迹（商品详情、订单列表、首页）—— 不记账
+     *
+     * 判定顺序很重要：先看成功词，再看未完成词，最后才看详情页结构。
+     * 支付成功页上也会出现「支付方式：余额宝」这类字样，所以未完成词表里不含这类通用词；
+     * 而收银台上同时出现「订单编号」（结构证据）和「立即支付」（未完成信号），
+     * 必须让未完成信号优先，否则收银台会被结构证据放行。
+     */
+    fun payState(texts: List<String>): Int {
+        val hasPaid = PAID_WORDS.any { w -> texts.any { it.contains(w) } }
+        if (hasPaid) return STATE_PAID
+        val hasUnsettled = UNSETTLED_WORDS.any { w -> texts.any { it.contains(w) } }
+        if (hasUnsettled) return STATE_UNPAID
+        val detail = DETAIL_WORDS.any { w -> texts.any { it.contains(w) } }
+        return if (detail) STATE_PAID else STATE_UNKNOWN
+    }
+
+    /** 单条文本是否属于「钱还没付」的提醒（订单待付款、请尽快支付之类），通知通道用 */
+    fun isUnsettledText(s: String): Boolean = UNSETTLED_WORDS.any { s.contains(it) }
+
+    fun hasTitle(texts: List<String>, app: App?): Boolean {        val words = app?.titleWords ?: COMMON_TITLE_WORDS
         return texts.any { t -> words.any { w -> t.contains(w) } }
     }
 

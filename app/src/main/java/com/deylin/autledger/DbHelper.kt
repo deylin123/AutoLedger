@@ -273,6 +273,21 @@ class DbHelper(context: Context) :
         ).use { return it.moveToFirst() }
     }
 
+    /**
+     * 取出时间窗内「同金额」的最近一条记录，用于把同一笔支付的多次识别收敛成一条。
+     *
+     * 为什么按金额而不按商户名：同一笔在收银台、支付结果页、账单详情里提取到的商户名经常不一样，
+     * 按商户名比对必然漏判。为什么必须带时间窗：两笔真实的同金额消费（先后买两杯咖啡）不能被吞掉。
+     */
+    fun recentSameAmount(amount: Double, ts: Long, windowMs: Long): Rec? {
+        val cols = COLS.joinToString(",")
+        readableDatabase.rawQuery(
+            "SELECT $cols FROM records WHERE amount=? AND abs(ts-?)<? ORDER BY abs(ts-?) ASC LIMIT 1",
+            arrayOf(amount.toString(), ts.toString(), windowMs.toString(), ts.toString())
+        ).use { c -> if (c.moveToFirst()) return read(c) }
+        return null
+    }
+
     // ---------- 预算 ----------
 
     fun budget(month: String): Double {

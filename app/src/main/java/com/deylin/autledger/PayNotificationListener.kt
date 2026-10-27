@@ -76,6 +76,9 @@ class PayNotificationListener : NotificationListenerService() {
         // ① 必须是支付成功类通知（词表 + 「向XX付款」句式）
         val strongPay = STRONG_PAY_WORDS.any { body.contains(it) } || PAY_PATTERN.containsMatchIn(body)
         if (!strongPay) return
+        // ①.5 排除「还没付钱」的提醒：不少 App 会推「订单待付款，付款成功后将…」，
+        //     里面同时含「付款成功」，不单独拦会被当成已支付
+        if (PayApps.isUnsettledText(body)) return
         // ② 排除退款 / 到账
         if (PayApps.INCOME_WORDS.any { body.contains(it) }) return
         // ③ 排除营销推送
@@ -100,12 +103,16 @@ class PayNotificationListener : NotificationListenerService() {
 
         val db = DbHelper(this)
         try {
-            if (db.existsSimilar(amount, merchant, ts)) {
-                Diag.log(this, "$appName 通知 ¥$amount → 跳过：2分钟内已记录")
-                return
-            }
-            if (db.existsAmountWithin(amount, ts, 20000)) {
-                Diag.log(this, "$appName 通知 ¥$amount → 跳过：20秒内同金额已有记录")
+            // 同一笔可能已被页面通道记下（商户名往往不一致），按「金额 + 90 秒」收敛，不按商户名比对
+            val prev = db.recentSameAmount(amount, ts, PayApps.MERGE_WINDOW_MS)
+            if (prev != null) {
+                if (prev.status == 0 && prev.note.endsWith("消费") && !merchant.endsWith("消费")) {
+                    // 待确认那条只是兜底名，用通知里的具体商户名补全，时间仍保留页面抓到的
+                    db.updateRecord(prev.id, amount, prev.cat, merchant, prev.ts, 0)
+                    Diag.log(this, "$appName 通知 ¥$amount → 合并商户名到待确认 #${prev.id}（$merchant）")
+                } else {
+                    Diag.log(this, "$appName 通知 ¥$amount → 跳过：90秒内同金额已有记录 #${prev.id}")
+                }
                 return
             }
             val book = getSharedPreferences("cfg", MODE_PRIVATE)

@@ -50,6 +50,12 @@ class BillAccessibilityService : AccessibilityService() {
         /** 单页最多收集多少条文本 */
         private const val MAX_TEXTS = 260
 
+        /**
+         * 同一笔消费被判为"重复识别"的时间窗（与通知通道共用，见 [PayApps.MERGE_WINDOW_MS]）。
+         * 旧版只按 20 秒判重，跨过这 20 秒就会把同一笔存成两条。
+         */
+        private const val MERGE_WINDOW = PayApps.MERGE_WINDOW_MS
+
         /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
         private val FIELD_NOISE = listOf(
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
@@ -70,6 +76,7 @@ class BillAccessibilityService : AccessibilityService() {
     private var lastAmountAt = 0L
 
     private val suspectLogged = HashMap<String, Long>()
+    private val skipLogged = HashMap<String, Long>()
     private val labelCache = HashMap<String, String>()
 
     private var card: View? = null
@@ -135,6 +142,23 @@ class BillAccessibilityService : AccessibilityService() {
             // 未注册的 App：必须有支出方向佐证才敢认定，避免"订单详情"浏览页误抓
             if (app == null && !PayApps.hasExpenseSignal(texts)) return
 
+            // 关键闸门（v2.6）：必须是「已经扣款」的页面。
+            // 收银台、输入金额页同样有「实付款 ¥89.00」这类强标签金额，不拦住就会在付款前先记一笔，
+            // 付款成功后再记一笔 —— 用户看到的「一次支付识别两次」就是这个。
+            val state = PayApps.payState(texts)
+            if (state != PayApps.STATE_PAID) {
+                val name = app?.name ?: appLabel(pkg)
+                val v = PayApps.findAmount(texts)?.value
+                if (state == PayApps.STATE_UNPAID) {
+                    logSkip("$pkg#$state#$v",
+                        "$name ¥${v ?: "-"} → 跳过：还在支付流程里（输金额/收银台/等密码），钱未扣")
+                } else {
+                    logSkip("$pkg#$state",
+                        "$name → 跳过：页面上没有支付完成证据，按浏览页处理")
+                }
+                return
+            }
+
             if (scan(pkg, texts, app)) hitToken = token
         } catch (e: Exception) {
             Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
@@ -177,13 +201,21 @@ class BillAccessibilityService : AccessibilityService() {
 
         val db = DbHelper(this)
         try {
-            if (db.existsSimilar(amount, note, ts)) {
-                Diag.log(this, "$appName ¥$amount $note → 跳过：2分钟内已记录")
-                return false
-            }
-            // 页面与通知两条通道会同时命中同一笔，商户名提取不一致，用金额+20秒兜一层
-            if (db.existsAmountWithin(amount, ts, 20000)) {
-                Diag.log(this, "$appName ¥$amount → 跳过：20秒内同金额已有记录（另一通道已抓）")
+            // 一笔支付只允许落一条记录。
+            // 同一笔可能在「结果页」和「账单详情」各被识别一次（两个页面文字不同、商户名不同），
+            // 也可能页面和通知各命中一次 —— 所以按「金额 + 90 秒」收敛，不按商户名比对。
+            val prev = db.recentSameAmount(amount, ts, MERGE_WINDOW)
+            if (prev != null) {
+                if (prev.status == 0) {
+                    // 先前那条还没确认：用本次更完整的信息覆盖（商品名通常只有结果页才有），不新增、不重复弹卡片
+                    val merged = betterNote(prev.note, note)
+                    db.updateRecord(prev.id, amount, cat, merged, ts, 0)
+                    lastAmount = amount
+                    lastAmountAt = now
+                    Diag.log(this, "$appName ¥$amount → 同一笔已合并到待确认 #${prev.id}（备注：$merged）")
+                    return true
+                }
+                Diag.log(this, "$appName ¥$amount → 跳过：${MERGE_WINDOW / 1000}秒内同金额已记账（#${prev.id}）")
                 return false
             }
             val id = db.addRecord(
@@ -201,6 +233,26 @@ class BillAccessibilityService : AccessibilityService() {
         } finally {
             db.close()
         }
+    }
+
+    /** 合并备注：本次只是兜底名（"支付宝消费"）时，保留上一次识别到的具体商户名 */
+    private fun betterNote(oldNote: String, newNote: String): String {
+        if (oldNote.isBlank()) return newNote
+        if (newNote.isBlank()) return oldNote
+        if (newNote.endsWith("消费") && !oldNote.endsWith("消费")) return oldNote
+        return newNote
+    }
+
+    /**
+     * 跳过原因的日志节流。
+     * 输金额页停留期间会反复触发扫描与重试，不节流会把诊断日志刷满、把有用信息挤掉。
+     */
+    private fun logSkip(key: String, msg: String) {
+        val now = System.currentTimeMillis()
+        if (now - (skipLogged[key] ?: 0L) < 60_000L) return
+        if (skipLogged.size > 60) skipLogged.clear()
+        skipLogged[key] = now
+        Diag.log(this, msg)
     }
 
     /** 未登记 App 的疑似消费页：只记一次包名，方便后续在 PayApps 里补登记 */
