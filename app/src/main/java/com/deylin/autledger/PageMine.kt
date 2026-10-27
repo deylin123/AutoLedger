@@ -1,0 +1,323 @@
+package com.deylin.autledger
+
+import android.app.AlertDialog
+import android.content.Context
+import android.content.Intent
+import android.provider.Settings
+import android.text.InputType
+import android.view.Gravity
+import android.view.View
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/** 我的：账本、预算、分类管理、自动记账权限、数据导出、诊断 */
+class PageMine(private val act: MainActivity) {
+
+    private val c: Context = act
+
+    fun build(): View {
+        val root = Ui.col(c)
+        root.setBackgroundColor(Ui.BG)
+
+        val top = Ui.row(c)
+        Ui.pad(top, 16, 14, 16, 6)
+        top.addView(Ui.tv(c, "我的", 18f, Ui.TEXT, true))
+        root.addView(top, Ui.lp(Ui.MP, Ui.WC))
+
+        val sv = ScrollView(c)
+        sv.isFillViewport = true
+        val body = Ui.col(c)
+        Ui.pad(body, 14, 4, 14, 30)
+
+        // ---- 账本 ----
+        val bookCard = card("账本")
+        val chips = Ui.col(c)
+        var line: LinearLayout? = null
+        val books = act.db().books()
+        for (i in books.indices) {
+            if (i % 3 == 0) {
+                line = Ui.row(c)
+                chips.addView(line, Ui.lp(Ui.MP, Ui.WC))
+            }
+            val b = chipText(books[i], books[i] == act.book)
+            b.setOnClickListener {
+                act.book = books[i]
+                act.refresh()
+            }
+            val p = Ui.lp(0, Ui.WC, 1f)
+            p.setMargins(0, Ui.dp(c, 4f), Ui.dp(c, 6f), Ui.dp(c, 4f))
+            line?.addView(b, p)
+        }
+        val filler = (3 - books.size % 3) % 3
+        for (i in 0 until filler) {
+            val sp = View(c)
+            val p = Ui.lp(0, Ui.WC, 1f)
+            p.setMargins(0, 0, Ui.dp(c, 6f), 0)
+            line?.addView(sp, p)
+        }
+        bookCard.addView(chips)
+        val addBook = chipText("＋ 新建账本", false)
+        addBook.setOnClickListener { newBookDialog { act.refresh() } }
+        val abp = Ui.lp(Ui.WC, Ui.WC)
+        abp.topMargin = Ui.dp(c, 6f)
+        bookCard.addView(addBook, abp)
+        body.addView(bookCard, Ui.lp(Ui.MP, Ui.WC))
+
+        // ---- 预算 ----
+        val month = String.format(Locale.CHINA, "%04d-%02d", act.curY, act.curM + 1)
+        val budget = act.db().budget(month)
+        val budgetCard = card("预算（${act.curM + 1}月）")
+        budgetCard.addView(
+            rowItem(
+                "本月总预算",
+                if (budget > 0) "¥" + Ui.money(budget) else "未设置"
+            ) { setBudgetDialog(month, budget) }
+        )
+        val bcp = Ui.lp(Ui.MP, Ui.WC)
+        bcp.topMargin = Ui.dp(c, 10f)
+        body.addView(budgetCard, bcp)
+
+        // ---- 分类 ----
+        val catCard = card("分类")
+        catCard.addView(rowItem("分类管理", "增删自定义分类") { manageCats() })
+        val ccp = Ui.lp(Ui.MP, Ui.WC)
+        ccp.topMargin = Ui.dp(c, 10f)
+        body.addView(catCard, ccp)
+
+        // ---- 自动记账 ----
+        val autoCard = card("自动记账")
+        val pend = act.db().pendingCount()
+        autoCard.addView(
+            rowItem("待确认账单", if (pend > 0) "$pend 笔" else "无") {
+                act.startActivity(Intent(act, PendingActivity::class.java))
+            }
+        )
+        autoCard.addView(permRow("通知监听", "读取微信/支付宝支付通知", hasNotifListener()) { act.openNotifListener() })
+        autoCard.addView(permRow("账单页抓取", "打开账单详情页时识别金额", hasAccessibility()) { act.openAccessibility() })
+        autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
+        autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", true) { act.openBattery() })
+        val acp = Ui.lp(Ui.MP, Ui.WC)
+        acp.topMargin = Ui.dp(c, 10f)
+        body.addView(autoCard, acp)
+
+        // ---- 数据 ----
+        val dataCard = card("数据")
+        dataCard.addView(rowItem("导出账单 CSV", "") { exportCsv() })
+        dataCard.addView(rowItem("抓取诊断日志", "") { showDiag() })
+        dataCard.addView(rowItem("关于", "版本 2.0", arrow = false) {})
+        val dcp = Ui.lp(Ui.MP, Ui.WC)
+        dcp.topMargin = Ui.dp(c, 10f)
+        body.addView(dataCard, dcp)
+
+        val tip = Ui.tv(c, "账单只存在本机，不上传任何服务器", 11f, Ui.SUB)
+        tip.gravity = Gravity.CENTER
+        tip.setPadding(0, Ui.dp(c, 16f), 0, 0)
+        body.addView(tip, Ui.lp(Ui.MP, Ui.WC))
+
+        sv.addView(body, Ui.lp(Ui.MP, Ui.WC))
+        root.addView(sv, Ui.lp(Ui.MP, 0, 1f))
+        return root
+    }
+
+    // ---------- 组件 ----------
+
+    private fun card(title: String): LinearLayout {
+        val cd = Ui.card(c, 14f, 8f)
+        val t = Ui.tv(c, title, 12f, Ui.SUB, true)
+        t.setPadding(0, Ui.dp(c, 4f), 0, Ui.dp(c, 6f))
+        cd.addView(t)
+        return cd
+    }
+
+    private fun chipText(text: String, selected: Boolean): TextView {
+        val t = Ui.tv(c, text, 12.5f, if (selected) 0xFFFFFFFF.toInt() else Ui.TEXT, selected)
+        t.gravity = Gravity.CENTER
+        t.setBackground(Ui.round(c, if (selected) Ui.ORANGE else 0xFFF7F1E8.toInt(), 14f))
+        t.setPadding(0, Ui.dp(c, 9f), 0, Ui.dp(c, 9f))
+        return t
+    }
+
+    private fun rowItem(title: String, value: String, arrow: Boolean = true, onClick: () -> Unit): View {
+        val row = Ui.row(c)
+        Ui.pad(row, 0, 12, 0, 12)
+        row.addView(Ui.tv(c, title, 14f, Ui.TEXT), Ui.lp(0, Ui.WC, 1f))
+        if (value.isNotEmpty()) row.addView(Ui.tv(c, value, 12f, Ui.SUB))
+        if (arrow) {
+            val a = Ui.tv(c, "›", 16f, Ui.SUB)
+            a.setPadding(Ui.dp(c, 6f), 0, 0, 0)
+            row.addView(a)
+        }
+        row.setOnClickListener { onClick() }
+        return row
+    }
+
+    private fun permRow(title: String, desc: String, ok: Boolean, onClick: () -> Unit): View {
+        val row = Ui.row(c)
+        Ui.pad(row, 0, 11, 0, 11)
+        val col = Ui.col(c)
+        col.addView(Ui.tv(c, title, 14f, Ui.TEXT))
+        val d = Ui.tv(c, desc, 11f, Ui.SUB)
+        d.setPadding(0, Ui.dp(c, 3f), 0, 0)
+        col.addView(d)
+        row.addView(col, Ui.lp(0, Ui.WC, 1f))
+        val st = Ui.tv(c, if (ok) "已开启" else "去开启", 12f, if (ok) Ui.GREEN else Ui.ORANGE, true)
+        row.addView(st)
+        row.setOnClickListener { onClick() }
+        return row
+    }
+
+    // ---------- 权限状态 ----------
+
+    private fun hasNotifListener(): Boolean {
+        val s = Settings.Secure.getString(act.contentResolver, "enabled_notification_listeners") ?: return false
+        return s.contains(act.packageName)
+    }
+
+    private fun hasAccessibility(): Boolean {
+        val s = Settings.Secure.getString(act.contentResolver, "enabled_accessibility_services") ?: return false
+        return s.contains(act.packageName)
+    }
+
+    // ---------- 对话框 ----------
+
+    fun newBookDialog(onDone: () -> Unit) {
+        val et = EditText(c)
+        et.setHint("例如：旅行账本")
+        et.inputType = InputType.TYPE_CLASS_TEXT
+        AlertDialog.Builder(act)
+            .setTitle("新建账本")
+            .setView(et)
+            .setPositiveButton("创建") { _, _ ->
+                val name = et.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    act.db().addBook(name)
+                    act.book = name
+                    onDone()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun setBudgetDialog(month: String, cur: Double) {
+        val et = EditText(c)
+        et.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        if (cur > 0) et.setText(Ui.money(cur))
+        et.setHint("输入 0 表示取消预算")
+        AlertDialog.Builder(act)
+            .setTitle("设置本月总预算")
+            .setView(et)
+            .setPositiveButton("保存") { _, _ ->
+                val v = et.text.toString().trim().toDoubleOrNull() ?: 0.0
+                act.db().setBudget(month, v)
+                Toast.makeText(act, if (v > 0) "预算已设置" else "已取消预算", Toast.LENGTH_SHORT).show()
+                act.refresh()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun manageCats() {
+        AlertDialog.Builder(act)
+            .setTitle("分类管理")
+            .setItems(arrayOf("支出分类", "收入分类")) { _, w -> manageCatType(w) }
+            .show()
+    }
+
+    private fun manageCatType(t: Int) {
+        val list = act.db().cats(t)
+        val names = ArrayList<String>()
+        for (cd in list) names.add(cd.name)
+        AlertDialog.Builder(act)
+            .setTitle(if (t == 0) "支出分类" else "收入分类")
+            .setItems(names.toTypedArray()) { _, w ->
+                AlertDialog.Builder(act)
+                    .setTitle("删除「${names[w]}」？")
+                    .setMessage("已记录的账单不会删除，只是该分类不再出现在选择列表")
+                    .setPositiveButton("删除") { _, _ ->
+                        act.db().delCat(list[w].id)
+                        act.refresh()
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            .setPositiveButton("＋ 新增") { _, _ -> addCatDialog(t) }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun addCatDialog(t: Int) {
+        val box = Ui.col(c)
+        Ui.pad(box, 16, 8, 16, 0)
+        val name = EditText(c)
+        name.setHint("分类名称")
+        name.inputType = InputType.TYPE_CLASS_TEXT
+        box.addView(name)
+        val emoji = EditText(c)
+        emoji.setHint("图标（可填一个 emoji，如 🍔）")
+        emoji.inputType = InputType.TYPE_CLASS_TEXT
+        box.addView(emoji)
+        AlertDialog.Builder(act)
+            .setTitle("新增分类")
+            .setView(box)
+            .setPositiveButton("添加") { _, _ ->
+                val n = name.text.toString().trim()
+                if (n.isEmpty()) return@setPositiveButton
+                val e = emoji.text.toString().trim()
+                act.db().addCat(n, if (e.isEmpty()) "📌" else e, t)
+                act.refresh()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun exportCsv() {
+        try {
+            val recs = act.db().list(0L, System.currentTimeMillis() + 86400000L, "", -1, true)
+            val sb = StringBuilder()
+            sb.append("日期,类型,分类,金额,备注,账本,来源\r\n")
+            val f = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA)
+            for (r in recs) {
+                sb.append(f.format(Date(r.ts))).append(',')
+                sb.append(if (r.type == 0) "支出" else "收入").append(',')
+                sb.append(r.cat).append(',')
+                sb.append(Ui.money(r.amount)).append(',')
+                sb.append(r.note.replace(",", " ")).append(',')
+                sb.append(r.book).append(',')
+                sb.append(r.src).append("\r\n")
+            }
+            val dir = act.getExternalFilesDir(null) ?: act.filesDir
+            val file = File(dir, "账单导出_" + System.currentTimeMillis() + ".csv")
+            file.writeText("\uFEFF" + sb.toString(), Charsets.UTF_8)
+            AlertDialog.Builder(act)
+                .setTitle("导出完成（${recs.size} 笔）")
+                .setMessage("文件位置：\n" + file.absolutePath)
+                .setPositiveButton("知道了", null)
+                .show()
+        } catch (e: Exception) {
+            Toast.makeText(act, "导出失败：" + e.javaClass.simpleName, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showDiag() {
+        val txt = TextView(c)
+        txt.text = Diag.dump(act, 30)
+        txt.setTextSize(11f)
+        txt.setTextColor(Ui.TEXT)
+        txt.setPadding(Ui.dp(c, 14f), Ui.dp(c, 10f), Ui.dp(c, 14f), Ui.dp(c, 10f))
+        val sv = ScrollView(c)
+        sv.addView(txt)
+        AlertDialog.Builder(act)
+            .setTitle("抓取诊断（最近 30 条）")
+            .setView(sv)
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+}

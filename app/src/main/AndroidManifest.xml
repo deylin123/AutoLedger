@@ -18,10 +18,8 @@
         </activity>
 
         <activity
-            android:name=".ConfirmActivity"
-            android:exported="false"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true" />
+            android:name=".PendingActivity"
+            android:exported="false" />
 
         <service
             android:name=".BillAccessibilityService"

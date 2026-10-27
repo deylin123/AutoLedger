@@ -3,135 +3,151 @@ package com.deylin.autledger
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.view.LayoutInflater
-import android.widget.Button
+import android.view.Gravity
+import android.view.View
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.util.Calendar
 
 class MainActivity : Activity() {
 
-    private lateinit var db: DbHelper
+    lateinit var content: FrameLayout
+    lateinit var host: FrameLayout
+    private var tab = 0
+    private val navs = ArrayList<TextView>()
+    private var helper: DbHelper? = null
+
+    var curY: Int = 0
+    var curM: Int = 0
+
+    var book: String = "日常账本"
+        set(v) {
+            field = v
+            getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("book", v).apply()
+        }
+
+    fun db(): DbHelper {
+        var h = helper
+        if (h == null) {
+            h = DbHelper(this)
+            helper = h
+        }
+        return h
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        db = DbHelper(this)
-
-        findViewById<Button>(R.id.btnPerm).setOnClickListener {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        }
-        findViewById<Button>(R.id.btnAcc).setOnClickListener {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }
-        findViewById<Button>(R.id.btnOverlay).setOnClickListener {
-            if (!Settings.canDrawOverlays(this)) {
-                startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
-                )
-            } else {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        val now = Calendar.getInstance()
+        curY = now.get(Calendar.YEAR)
+        curM = now.get(Calendar.MONTH)
+        book = getSharedPreferences("cfg", MODE_PRIVATE).getString("book", "日常账本") ?: "日常账本"
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
+            } catch (_: Exception) {
             }
         }
 
-        findViewById<Button>(R.id.btnBattery).setOnClickListener {
-            try {
-                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-            } catch (e: Exception) {
-                try {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.parse("package:$packageName")
-                        )
-                    )
-                } catch (_: Exception) {
+        val root = FrameLayout(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setBackgroundColor(Ui.BG)
+
+        content = FrameLayout(this)
+        col.addView(content, Ui.lp(Ui.MP, 0, 1f))
+        col.addView(buildNav(), Ui.lp(Ui.MP, Ui.dp(this, 58f)))
+
+        root.addView(col, FrameLayout.LayoutParams(Ui.MP, Ui.MP))
+        host = FrameLayout(this)
+        root.addView(host, FrameLayout.LayoutParams(Ui.MP, Ui.MP))
+        setContentView(root)
+
+        show(0)
+    }
+
+    private fun buildNav(): View {
+        val bar = Ui.col(this)
+        bar.setBackgroundColor(Ui.CARD)
+        val line = Ui.divider(this)
+        bar.addView(line, Ui.lp(Ui.MP, 1))
+        val row = Ui.row(this)
+        bar.addView(row, Ui.lp(Ui.MP, 0, 1f))
+
+        val titles = arrayOf("明细", "图表", "＋", "我的")
+        for (i in titles.indices) {
+            val t = Ui.tv(this, titles[i], if (i == 2) 24f else 12f, if (i == 2) Ui.ORANGE else Ui.SUB, i == 2)
+            t.gravity = Gravity.CENTER
+            t.layoutParams = Ui.lp(0, Ui.MP, 1f)
+            t.setOnClickListener {
+                when (i) {
+                    2 -> PageEntry(this).show(null)
+                    3 -> show(2)
+                    else -> show(i)
                 }
             }
+            row.addView(t)
+            navs.add(t)
         }
+        return bar
+    }
 
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+    fun show(i: Int) {
+        tab = i
+        content.removeAllViews()
+        val v: View = when (i) {
+            0 -> PageDetail(this).build()
+            1 -> PageChart(this).build()
+            else -> PageMine(this).build()
         }
+        content.addView(v, FrameLayout.LayoutParams(Ui.MP, Ui.MP))
+        for (k in navs.indices) {
+            if (k == 2) continue
+            val selected = (k == 3 && i == 2) || (k != 3 && k == i)
+            navs[k].setTextColor(if (selected) Ui.ORANGE else Ui.SUB)
+        }
+    }
+
+    fun refresh() {
+        show(tab)
     }
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        if (this::content.isInitialized && content.childCount > 0) show(tab)
     }
 
-    private fun listenerEnabled(): Boolean {
-        val s = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: return false
-        return s.split(":").any { it.contains(packageName) }
-    }
+    // ---------- 权限入口 ----------
 
-    private fun accEnabled(): Boolean {
-        val s = Settings.Secure.getString(contentResolver, "enabled_accessibility_services") ?: return false
-        return s.contains("$packageName/.BillAccessibilityService") ||
-                s.contains("$packageName.BillAccessibilityService")
-    }
-
-    private fun refresh() {
-        findViewById<TextView>(R.id.tvStatus).text =
-            if (listenerEnabled())
-                "✅ 通知监听已开启：支付推送自动记录"
-            else
-                "❌ 通知监听未开启：点下方「权限1」开启（支付到账推送实时记录用）"
-
-        findViewById<TextView>(R.id.tvStatus2).text =
-            if (accEnabled())
-                "✅ 账单页抓取已开启：打开支付宝/微信「账单详情」页即自动弹窗"
-            else
-                "❌ 账单页抓取未开启：点下方「权限2」→ 已下载的服务 → 找到「自动记账」并开启"
-
-        findViewById<TextView>(R.id.tvStatus3).text =
-            if (Settings.canDrawOverlays(this))
-                "✅ 悬浮窗已允许：抓取后屏幕顶部弹确认条"
-            else
-                "提示：点「权限3」允许「显示在其他应用上层」，弹窗体验更好（不允许可用通知提醒）"
-
-        findViewById<TextView>(R.id.tvTotal).text =
-            "本月已确认支出：¥" + String.format("%.2f", db.monthTotal())
-
-        // 抓取诊断：直接看到无障碍服务到底有没有收到页面、卡在哪一步
-        findViewById<TextView>(R.id.tvDiag).text = Diag.dump(this, 8)
-
-        val box = findViewById<LinearLayout>(R.id.listBox)
-        box.removeAllViews()
-        val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
-        val inf = LayoutInflater.from(this)
-        val records = db.recent(100)
-        for (r in records) {
-            val v = inf.inflate(R.layout.item_record, box, false)
-            v.findViewById<TextView>(R.id.tvLine1).text =
-                "${r.merchant}　¥" + String.format("%.2f", r.amount)
-            v.findViewById<TextView>(R.id.tvLine2).text =
-                "${fmt.format(Date(r.ts))} · ${r.category} · ${statusText(r.status)}"
-            box.addView(v)
-        }
-        if (records.isEmpty()) {
-            val empty = TextView(this)
-            empty.text = "暂无记录。支付一笔或打开账单详情页试试～"
-            empty.setPadding(0, 24, 0, 0)
-            box.addView(empty)
+    fun openNotifListener() {
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (_: Exception) {
         }
     }
 
-    private fun statusText(st: Int) = when (st) {
-        0 -> "待确认"
-        1 -> "已确认"
-        else -> "已忽略"
+    fun openAccessibility() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (_: Exception) {
+        }
+    }
+
+    fun openOverlay() {
+        try {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        } catch (_: Exception) {
+        }
+    }
+
+    fun openBattery() {
+        try {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        } catch (_: Exception) {
+        }
     }
 }

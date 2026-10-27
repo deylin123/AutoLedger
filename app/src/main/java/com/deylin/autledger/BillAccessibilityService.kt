@@ -1,41 +1,27 @@
 package com.deylin.autledger
 
 import android.accessibilityservice.AccessibilityService
-import android.app.AlertDialog
-import android.app.DatePickerDialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.text.InputType
-import android.view.ContextThemeWrapper
 import android.view.Gravity
-import android.view.LayoutInflater
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.GridLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.widget.LinearLayout
 import android.widget.Toast
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Locale
 
 /**
- * 账单页抓取服务：
- * 仅当屏幕内容是支付宝/微信「账单详情」页时读取文字，
- * 提取金额、收款方、时间，自动预分类后弹出「记账表单」，
- * 分类 / 金额 / 日期 / 备注都可在弹窗里直接改，点保存才入库。
+ * 账单页抓取：只在支付宝/微信「账单详情」页读屏。
+ * 抓到后**先落成待确认账单**（数据不会丢），再尝试弹悬浮卡片；没弹出来也能在「待确认」里处理。
  */
 class BillAccessibilityService : AccessibilityService() {
 
@@ -43,49 +29,44 @@ class BillAccessibilityService : AccessibilityService() {
         const val PKG_ALIPAY = "com.eg.android.AlipayGphone"
         const val PKG_WECHAT = "com.tencent.mm"
 
-        private val TIME_LINE = Regex("(20[0-9]{2}[-/年.][0-9]{1,2}[-/月.][0-9]{1,2}[^0-9][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
+        private val TIME_LINE =
+            Regex("(20[0-9]{2}[-/年.][0-9]{1,2}[-/月.][0-9]{1,2}[^0-9][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
 
-        // 金额识别分级（取命中里分数最高的那条），兼容支付宝「支出6.5元」与小票式「-47.52」两种排版
-        // ① 带支出标记：支出6.5元 / 付款金额 ¥6.50 / 实付19元
         private val AMOUNT_LABELED = Regex(
             "^(?:支出|付款|支付|扣款|消费|实付|付款金额|支付金额|扣款金额|交易金额|支出金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$"
         )
-        // ② 带正负号：-6.50 / -¥47.52
-        private val AMOUNT_SIGNED = Regex("^(-|\\+)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
-        // ③ 带货币符号：¥6.50 / ￥19
-        private val AMOUNT_SYMBOL = Regex("^[¥￥]\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
-        // ④ 纯小数：6.50 / 6.5元
+        private val AMOUNT_SIGNED =
+            Regex("^(-|\\+)\\s*[¥￥]?\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
+        private val AMOUNT_SYMBOL =
+            Regex("^[¥￥]\\s*(\\d{1,6}(?:,\\d{3})*(?:\\.\\d{1,2})?)\\s*元?$")
         private val AMOUNT_PLAIN = Regex("^(\\d{1,6}(?:,\\d{3})*\\.\\d{1,2})\\s*元?$")
-        // 兜底：整句里抠金额
         private val AMOUNT_IN_TEXT = Regex("(?:支出|付款|支付|扣款|消费|实付|金额)\\s*[¥￥]?\\s*(\\d{1,6}(?:\\.\\d{1,2})?)\\s*元")
         private val CURRENCY_IN_TEXT = Regex("[¥￥]\\s*(\\d{1,6}(?:\\.\\d{1,2})?)")
 
         private val BILL_PAGE_WORDS = listOf("账单详情", "付款详情", "交易详情", "转账详情")
-        private val EXPENSE_WORDS = listOf("付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额", "支付时间", "付款时间", "当前状态", "支出")
+        private val EXPENSE_WORDS = listOf(
+            "付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额",
+            "支付时间", "付款时间", "当前状态", "支出"
+        )
         private val INCOME_WORDS = listOf("退款", "已存入", "已到账", "已收钱", "收款到账", "退款成功")
-        private val STATUS_WORDS = listOf("自动扣款成功", "付款成功", "支付成功", "交易成功", "已付款", "转账成功", "扣款成功", "待付款")
+        private val STATUS_WORDS = listOf(
+            "自动扣款成功", "付款成功", "支付成功", "交易成功", "已付款",
+            "转账成功", "扣款成功", "待付款"
+        )
         private val FIELD_KEYS = listOf("收款方全称", "收款方", "商户全称", "商户", "对方账户", "商品说明", "账单分类")
     }
 
     private var lastScan = 0L
     private var lastOtherScan = 0L
-    private var lastPopupKey = ""
-    private var lastPopupAt = 0L
+    private var lastKey = ""
+    private var lastAt = 0L
     private val handler = Handler(Looper.getMainLooper())
-    private var overlayView: View? = null
-
-    // 弹窗中的编辑状态
-    private var eAmount = 0.0
-    private var eMerchant = ""
-    private var eTs = 0L
-    private var eCategory = "其它"
-    private var eNote = ""
-    private var catButtons = ArrayList<Pair<TextView, String>>()
+    private var card: View? = null
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val pkg = event.packageName?.toString() ?: return
-        if (pkg == packageName) return    // 忽略自己
+        if (pkg == packageName) return
         val et = event.eventType
         if (et != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             et != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -106,17 +87,15 @@ class BillAccessibilityService : AccessibilityService() {
             val texts = ArrayList<String>()
             collect(root, texts)
             if (texts.size < 3) return
-            // 排除把自己 App 首页误判成账单页（首页也有「账单」「支出」等字样）
-            if (texts.any { it.contains("抓取诊断") || it.contains("权限1") || it.contains("本月已确认支出") }) return
-            val hasBillPage = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
-            if (!hasBillPage) return
+            if (texts.any { it.contains("自动记账") || it.contains("待确认") || it.contains("本月预算") }) return
+            val isBill = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
+            if (!isBill) return
 
             if (!whitelist) {
                 val hasAmount = texts.any { hasAmountIn(it.trim()) }
-                if (hasAmount) Diag.log(this, "其他App($pkg) 疑似账单详情页 → 未接入，仅记录包名")
+                if (hasAmount) Diag.log(this, "其他App($pkg) 疑似账单页 → 未接入，仅记包名")
                 return
             }
-
             scan(pkg, texts)
         } catch (e: Exception) {
             Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
@@ -129,25 +108,16 @@ class BillAccessibilityService : AccessibilityService() {
 
         val amt = findAmount(texts)
         if (amt == null) {
-            Diag.log(
-                this,
-                "$appName 账单页 → 仍未识别到金额（页面文字：${texts.take(12).joinToString("/").take(160)}）"
-            )
+            Diag.log(this, "$appName 账单页 → 未识别到金额（文字：${texts.take(12).joinToString("/").take(160)}）")
             return
         }
         val amount = amt.value
-        val amountIdx = amt.idx
-
         if (!amt.expense && INCOME_WORDS.any { joined.contains(it) }) {
-            Diag.log(this, "$appName 账单页 ¥$amount → 跳过：疑似收入/退款")
+            Diag.log(this, "$appName ¥$amount → 跳过：退款/收入")
             return
         }
-        val isExpense = amt.expense || EXPENSE_WORDS.any { joined.contains(it) }
-        if (!isExpense) {
-            Diag.log(
-                this,
-                "$appName 账单页 ¥$amount → 跳过：不像支出（页面文字：${texts.take(10).joinToString("/").take(120)}）"
-            )
+        if (!amt.expense && EXPENSE_WORDS.none { joined.contains(it) }) {
+            Diag.log(this, "$appName ¥$amount → 跳过：不像支出")
             return
         }
 
@@ -156,61 +126,61 @@ class BillAccessibilityService : AccessibilityService() {
             val i = texts.indexOf(k)
             if (i >= 0 && i + 1 < texts.size) fieldVals[k] = texts[i + 1].trim()
         }
-
         val merchant = fieldVals["收款方全称"]
             ?: fieldVals["商户全称"]
             ?: fieldVals["收款方"]
             ?: fieldVals["商户"]
             ?: fieldVals["对方账户"]
-            ?: run {
-                var found = ""
-                for (j in (amountIdx - 1) downTo maxOf(0, amountIdx - 4)) {
-                    val s = texts[j].trim()
-                    if (s.length in 2..20 && !hasAmountIn(s) &&
-                        STATUS_WORDS.none { s.contains(it) } && !s.contains("账单")
-                    ) {
-                        found = s
-                        break
-                    }
-                }
-                found.ifEmpty { appName + "支付" }
-            }
+            ?: goodsNear(texts, amt.idx, appName)
 
         val goods = fieldVals["商品说明"] ?: ""
         val catHint = fieldVals["账单分类"] ?: ""
-        val timeStr = TIME_LINE.find(joined)?.groupValues?.get(1)
-        val ts = parseTime(timeStr) ?: System.currentTimeMillis()
+        val ts = parseTime(TIME_LINE.find(joined)?.groupValues?.getOrNull(1)) ?: System.currentTimeMillis()
+        val cat = Category.of(merchant, goods, catHint)
 
         val db = DbHelper(this)
-        val dup = db.existsSimilar(amount, merchant, ts)
-        db.close()
-        if (dup) {
-            Diag.log(this, "$appName 账单页 ¥$amount $merchant → 跳过：2分钟内已记录过")
+        if (db.existsSimilar(amount, merchant, ts)) {
+            db.close()
+            Diag.log(this, "$appName ¥$amount $merchant → 跳过：2分钟内已记录")
             return
         }
         val key = "$amount|$merchant|${ts / 60000}"
-        if (key == lastPopupKey && System.currentTimeMillis() - lastPopupAt < 15000) return
-        lastPopupKey = key
-        lastPopupAt = System.currentTimeMillis()
+        if (key == lastKey && System.currentTimeMillis() - lastAt < 15000) {
+            db.close()
+            return
+        }
+        lastKey = key
+        lastAt = System.currentTimeMillis()
 
-        val category = Category.of(merchant, goods, catHint)
-        Diag.log(this, "$appName 账单页 ¥$amount $merchant → 已弹窗（预分类：$category）")
-        showForm(amount, merchant, ts, category)
+        val id = db.addRecord(
+            Rec(
+                amount = amount, type = 0, cat = cat, note = merchant, ts = ts,
+                book = bookOf(), status = 0, src = appName
+            )
+        )
+        db.close()
+        Diag.log(this, "$appName ¥$amount $merchant → 已存为待确认（预分类：$cat）")
+        if (id > 0) showCard(id, amount, merchant, cat)
+    }
+
+    private fun goodsNear(texts: List<String>, idx: Int, appName: String): String {
+        for (j in (idx - 1) downTo maxOf(0, idx - 4)) {
+            val s = texts[j].trim()
+            if (s.length in 2..20 && !hasAmountIn(s) &&
+                STATUS_WORDS.none { s.contains(it) } && !s.contains("账单")
+            ) return s
+        }
+        return appName + "支付"
     }
 
     private class Amt(val value: Double, val expense: Boolean, val score: Int, val idx: Int)
 
-    private fun toNum(s: String?): Double? =
-        s?.replace(",", "")?.replace(" ", "")?.toDoubleOrNull()
+    private fun toNum(s: String?): Double? = s?.replace(",", "")?.replace(" ", "")?.toDoubleOrNull()
 
     private fun hasAmountIn(s: String): Boolean =
         AMOUNT_LABELED.containsMatchIn(s) || AMOUNT_SIGNED.containsMatchIn(s) ||
             AMOUNT_SYMBOL.containsMatchIn(s) || AMOUNT_PLAIN.containsMatchIn(s)
 
-    /**
-     * 多级识别金额，取可信度最高的一条：
-     * 带支出标记(100) > 带正负号(90) > 带¥符号(85) > 纯小数(75) > 整句抠取(50)
-     */
     private fun findAmount(texts: List<String>): Amt? {
         var best: Amt? = null
         for (i in texts.indices) {
@@ -244,7 +214,6 @@ class BillAccessibilityService : AccessibilityService() {
         }
         if (best != null) return best
 
-        // 兜底：整句里抠（如「交易成功 支出 6.5 元」或「¥6.50」夹在句子里）
         for (i in texts.indices) {
             val s = texts[i].trim()
             if (s.isEmpty() || TIME_LINE.containsMatchIn(s)) continue
@@ -270,7 +239,7 @@ class BillAccessibilityService : AccessibilityService() {
         )
         for (f in fmts) {
             try {
-                val p = SimpleDateFormat(f, Locale.CHINA)
+                val p = java.text.SimpleDateFormat(f, java.util.Locale.CHINA)
                 p.isLenient = false
                 return p.parse(s)!!.time
             } catch (_: Exception) {
@@ -279,116 +248,91 @@ class BillAccessibilityService : AccessibilityService() {
         return null
     }
 
-    /** 悬浮记账表单：分类、金额、日期、备注可改，取消/保存都在弹窗内完成 */
-    private fun showForm(amount: Double, merchant: String, ts: Long, category: String) {
+    private fun bookOf(): String {
+        return getSharedPreferences("cfg", MODE_PRIVATE).getString("book", "日常账本") ?: "日常账本"
+    }
+
+    // ---------- 悬浮卡片 ----------
+
+    private fun showCard(id: Long, amount: Double, note: String, cat: String) {
         if (!Settings.canDrawOverlays(this)) {
-            Diag.log(this, "无悬浮窗权限 → 改用通知提醒")
-            notifyFallback(amount, merchant, ts, category)
+            notifyPending(id, amount, note, cat)
             return
         }
-        removeOverlay()
+        removeCard()
 
-        eAmount = amount
-        eMerchant = merchant
-        eTs = ts
-        eCategory = category
-        eNote = ""
+        val box = Ui.col(this)
+        box.setBackground(Ui.round(this, Ui.CARD, 18f, 1f, Ui.LINE))
+        val padH = Ui.dp(this, 14f)
+        box.setPadding(padH, Ui.dp(this, 12f), padH, Ui.dp(this, 10f))
 
-        val themeCtx = ContextThemeWrapper(this, android.R.style.Theme_Material_Light)
-        val view = LayoutInflater.from(themeCtx).inflate(R.layout.overlay_form, null)
-        val tvAmount = view.findViewById<TextView>(R.id.tvAmount)
-        val tvMerchant = view.findViewById<TextView>(R.id.tvMerchant)
-        val tvCategory = view.findViewById<TextView>(R.id.tvCategory)
-        val tvTime = view.findViewById<TextView>(R.id.tvTime)
-        val tvNote = view.findViewById<TextView>(R.id.tvNote)
-        val scrollCats = view.findViewById<ScrollView>(R.id.scrollCats)
-        val grid = view.findViewById<GridLayout>(R.id.gridCats)
+        val l1 = Ui.row(this)
+        l1.addView(Ui.tv(this, "自动识别到消费", 11.5f, Ui.SUB), Ui.lp(0, Ui.WC, 1f))
+        l1.addView(Ui.tv(this, "-¥" + Ui.money(amount), 18f, Ui.TEXT, true))
+        box.addView(l1, Ui.lp(Ui.MP, Ui.WC))
 
-        tvMerchant.text = merchant
-        tvAmount.text = "¥" + String.format("%.2f", eAmount)
-        tvCategory.text = eCategory
-        tvTime.text = SimpleDateFormat("yyyy.MM.dd", Locale.CHINA).format(eTs)
-        tvNote.text = "点击填写"
+        val l2 = Ui.row(this)
+        val p2 = Ui.lp(Ui.MP, Ui.WC)
+        p2.topMargin = Ui.dp(this, 10f)
+        l2.addView(Ui.iconCircle(this, DbHelper(this).emojiOf(cat)))
+        val mid = Ui.col(this)
+        val mp = Ui.lp(0, Ui.WC, 1f)
+        mp.leftMargin = Ui.dp(this, 10f)
+        mid.layoutParams = mp
+        mid.addView(Ui.tv(this, note, 14f, Ui.TEXT))
+        mid.addView(Ui.tv(this, "分类：" + cat, 11.5f, Ui.SUB))
+        l2.addView(mid)
+        box.addView(l2, p2)
 
-        catButtons = ArrayList()
-        for (c in Category.ALL) {
-            val b = TextView(this)
-            b.text = c
-            b.textSize = 12f
-            b.gravity = Gravity.CENTER
-            b.setPadding(6, 14, 6, 14)
-            b.setBackgroundResource(R.drawable.bg_chip)
-            val lp = GridLayout.LayoutParams()
-            lp.width = 0
-            lp.columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
-            lp.setMargins(3, 3, 3, 3)
-            b.layoutParams = lp
-            b.setOnClickListener {
-                eCategory = c
-                tvCategory.text = c
-                highlightCats()
-                scrollCats.visibility = View.GONE
-            }
-            grid.addView(b)
-            catButtons.add(Pair(b, c))
+        val l3 = Ui.row(this)
+        val p3 = Ui.lp(Ui.MP, Ui.WC)
+        p3.topMargin = Ui.dp(this, 12f)
+        l3.addView(View(this), Ui.lp(0, 1, 1f))
+
+        val later = Ui.tv(this, "稍后", 13f, Ui.SUB)
+        later.setPadding(Ui.dp(this, 12f), Ui.dp(this, 8f), Ui.dp(this, 12f), Ui.dp(this, 8f))
+        later.setOnClickListener {
+            removeCard()
+            Toast.makeText(this, "已存入待确认", Toast.LENGTH_SHORT).show()
         }
-        highlightCats()
+        l3.addView(later)
 
-        view.findViewById<TextView>(R.id.btnPickCat).setOnClickListener {
-            scrollCats.visibility = if (scrollCats.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        }
-
-        view.findViewById<TextView>(R.id.btnEditAmount).setOnClickListener {
-            askText("修改金额", String.format("%.2f", eAmount), true) { txt ->
-                txt.toDoubleOrNull()?.let {
-                    if (it > 0) {
-                        eAmount = it
-                        tvAmount.text = "¥" + String.format("%.2f", eAmount)
-                    }
-                }
+        val edit = Ui.tv(this, "改分类", 13f, Ui.ORANGE_DEEP, true)
+        edit.setBackground(Ui.round(this, Ui.ORANGE_LIGHT, 14f))
+        edit.setPadding(Ui.dp(this, 14f), Ui.dp(this, 8f), Ui.dp(this, 14f), Ui.dp(this, 8f))
+        edit.setOnClickListener {
+            removeCard()
+            try {
+                startActivity(
+                    Intent(this, PendingActivity::class.java)
+                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .putExtra("focus", id)
+                )
+            } catch (_: Exception) {
             }
         }
+        val ep = Ui.lp(Ui.WC, Ui.WC)
+        ep.leftMargin = Ui.dp(this, 8f)
+        l3.addView(edit, ep)
 
-        view.findViewById<TextView>(R.id.btnEditNote).setOnClickListener {
-            askText("备注", eNote, false) { txt ->
-                eNote = txt
-                tvNote.text = if (txt.isBlank()) "点击填写" else txt
-            }
-        }
-
-        view.findViewById<TextView>(R.id.btnPickDate).setOnClickListener {
-            val cal = Calendar.getInstance().apply { timeInMillis = eTs }
-            val dlg = DatePickerDialog(
-                ContextThemeWrapper(this, android.R.style.Theme_Material_Light_Dialog_Alert),
-                { _, y, m, d ->
-                    val c2 = Calendar.getInstance()
-                    c2.timeInMillis = eTs
-                    c2.set(Calendar.YEAR, y)
-                    c2.set(Calendar.MONTH, m)
-                    c2.set(Calendar.DAY_OF_MONTH, d)
-                    eTs = c2.timeInMillis
-                    tvTime.text = SimpleDateFormat("yyyy.MM.dd", Locale.CHINA).format(eTs)
-                },
-                cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
-            )
-            dlg.window?.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
-            dlg.show()
-        }
-
-        view.findViewById<TextView>(R.id.btnSave).setOnClickListener {
+        val ok = Ui.tv(this, "确认记账", 13f, 0xFFFFFFFF.toInt(), true)
+        ok.setBackground(Ui.round(this, Ui.ORANGE, 14f))
+        ok.setPadding(Ui.dp(this, 16f), Ui.dp(this, 8f), Ui.dp(this, 16f), Ui.dp(this, 8f))
+        ok.setOnClickListener {
             val db = DbHelper(this)
-            db.insertFinal(eAmount, eMerchant, eCategory, eTs, eNote)
+            db.updateRecord(id, amount, cat, note, System.currentTimeMillis(), 1)
             db.close()
-            Diag.log(this, "已保存：¥$eAmount $eMerchant · $eCategory")
-            Toast.makeText(this, "已记录：$eCategory ¥" + String.format("%.2f", eAmount), Toast.LENGTH_SHORT).show()
-            removeOverlay()
+            removeCard()
+            Toast.makeText(this, "已记账：" + cat + " ¥" + Ui.money(amount), Toast.LENGTH_SHORT).show()
         }
+        val op = Ui.lp(Ui.WC, Ui.WC)
+        op.leftMargin = Ui.dp(this, 8f)
+        l3.addView(ok, op)
+        box.addView(l3, p3)
 
-        view.findViewById<TextView>(R.id.btnCancel).setOnClickListener {
-            Diag.log(this, "已取消：¥$eAmount $eMerchant")
-            removeOverlay()
-        }
-        view.findViewById<TextView>(R.id.btnClose).setOnClickListener { removeOverlay() }
+        val holder = FrameLayout(this)
+        holder.setPadding(Ui.dp(this, 14f), 0, Ui.dp(this, 14f), 0)
+        holder.addView(box, FrameLayout.LayoutParams(Ui.MP, FrameLayout.LayoutParams.WRAP_CONTENT))
 
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val params = WindowManager.LayoutParams(
@@ -398,94 +342,57 @@ class BillAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.y = 90
-
-        val holder = FrameLayout(themeCtx)
-        holder.setPadding(28, 0, 28, 0)
-        holder.addView(view)
-
+        params.gravity = Gravity.BOTTOM
+        params.y = Ui.dp(this, 90f)
         try {
             wm.addView(holder, params)
-            overlayView = holder
+            card = holder
+            Diag.log(this, "悬浮卡片已显示")
         } catch (e: Exception) {
-            Diag.log(this, "悬浮窗添加失败（${e.javaClass.simpleName}）→ 改用通知")
-            notifyFallback(amount, merchant, ts, category)
+            Diag.log(this, "悬浮卡片失败（${e.javaClass.simpleName}）→ 改为通知")
+            notifyPending(id, amount, note, cat)
             return
         }
-        // 60 秒未处理自动收起，避免一直挡屏
-        handler.postDelayed({ removeOverlay() }, 60000)
+        handler.postDelayed({ removeCard() }, 60000)
     }
 
-    private fun highlightCats() {
-        for ((b, c) in catButtons) {
-            if (c == eCategory) {
-                b.setTypeface(null, Typeface.BOLD)
-                b.setTextColor(0xFF1E88E5.toInt())
-            } else {
-                b.setTypeface(null, Typeface.NORMAL)
-                b.setTextColor(0xFF555555.toInt())
-            }
-        }
-    }
-
-    private fun askText(title: String, init: String, number: Boolean, onOk: (String) -> Unit) {
-        val ctx = ContextThemeWrapper(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-        val et = EditText(ctx)
-        et.setText(init)
-        et.setSelection(init.length)
-        if (number) et.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        val dlg = AlertDialog.Builder(ctx)
-            .setTitle(title)
-            .setView(et)
-            .setPositiveButton("确定") { _, _ -> onOk(et.text.toString().trim()) }
-            .setNegativeButton("取消", null)
-            .create()
-        dlg.window?.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
-        dlg.show()
-    }
-
-    private fun removeOverlay() {
+    private fun removeCard() {
         try {
-            overlayView?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+            card?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
         } catch (_: Exception) {
         }
-        overlayView = null
+        card = null
     }
 
-    private fun notifyFallback(amount: Double, merchant: String, ts: Long, category: String) {
+    private fun notifyPending(id: Long, amount: Double, note: String, cat: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
-            NotificationChannel("screen_alert", "账单页抓取提醒", NotificationManager.IMPORTANCE_HIGH)
+            NotificationChannel("bill_capture", "自动记账提醒", NotificationManager.IMPORTANCE_HIGH)
         )
         val pi = PendingIntent.getActivity(
-            this, (ts / 1000).toInt(),
-            Intent(this, ConfirmActivity::class.java)
+            this, id.toInt(),
+            Intent(this, PendingActivity::class.java)
                 .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                .putExtra("screen", true)
-                .putExtra("amount", amount)
-                .putExtra("merchant", merchant)
-                .putExtra("ts", ts)
-                .putExtra("category", category),
+                .putExtra("focus", id),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val n = Notification.Builder(this, "screen_alert")
+        val n = Notification.Builder(this, "bill_capture")
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
-            .setContentTitle("检测到消费 ¥" + String.format("%.2f", amount))
-            .setContentText("$merchant · 预分类：$category · 点击确认记录")
+            .setContentTitle("识别到消费 ¥" + Ui.money(amount))
+            .setContentText("$note · 分类：$cat · 点击确认")
             .setContentIntent(pi)
             .setAutoCancel(true)
             .build()
         try {
-            nm.notify((ts / 1000).toInt(), n)
-        } catch (_: SecurityException) {
+            nm.notify(id.toInt(), n)
+        } catch (_: Exception) {
         }
     }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
-        removeOverlay()
+        removeCard()
         super.onDestroy()
     }
 }
