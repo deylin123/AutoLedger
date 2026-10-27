@@ -2,7 +2,9 @@ package com.deylin.autledger
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +20,7 @@ class MainActivity : Activity() {
 
     lateinit var content: FrameLayout
     lateinit var host: FrameLayout
+    private lateinit var warnBar: LinearLayout
     private var tab = 0
     private val navs = ArrayList<TextView>()
     private var helper: DbHelper? = null
@@ -57,6 +60,10 @@ class MainActivity : Activity() {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setBackgroundColor(Ui.BG)
+
+        warnBar = Ui.col(this)
+        warnBar.visibility = View.GONE
+        col.addView(warnBar, Ui.lp(Ui.MP, Ui.WC))
 
         content = FrameLayout(this)
         col.addView(content, Ui.lp(Ui.MP, 0, 1f))
@@ -119,6 +126,71 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (this::content.isInitialized && content.childCount > 0) show(tab)
+        refreshWarn()
+    }
+
+    // ---------- 自动弹窗就绪检查 ----------
+
+    fun accOn(): Boolean {
+        val s = try {
+            Settings.Secure.getString(contentResolver, "enabled_accessibility_services")
+        } catch (_: Exception) {
+            null
+        } ?: return false
+        return s.contains(packageName)
+    }
+
+    fun missingPerms(): MutableList<String> {
+        val out = ArrayList<String>()
+        if (!accOn()) out.add("无障碍（账单页识别）")
+        if (!Settings.canDrawOverlays(this)) out.add("悬浮窗（在别的App上面弹窗）")
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) out.add("通知（弹窗被拦时兜底提醒）")
+        return out
+    }
+
+    fun refreshWarn() {
+        if (!this::warnBar.isInitialized) return
+        warnBar.removeAllViews()
+        val miss = missingPerms()
+        if (miss.isEmpty()) {
+            warnBar.visibility = View.GONE
+            return
+        }
+        warnBar.visibility = View.VISIBLE
+        warnBar.setBackgroundColor(Ui.ORANGE_LIGHT)
+        val t = Ui.tv(
+            this,
+            "自动弹窗还差 ${miss.size} 项权限未开，缺任意一项都不会在别的App上面弹窗：" +
+                miss.joinToString("、"),
+            11.5f, Ui.ORANGE_DEEP
+        )
+        t.setPadding(Ui.dp(this, 14f), Ui.dp(this, 9f), Ui.dp(this, 14f), Ui.dp(this, 4f))
+        warnBar.addView(t, Ui.lp(Ui.MP, Ui.WC))
+        val t2 = Ui.tv(this, "点此逐项开启 →", 11.5f, Ui.ORANGE_DEEP, true)
+        t2.setPadding(Ui.dp(this, 14f), 0, Ui.dp(this, 14f), Ui.dp(this, 10f))
+        warnBar.addView(t2, Ui.lp(Ui.MP, Ui.WC))
+        warnBar.setOnClickListener { showPermDialog() }
+    }
+
+    fun showPermDialog() {
+        val miss = missingPerms()
+        if (miss.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle("开启自动弹窗所需权限")
+            .setItems(miss.toTypedArray()) { _, w ->
+                val m = miss[w]
+                when {
+                    m.startsWith("无障碍") -> openAccessibility()
+                    m.startsWith("悬浮窗") -> openOverlay()
+                    else -> if (Build.VERSION.SDK_INT >= 33) {
+                        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
+                    }
+                }
+            }
+            .setNegativeButton("稍后", null)
+            .show()
     }
 
     // ---------- 权限入口 ----------

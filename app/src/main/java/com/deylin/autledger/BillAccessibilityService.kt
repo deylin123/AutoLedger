@@ -44,6 +44,7 @@ class BillAccessibilityService : AccessibilityService() {
         private val CURRENCY_IN_TEXT = Regex("[¥￥]\\s*(\\d{1,6}(?:\\.\\d{1,2})?)")
 
         private val BILL_PAGE_WORDS = listOf("账单详情", "付款详情", "交易详情", "转账详情")
+        private val RESULT_WORDS = listOf("支付成功", "付款成功", "扣款成功", "交易成功", "已付款", "付款金额", "支付金额")
         private val EXPENSE_WORDS = listOf(
             "付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额",
             "支付时间", "付款时间", "当前状态", "支出"
@@ -89,7 +90,9 @@ class BillAccessibilityService : AccessibilityService() {
             if (texts.size < 3) return
             if (texts.any { it.contains("自动记账") || it.contains("待确认") || it.contains("本月预算") }) return
             val isBill = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
-            if (!isBill) return
+            val isPayResult = texts.any { t -> RESULT_WORDS.any { t.contains(it) } }
+            // 支付宝：账单详情页、付款结果页都抓；微信及其他 App：只认账单详情页，避免聊天/列表内容误判
+            if (!isBill && !(pkg == PKG_ALIPAY && isPayResult)) return
 
             if (!whitelist) {
                 val hasAmount = texts.any { hasAmountIn(it.trim()) }
@@ -256,6 +259,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     private fun showCard(id: Long, amount: Double, note: String, cat: String) {
         if (!Settings.canDrawOverlays(this)) {
+            Diag.log(this, "弹窗未显示：悬浮窗权限未开启 → 已改发通知（请在App首页顶部开启）")
             notifyPending(id, amount, note, cat)
             return
         }
@@ -349,7 +353,7 @@ class BillAccessibilityService : AccessibilityService() {
             card = holder
             Diag.log(this, "悬浮卡片已显示")
         } catch (e: Exception) {
-            Diag.log(this, "悬浮卡片失败（${e.javaClass.simpleName}）→ 改为通知")
+            Diag.log(this, "悬浮卡片显示失败（${e.javaClass.simpleName}）→ 改发通知")
             notifyPending(id, amount, note, cat)
             return
         }
