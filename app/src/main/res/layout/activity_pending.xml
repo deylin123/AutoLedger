@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  待确认页（v2.4）
+  结构原则：整页只有一个 ScrollView 作为根视图，高度 match_parent。
+  所有内容（含标题行）都放在 ScrollView 内部，自上而下顺序排列。
+  这样即使系统给出的内容区高度异常，内容也一定从顶部开始可见，不会出现「列表区高度被算成 0」的空白。
+  不使用任何 layout_weight 撑开高度，避免测量为 0。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FFFBF5"
+    android:fillViewport="false"
+    android:scrollbars="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <!-- 标题行 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingLeft="14dp"
+            android:paddingTop="14dp"
+            android:paddingRight="14dp"
+            android:paddingBottom="6dp">
+
+            <TextView
+                android:id="@+id/btnBack"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp"
+                android:paddingRight="10dp"
+                android:paddingBottom="8dp"
+                android:text="‹ 返回"
+                android:textColor="#333333"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tvHead"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="待确认"
+                android:textColor="#333333"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/btnAll"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingLeft="8dp"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp"
+                android:text="全部确认"
+                android:textColor="#FF8A3D"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- 自检统计行：这行字能区分「数据没落库」和「界面没画出来」 -->
+        <TextView
+            android:id="@+id/tvStat"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingLeft="14dp"
+            android:paddingTop="2dp"
+            android:paddingRight="14dp"
+            android:paddingBottom="2dp"
+            android:text="读取中…"
+            android:textColor="#999999"
+            android:textSize="11sp" />
+
+        <!-- 悬浮窗未开启时的提示 -->
+        <TextView
+            android:id="@+id/tvTip"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="14dp"
+            android:layout_marginTop="10dp"
+            android:layout_marginRight="14dp"
+            android:background="@drawable/bg_tip_orange"
+            android:padding="10dp"
+            android:text=""
+            android:textColor="#F2711C"
+            android:textSize="11.5sp"
+            android:visibility="gone" />
+
+        <!-- 明细列表 -->
+        <LinearLayout
+            android:id="@+id/listBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingLeft="14dp"
+            android:paddingTop="4dp"
+            android:paddingRight="14dp" />
+
+        <!-- 空态 -->
+        <TextView
+            android:id="@+id/tvEmpty"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:paddingLeft="14dp"
+            android:paddingTop="60dp"
+            android:paddingRight="14dp"
+            android:text="没有待确认的账单"
+            android:textColor="#999999"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <!-- 版本行：装的是哪一版，一眼可见 -->
+        <TextView
+            android:id="@+id/tvVer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:paddingLeft="14dp"
+            android:paddingTop="28dp"
+            android:paddingRight="14dp"
+            android:paddingBottom="28dp"
+            android:text=""
+            android:textColor="#CCCCCC"
+            android:textSize="10.5sp" />
+    </LinearLayout>
+</ScrollView>

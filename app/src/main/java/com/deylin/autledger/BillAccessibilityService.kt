@@ -17,6 +17,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 
 /**
@@ -257,59 +258,60 @@ class BillAccessibilityService : AccessibilityService() {
 
     // ---------- 悬浮卡片 ----------
 
+    private val hideTask = Runnable { removeCard() }
+
+    /** 同一笔只弹一次，避免重复触发反复重建窗口造成闪烁 */
+    private var lastCardId = -1L
+
     private fun showCard(id: Long, amount: Double, note: String, cat: String) {
         // 通道一：通知栏，无条件发送。
-        // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、只是窗口不可见，
-        // 代码会误判为“已显示”。通知不受该权限限制，是唯一可靠通道，因此不再作为降级方案而是主通道。
+        // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、
+        // 只是窗口不可见，代码会误判为"已显示"。通知不受该权限限制，是唯一可靠通道，故作为主通道。
         notifyPending(id, amount, note, cat)
 
-        // 通道二：悬浮卡片，仅作增强
+        if (id == lastCardId) return
+        lastCardId = id
+
+        handler.post {
+            try {
+                buildCard(id, amount, note, cat)
+            } catch (e: Exception) {
+                Diag.log(this, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
+            }
+        }
+    }
+
+    /**
+     * 通道二：悬浮记账卡片。
+     *
+     * v2.4 修掉两个会导致"不稳定"的真实缺陷：
+     *  1. 自动关闭定时器无法取消。之前每笔都 post 一个 60 秒匿名 Runnable，
+     *     连续抓多笔时，先前的定时器到点会把当前正在显示的卡片移除，表现为"卡片闪一下就不见了"。
+     *     现在改为可取消的 hideTask，显示新卡片前先 removeCallbacks。
+     *  2. 窗口宽度用 MATCH_PARENT。部分 ROM 下 overlay 窗口宽度会被测量成 0，
+     *     卡片就塌缩成一个小圆角块（用户看到的"只剩一个圈"）。现在改为明确的像素宽度。
+     */
+    private fun buildCard(id: Long, amount: Double, note: String, cat: String) {
         if (!Settings.canDrawOverlays(this)) {
             Diag.log(this, "悬浮卡片跳过：悬浮窗权限未开（通知已发）")
             return
         }
+        handler.removeCallbacks(hideTask)
         removeCard()
 
-        val box = Ui.col(this)
-        box.setBackground(Ui.round(this, Ui.CARD, 18f, 1f, Ui.LINE))
-        val padH = Ui.dp(this, 14f)
-        box.setPadding(padH, Ui.dp(this, 12f), padH, Ui.dp(this, 10f))
+        val v = layoutInflater.inflate(R.layout.view_card, null)
+        (v.findViewById<View>(R.id.tvAmount) as TextView).text = "-¥" + Ui.money(amount)
+        (v.findViewById<View>(R.id.tvNote) as TextView).text = note
+        (v.findViewById<View>(R.id.tvCat) as TextView).text = "分类：" + cat
+        (v.findViewById<View>(R.id.tvIcon) as TextView).text = emojiOf(cat)
 
-        val l1 = Ui.row(this)
-        l1.addView(Ui.tv(this, "自动识别到消费", 11.5f, Ui.SUB), Ui.lp(0, Ui.WC, 1f))
-        l1.addView(Ui.tv(this, "-¥" + Ui.money(amount), 18f, Ui.TEXT, true))
-        box.addView(l1, Ui.lp(Ui.MP, Ui.WC))
-
-        val l2 = Ui.row(this)
-        val p2 = Ui.lp(Ui.MP, Ui.WC)
-        p2.topMargin = Ui.dp(this, 10f)
-        l2.addView(Ui.iconCircle(this, DbHelper(this).emojiOf(cat)))
-        val mid = Ui.col(this)
-        val mp = Ui.lp(0, Ui.WC, 1f)
-        mp.leftMargin = Ui.dp(this, 10f)
-        mid.layoutParams = mp
-        mid.addView(Ui.tv(this, note, 14f, Ui.TEXT))
-        mid.addView(Ui.tv(this, "分类：" + cat, 11.5f, Ui.SUB))
-        l2.addView(mid)
-        box.addView(l2, p2)
-
-        val l3 = Ui.row(this)
-        val p3 = Ui.lp(Ui.MP, Ui.WC)
-        p3.topMargin = Ui.dp(this, 12f)
-        l3.addView(View(this), Ui.lp(0, 1, 1f))
-
-        val later = Ui.tv(this, "稍后", 13f, Ui.SUB)
-        later.setPadding(Ui.dp(this, 12f), Ui.dp(this, 8f), Ui.dp(this, 12f), Ui.dp(this, 8f))
-        later.setOnClickListener {
+        v.findViewById<View>(R.id.btnLater).setOnClickListener {
+            handler.removeCallbacks(hideTask)
             removeCard()
             Toast.makeText(this, "已存入待确认", Toast.LENGTH_SHORT).show()
         }
-        l3.addView(later)
-
-        val edit = Ui.tv(this, "改分类", 13f, Ui.ORANGE_DEEP, true)
-        edit.setBackground(Ui.round(this, Ui.ORANGE_LIGHT, 14f))
-        edit.setPadding(Ui.dp(this, 14f), Ui.dp(this, 8f), Ui.dp(this, 14f), Ui.dp(this, 8f))
-        edit.setOnClickListener {
+        v.findViewById<View>(R.id.btnCat).setOnClickListener {
+            handler.removeCallbacks(hideTask)
             removeCard()
             try {
                 startActivity(
@@ -320,48 +322,55 @@ class BillAccessibilityService : AccessibilityService() {
             } catch (_: Exception) {
             }
         }
-        val ep = Ui.lp(Ui.WC, Ui.WC)
-        ep.leftMargin = Ui.dp(this, 8f)
-        l3.addView(edit, ep)
-
-        val ok = Ui.tv(this, "确认记账", 13f, 0xFFFFFFFF.toInt(), true)
-        ok.setBackground(Ui.round(this, Ui.ORANGE, 14f))
-        ok.setPadding(Ui.dp(this, 16f), Ui.dp(this, 8f), Ui.dp(this, 16f), Ui.dp(this, 8f))
-        ok.setOnClickListener {
-            val db = DbHelper(this)
-            db.updateRecord(id, amount, cat, note, System.currentTimeMillis(), 1)
-            db.close()
+        v.findViewById<View>(R.id.btnOk).setOnClickListener {
+            try {
+                val db = DbHelper(this)
+                db.updateRecord(id, amount, cat, note, System.currentTimeMillis(), 1)
+                db.close()
+            } catch (e: Exception) {
+                Diag.log(this, "确认记账失败：${e.javaClass.simpleName}")
+            }
+            handler.removeCallbacks(hideTask)
             removeCard()
-            Toast.makeText(this, "已记账：" + cat + " ¥" + Ui.money(amount), Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已记账：$cat ¥" + Ui.money(amount), Toast.LENGTH_SHORT).show()
         }
-        val op = Ui.lp(Ui.WC, Ui.WC)
-        op.leftMargin = Ui.dp(this, 8f)
-        l3.addView(ok, op)
-        box.addView(l3, p3)
-
-        val holder = FrameLayout(this)
-        holder.setPadding(Ui.dp(this, 14f), 0, Ui.dp(this, 14f), 0)
-        holder.addView(box, FrameLayout.LayoutParams(Ui.MP, FrameLayout.LayoutParams.WRAP_CONTENT))
 
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val winW = resources.displayMetrics.widthPixels - Ui.dp(this, 28f)
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
+            winW,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.BOTTOM
-        params.y = Ui.dp(this, 90f)
+        params.y = Ui.dp(this, 96f)
         try {
-            wm.addView(holder, params)
-            card = holder
-            Diag.log(this, "悬浮卡片已提交显示（通知已同时发出）")
+            wm.addView(v, params)
+            card = v
+            Diag.log(this, "悬浮卡片已显示（通知同时已发）")
         } catch (e: Exception) {
             Diag.log(this, "悬浮卡片显示失败（${e.javaClass.simpleName}），通知已发")
             return
         }
-        handler.postDelayed({ removeCard() }, 60000)
+        // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
+        v.postDelayed({
+            Diag.log(this, "卡片实际尺寸 " + v.width + "x" + v.height +
+                "，屏幕宽 " + resources.displayMetrics.widthPixels)
+        }, 500)
+        handler.postDelayed(hideTask, 45000)
+    }
+
+    private fun emojiOf(cat: String): String {
+        val db = DbHelper(this)
+        return try {
+            db.emojiOf(cat)
+        } catch (e: Exception) {
+            "🧾"
+        } finally {
+            db.close()
+        }
     }
 
     private fun removeCard() {

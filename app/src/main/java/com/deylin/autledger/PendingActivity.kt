@@ -6,10 +6,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
-import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
@@ -17,73 +15,44 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 待确认：自动抓取到的消费先落在这里，确认后才进正式账本。
+ * 待确认页（v2.4 重做）
  *
- * 结构说明（v2.3）：改成与「我的」页完全同构的写法 —— 根 LinearLayout + 顶部行 + 滚动区(weight=1)。
- * 「我的」页在同一台手机上显示正常，故以此为唯一可信基准，不再使用「直接 setContentView(ScrollView)」的形式。
- * 每条只使用 row + TextView 的最简组合，避免多层嵌套 LayoutParams 造成的渲染异常。
- * 顶部固定显示一行统计（全库笔数 / 待确认笔数），用于区分「数据没落库」与「渲染没出来」。
+ * 前几版的失败教训：用代码动态搭建「顶部固定行 + 高度 0 + weight 撑开」的结构，
+ * 在部分机型上列表区被测量成 0 像素，表现为标题有数字、下面一片空白且点不进去。
+ *
+ * 本版改为：
+ *   1. 整页只有一个 ScrollView 作为根视图，所有内容顺序排列，不使用任何撑高度的 weight；
+ *   2. 每一条明细用独立 XML（item_pending.xml）填充，结构固定、可复用；
+ *   3. 标题区直接显示版本号与库内笔数，装错版本或数据没落库一眼可见；
+ *   4. 单条渲染失败只影响那一行，并显示失败原因，不会让整页空白。
  */
 class PendingActivity : Activity() {
 
     private lateinit var helper: DbHelper
     private lateinit var listBox: LinearLayout
-    private lateinit var head: TextView
-    private lateinit var tip: TextView
-    private lateinit var stat: TextView
+    private lateinit var tvHead: TextView
+    private lateinit var tvStat: TextView
+    private lateinit var tvTip: TextView
+    private lateinit var tvEmpty: TextView
+    private lateinit var tvVer: TextView
     private var focusId = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_pending)
         helper = DbHelper(this)
         focusId = intent.getLongExtra("focus", 0L)
 
-        val root = Ui.col(this)
-        root.setBackgroundColor(Ui.BG)
+        listBox = findViewById(R.id.listBox)
+        tvHead = findViewById(R.id.tvHead)
+        tvStat = findViewById(R.id.tvStat)
+        tvTip = findViewById(R.id.tvTip)
+        tvEmpty = findViewById(R.id.tvEmpty)
+        tvVer = findViewById(R.id.tvVer)
 
-        // 顶部行：返回 / 标题 / 全部确认
-        val top = Ui.row(this)
-        Ui.pad(top, 14, 12, 14, 6)
-        val back = Ui.tv(this, "‹ 返回", 14f, Ui.TEXT)
-        back.setPadding(0, Ui.dp(this, 6f), Ui.dp(this, 10f), Ui.dp(this, 6f))
-        back.setOnClickListener { finish() }
-        top.addView(back, Ui.lp(0, Ui.WC, 1f))
-        head = Ui.tv(this, "待确认", 16f, Ui.TEXT, true)
-        top.addView(head)
-        top.addView(View(this), Ui.lp(0, Ui.WC, 1f))
-        val all = Ui.tv(this, "全部确认", 13f, Ui.ORANGE, true)
-        all.setPadding(Ui.dp(this, 8f), Ui.dp(this, 4f), 0, Ui.dp(this, 4f))
-        all.setOnClickListener { confirmAll() }
-        top.addView(all)
-        root.addView(top, Ui.lp(Ui.MP, Ui.WC))
-
-        // 滚动区（与「我的」页同一个写法：weight=1 撑满剩余高度）
-        val sv = ScrollView(this)
-        sv.isFillViewport = true
-        val col = Ui.col(this)
-        Ui.pad(col, 14, 4, 14, 28)
-
-        tip = Ui.tv(this, "", 11.5f, Ui.ORANGE_DEEP)
-        tip.setBackground(Ui.round(this, Ui.ORANGE_LIGHT, 10f))
-        tip.setPadding(Ui.dp(this, 10f), Ui.dp(this, 9f), Ui.dp(this, 10f), Ui.dp(this, 9f))
-        tip.visibility = View.GONE
-        tip.setOnClickListener { openOverlay() }
-        val tp = Ui.lp(Ui.MP, Ui.WC)
-        tp.topMargin = Ui.dp(this, 10f)
-        col.addView(tip, tp)
-
-        // 统计行：用于自证「数据在不在」
-        stat = Ui.tv(this, "读取中…", 11f, Ui.SUB)
-        stat.setPadding(0, Ui.dp(this, 8f), 0, Ui.dp(this, 2f))
-        col.addView(stat, Ui.lp(Ui.MP, Ui.WC))
-
-        listBox = Ui.col(this)
-        col.addView(listBox, Ui.lp(Ui.MP, Ui.WC))
-
-        sv.addView(col, Ui.lp(Ui.MP, Ui.WC))
-        root.addView(sv, Ui.lp(Ui.MP, 0, 1f))
-
-        setContentView(root)
+        findViewById<View>(R.id.btnBack).setOnClickListener { finish() }
+        findViewById<View>(R.id.btnAll).setOnClickListener { confirmAll() }
+        tvTip.setOnClickListener { openOverlay() }
     }
 
     override fun onResume() {
@@ -99,42 +68,41 @@ class PendingActivity : Activity() {
             list = helper.pending()
             total = helper.totalCount()
         } catch (e: Exception) {
-            err = e.javaClass.simpleName + ":" + (e.message ?: "")
+            err = e.javaClass.simpleName + ": " + (e.message ?: "")
+            Diag.log(this, "待确认页读取失败 → $err")
         }
 
-        head.text = "待确认（${list.size}）"
-        stat.text = if (err.isNotEmpty()) {
+        tvHead.text = "待确认（" + list.size + "）"
+        tvStat.text = if (err.isNotEmpty()) {
             "读取失败 → $err"
         } else {
-            "库内共 $total 笔，待确认 ${list.size} 笔"
+            "库内共 $total 笔 · 待确认 ${list.size} 笔 · 点「改分类」可换类别"
         }
+        tvVer.text = "v" + verName() + " · 自动抓到的消费先存在这里，确认后才进正式账本"
 
-        if (!Settings.canDrawOverlays(this)) {
-            tip.visibility = View.VISIBLE
-            tip.text = "⚠ 悬浮窗未开启：后台抓到的消费不会弹卡片。通知栏仍会提醒。点此开启 →"
+        if (Settings.canDrawOverlays(this)) {
+            tvTip.visibility = View.GONE
         } else {
-            tip.visibility = View.GONE
+            tvTip.visibility = View.VISIBLE
+            tvTip.text = "⚠ 悬浮窗未开启：抓到消费时不会在别的 App 上面弹卡片（通知栏仍会提醒）。点此开启 →"
         }
 
         listBox.removeAllViews()
-        if (list.isEmpty()) {
-            val t = Ui.tv(this, "没有待确认的账单\n自动抓取到的消费会显示在这里", 13f, Ui.SUB)
-            t.gravity = Gravity.CENTER
-            t.setPadding(0, Ui.dp(this, 60f), 0, 0)
-            listBox.addView(t, Ui.lp(Ui.MP, Ui.WC))
-            return
-        }
+        tvEmpty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
 
         for (r in list) {
             try {
-                val v = rowFor(r)
-                val lp = Ui.lp(Ui.MP, Ui.WC)
-                lp.topMargin = Ui.dp(this, 9f)
-                listBox.addView(v, lp)
+                val v = layoutInflater.inflate(R.layout.item_pending, listBox, false)
+                bind(v, r)
+                listBox.addView(v)
             } catch (e: Exception) {
-                val t = Ui.tv(this, "这笔渲染异常：" + e.javaClass.simpleName, 12f, Ui.RED)
+                Diag.log(this, "待确认单条渲染失败 id=${r.id} → ${e.javaClass.simpleName}")
+                val t = TextView(this)
+                t.text = "这一笔显示不出来：" + e.javaClass.simpleName
+                t.setTextColor(0xFFE8543F.toInt())
+                t.textSize = 12f
                 t.setPadding(0, Ui.dp(this, 8f), 0, Ui.dp(this, 8f))
-                listBox.addView(t, Ui.lp(Ui.MP, Ui.WC))
+                listBox.addView(t)
             }
         }
 
@@ -149,69 +117,45 @@ class PendingActivity : Activity() {
         }
     }
 
-    /** 单条渲染：只用 row + TextView，不嵌套卡片类组件 */
-    private fun rowFor(r: Rec): View {
-        val box = Ui.col(this)
-        box.setBackground(Ui.round(this, Ui.CARD, 14f))
-        Ui.pad(box, 14, 12, 14, 12)
-
-        val l1 = Ui.row(this)
-        l1.addView(
-            Ui.tv(this, if (r.note.isBlank()) r.cat else r.note, 14.5f, Ui.TEXT, true),
-            Ui.lp(0, Ui.WC, 1f)
-        )
-        l1.addView(Ui.tv(this, "-¥" + Ui.money(r.amount), 15.5f, Ui.TEXT, true))
-        box.addView(l1, Ui.lp(Ui.MP, Ui.WC))
-
-        val l2 = Ui.row(this)
-        val p2 = Ui.lp(Ui.MP, Ui.WC)
-        p2.topMargin = Ui.dp(this, 6f)
+    private fun bind(v: View, r: Rec) {
+        val note = if (r.note.isBlank()) r.cat else r.note
+        v.findViewById<TextView>(R.id.tvNote).text = note
+        v.findViewById<TextView>(R.id.tvAmount).text = "-¥" + Ui.money(r.amount)
         val src = if (r.src.isBlank()) "手工" else r.src
-        l2.addView(Ui.tv(this, r.cat + " · " + src, 11.5f, Ui.SUB), Ui.lp(0, Ui.WC, 1f))
-        l2.addView(Ui.tv(this, fmt(r.ts), 11.5f, Ui.SUB))
-        box.addView(l2, p2)
+        v.findViewById<TextView>(R.id.tvCat).text = "分类：" + r.cat + " · " + src
+        v.findViewById<TextView>(R.id.tvTime).text = fmt(r.ts)
 
-        val l3 = Ui.row(this)
-        val p3 = Ui.lp(Ui.MP, Ui.WC)
-        p3.topMargin = Ui.dp(this, 10f)
-        val del = Ui.tv(this, "删除", 12.5f, Ui.SUB)
-        del.setPadding(Ui.dp(this, 10f), Ui.dp(this, 7f), Ui.dp(this, 10f), Ui.dp(this, 7f))
-        del.setOnClickListener {
+        v.findViewById<View>(R.id.btnDel).setOnClickListener {
             helper.delRecord(r.id)
+            Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
             load()
         }
-        l3.addView(del, Ui.lp(0, Ui.WC, 1f))
-
-        val ok = Ui.tv(this, "确认记账", 12.5f, 0xFFFFFFFF.toInt(), true)
-        ok.setBackground(Ui.round(this, Ui.ORANGE, 14f))
-        ok.setPadding(Ui.dp(this, 16f), Ui.dp(this, 8f), Ui.dp(this, 16f), Ui.dp(this, 8f))
-        ok.setOnClickListener { pickCat(r) }
-        l3.addView(ok, Ui.lp(Ui.WC, Ui.WC))
-        box.addView(l3, p3)
-
-        // 整块也可点，避免按钮点不到时的死路
-        box.setOnClickListener { pickCat(r) }
-        return box
+        v.findViewById<View>(R.id.btnCat).setOnClickListener { pickCat(r) }
+        v.findViewById<View>(R.id.btnOk).setOnClickListener { confirmOne(r) }
     }
 
-    private fun fmt(ts: Long): String =
-        SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(ts))
-
+    /** 只改分类，仍留在待确认 */
     private fun pickCat(r: Rec) {
         val cats = helper.cats(r.type)
         val names = ArrayList<String>()
-        names.add("用当前分类「" + r.cat + "」直接记账")
         for (cd in cats) names.add(cd.emoji + "  " + cd.name)
         AlertDialog.Builder(this)
-            .setTitle("确认这笔的分类")
+            .setTitle("选择分类（当前：" + r.cat + "）")
             .setItems(names.toTypedArray()) { _, w ->
-                val cat = if (w == 0) r.cat else cats[w - 1].name
-                helper.updateRecord(r.id, r.amount, cat, r.note, r.ts, 1)
-                Toast.makeText(this, "已记账：" + cat, Toast.LENGTH_SHORT).show()
+                val cat = cats[w].name
+                helper.updateRecord(r.id, r.amount, cat, r.note, r.ts, r.status)
+                Toast.makeText(this, "已改为：" + cat, Toast.LENGTH_SHORT).show()
                 load()
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /** 按当前分类直接入正式账本 */
+    private fun confirmOne(r: Rec) {
+        helper.updateRecord(r.id, r.amount, r.cat, r.note, r.ts, 1)
+        Toast.makeText(this, "已记账：" + r.cat + " ¥" + Ui.money(r.amount), Toast.LENGTH_SHORT).show()
+        load()
     }
 
     private fun confirmAll() {
@@ -221,15 +165,27 @@ class PendingActivity : Activity() {
             return
         }
         AlertDialog.Builder(this)
-            .setTitle("全部确认 ${list.size} 笔？")
-            .setMessage("将按当前自动分类直接记账")
+            .setTitle("全部确认 " + list.size + " 笔？")
+            .setMessage("将按当前自动分类直接记入账本")
             .setPositiveButton("全部确认") { _, _ ->
                 for (r in list) helper.updateRecord(r.id, r.amount, r.cat, r.note, r.ts, 1)
-                Toast.makeText(this, "已确认 ${list.size} 笔", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "已确认 " + list.size + " 笔", Toast.LENGTH_SHORT).show()
                 load()
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    private fun fmt(ts: Long): String =
+        SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(ts))
+
+    private fun verName(): String {
+        return try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            (pi.versionName ?: "?") + " (" + pi.versionCode + ")"
+        } catch (_: Exception) {
+            "?"
+        }
     }
 
     private fun openOverlay() {
