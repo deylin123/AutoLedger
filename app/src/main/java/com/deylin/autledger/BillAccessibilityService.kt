@@ -26,6 +26,7 @@ import java.util.Locale
  * 仅当屏幕内容是支付宝/微信「账单详情」页时读取文字，
  * 提取金额（精确到分的大字金额行）、收款方、时间，自动预分类后弹窗确认。
  * 确认后才入库，忽略则不入库。
+ * 每次扫描结果都写入诊断日志（首页可见）。
  */
 class BillAccessibilityService : AccessibilityService() {
 
@@ -37,6 +38,8 @@ class BillAccessibilityService : AccessibilityService() {
         private val AMOUNT_LINE = Regex("^-?[¥￥]?\\s*-?[0-9]{1,7}(?:,[0-9]{3})*\\.[0-9]{2}$")
         private val TIME_LINE = Regex("(20[0-9]{2}[-/年.][0-9]{1,2}[-/月.][0-9]{1,2}[^0-9][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
 
+        // 页面特征：明确是账单/交易详情页
+        private val BILL_PAGE_WORDS = listOf("账单详情", "付款详情", "交易详情", "转账详情")
         private val EXPENSE_WORDS = listOf("付款成功", "支付成功", "扣款成功", "自动扣款", "已付款", "付款金额", "支付时间", "付款时间", "当前状态")
         private val INCOME_WORDS = listOf("退款", "已存入", "已到账", "已收钱", "收入", "收款到账")
         private val STATUS_WORDS = listOf("自动扣款成功", "付款成功", "支付成功", "交易成功", "已付款", "转账成功", "扣款成功", "待付款")
@@ -44,6 +47,7 @@ class BillAccessibilityService : AccessibilityService() {
     }
 
     private var lastScan = 0L
+    private var lastOtherScan = 0L
     private var lastPopupKey = ""
     private var lastPopupAt = 0L
     private val handler = Handler(Looper.getMainLooper())
@@ -52,31 +56,47 @@ class BillAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val pkg = event.packageName?.toString() ?: return
-        if (pkg != PKG_ALIPAY && pkg != PKG_WECHAT) return
         val et = event.eventType
         if (et != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             et != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
+
+        val whitelist = pkg == PKG_ALIPAY || pkg == PKG_WECHAT
         val now = System.currentTimeMillis()
-        if (now - lastScan < 1500) return   // 节流：1.5秒扫一次
-        lastScan = now
+        if (whitelist) {
+            if (now - lastScan < 1500) return
+            lastScan = now
+        } else {
+            // 非白名单App：低频扫描，只用于发现「别的App里也有账单详情页」并记录包名
+            if (now - lastOtherScan < 5000) return
+            lastOtherScan = now
+        }
 
         val root = rootInActiveWindow ?: return
         try {
-            scan(root, pkg)
-        } catch (_: Exception) {
+            val texts = ArrayList<String>()
+            collect(root, texts)
+            if (texts.size < 3) return
+            val hasBillPage = texts.any { t -> BILL_PAGE_WORDS.any { t.contains(it) } }
+
+            if (!whitelist) {
+                if (hasBillPage) {
+                    Diag.log(this, "其他App($pkg) 疑似账单详情页 → 未接入，仅记录包名")
+                }
+                return
+            }
+
+            if (!hasBillPage) return   // 白名单里的普通页面不记日志，避免刷屏
+
+            scan(pkg, texts)
+        } catch (e: Exception) {
+            Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
         }
     }
 
-    private fun scan(root: AccessibilityNodeInfo, pkg: String) {
-        val texts = ArrayList<String>()
-        collect(root, texts)
-        if (texts.size < 3) return
-
-        // 页面特征：必须是「账单详情」页
-        if (texts.none { it.contains("账单详情") }) return
-
+    private fun scan(pkg: String, texts: ArrayList<String>) {
         val joined = texts.joinToString("|")
+        val appName = if (pkg == PKG_WECHAT) "微信" else "支付宝"
 
         // 找金额：只认整行为金额格式的节点（大字金额）
         var amount = -1.0
@@ -94,22 +114,27 @@ class BillAccessibilityService : AccessibilityService() {
                 }
             }
         }
-        if (amount <= 0.0 || amountIdx < 0) return
+        if (amount <= 0.0 || amountIdx < 0) {
+            Diag.log(this, "$appName 账单页 → 未找到金额行（页面文字片段：${texts.take(6).joinToString("/").take(40)}）")
+            return
+        }
 
-        // 收入/退款页直接跳过
-        if (INCOME_WORDS.any { joined.contains(it) }) return
-        // 支出判定：金额带负号 或 页面含支出状态词
+        if (INCOME_WORDS.any { joined.contains(it) }) {
+            Diag.log(this, "$appName 账单页 ¥$amount → 跳过：疑似收入/退款")
+            return
+        }
         val isExpense = amountNeg || EXPENSE_WORDS.any { joined.contains(it) }
-        if (!isExpense) return
+        if (!isExpense) {
+            Diag.log(this, "$appName 账单页 ¥$amount → 跳过：不像支出")
+            return
+        }
 
-        // 提取「字段名 → 值」
         val fieldVals = HashMap<String, String>()
         for (k in FIELD_KEYS) {
             val i = texts.indexOf(k)
             if (i >= 0 && i + 1 < texts.size) fieldVals[k] = texts[i + 1].trim()
         }
 
-        // 商户：优先结构化字段，其次金额上方最近的短文本
         val merchant = fieldVals["收款方全称"]
             ?: fieldVals["商户全称"]
             ?: fieldVals["收款方"]
@@ -126,7 +151,7 @@ class BillAccessibilityService : AccessibilityService() {
                         break
                     }
                 }
-                found.ifEmpty { if (pkg == PKG_WECHAT) "微信支付" else "支付宝" }
+                found.ifEmpty { appName + "支付" }
             }
 
         val goods = fieldVals["商品说明"] ?: ""
@@ -134,24 +159,27 @@ class BillAccessibilityService : AccessibilityService() {
         val timeStr = TIME_LINE.find(joined)?.groupValues?.get(1)
         val ts = parseTime(timeStr) ?: System.currentTimeMillis()
 
-        // 防重复：同金额+同商户+2分钟内已存在（含通知链路的待确认）就不再弹
         val db = DbHelper(this)
         val dup = db.existsSimilar(amount, merchant, ts)
         db.close()
-        if (dup) return
+        if (dup) {
+            Diag.log(this, "$appName 账单页 ¥$amount $merchant → 跳过：2分钟内已记录过")
+            return
+        }
         val key = "$amount|$merchant|${ts / 60000}"
         if (key == lastPopupKey && System.currentTimeMillis() - lastPopupAt < 15000) return
         lastPopupKey = key
         lastPopupAt = System.currentTimeMillis()
 
         val category = Category.of(merchant, goods, catHint)
+        Diag.log(this, "$appName 账单页 ¥$amount $merchant → 已弹窗（预分类：$category）")
         showConfirm(amount, merchant, ts, category)
     }
 
     private fun collect(node: AccessibilityNodeInfo?, out: MutableList<String>) {
         node ?: return
         node.text?.toString()?.takeIf { it.isNotBlank() }?.let { out.add(it) }
-        if (out.size > 120) return
+        if (out.size > 150) return
         for (i in 0 until node.childCount) collect(node.getChild(i), out)
     }
 
@@ -182,11 +210,14 @@ class BillAccessibilityService : AccessibilityService() {
             .putExtra("category", category)
 
     private fun showConfirm(amount: Double, merchant: String, ts: Long, category: String) {
-        if (Settings.canDrawOverlays(this)) showOverlay(amount, merchant, ts, category)
-        else notifyFallback(amount, merchant, ts, category)
+        if (Settings.canDrawOverlays(this)) {
+            showOverlay(amount, merchant, ts, category)
+        } else {
+            Diag.log(this, "无悬浮窗权限 → 改用通知提醒")
+            notifyFallback(amount, merchant, ts, category)
+        }
     }
 
-    /** 悬浮条弹窗：点「确认」进入分类确认页，点「忽略」不记录 */
     private fun showOverlay(amount: Double, merchant: String, ts: Long, category: String) {
         removeOverlay()
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -207,8 +238,7 @@ class BillAccessibilityService : AccessibilityService() {
         box.gravity = Gravity.CENTER_VERTICAL
 
         val tv = TextView(this)
-        tv.text = "检测到消费 ¥" + String.format("%.2f", amount) +
-                "\n$merchant · 预分类：$category"
+        tv.text = "检测到消费 ¥" + String.format("%.2f", amount) + "\n$merchant · 预分类：$category"
         tv.setTextColor(Color.WHITE)
         tv.textSize = 15f
         box.addView(tv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -228,7 +258,9 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             wm.addView(box, params)
             overlay = box
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Diag.log(this, "悬浮窗添加失败 → 改用通知（${e.javaClass.simpleName}）")
+            notifyFallback(amount, merchant, ts, category)
         }
         handler.postDelayed({ removeOverlay() }, 10000)
     }
@@ -241,7 +273,6 @@ class BillAccessibilityService : AccessibilityService() {
         overlay = null
     }
 
-    /** 无悬浮窗权限时退化为高优先级通知 */
     private fun notifyFallback(amount: Double, merchant: String, ts: Long, category: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
