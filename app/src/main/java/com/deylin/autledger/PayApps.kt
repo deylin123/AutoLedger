@@ -232,7 +232,8 @@ object PayApps {
 
     // ---------------- 金额 ----------------
 
-    class Amt(val value: Double, val expense: Boolean, val score: Int, val idx: Int)
+    /** signed：金额带明确 + / - 号。方向判定里这是最硬的证据，优先于页面上的弱方向词。 */
+    class Amt(val value: Double, val expense: Boolean, val score: Int, val idx: Int, val signed: Boolean = false)
 
     private const val NUM = "\\d{1,7}(?:,\\d{3})*(?:\\.\\d{1,2})?"
 
@@ -351,7 +352,8 @@ object PayApps {
                     val neg = m.value.startsWith("-") || m.value.startsWith("－")
                     // 负号在账单页表示支出，但在电商页常是「优惠 -¥5.00」，
                     // 所以给 80 分，低于货币符号的 85 分：有正数金额时优先取正数。
-                    cand = Amt(it, neg, if (neg) 80 else 70, i)
+                    // signed=true：「-47.52」「+500.00」这类明确符号，方向判定时优先级最高。
+                    cand = Amt(it, neg, if (neg) 80 else 70, i, signed = true)
                 }
             }
             if (cand == null) AMOUNT_SYMBOL.find(s)?.let { m ->
@@ -364,7 +366,8 @@ object PayApps {
             val c0 = cand ?: continue
             if (c0.value <= 0.0 || c0.value > 500000.0) continue
             val bonus = paired[i] ?: 0
-            val c = if (bonus > c0.score) Amt(c0.value, true, bonus, i) else c0
+            // v2.9：配对抬分时保留金额节点原本的方向与符号信息，不再强制按支出处理
+            val c = if (bonus > c0.score) Amt(c0.value, c0.expense, bonus, i, c0.signed) else c0
             val cur = best
             if (cur == null || c.score > cur.score) best = c
         }
@@ -469,7 +472,7 @@ object PayApps {
     private val INCOME_DECISIVE = listOf(
         "收款成功", "收款到账", "已收款", "已到账", "到账成功", "入账成功", "已入账",
         "退款成功", "已退款", "退款到账", "收到转账", "已收钱", "收款金额",
-        "红包已存入", "已存入零钱", "收益到账", "利息到账"
+        "红包已存入", "已存入零钱", "已存入", "收益到账", "利息到账"
     )
 
     /** 一般收入词（弱），需与支出词比较后再定方向 */
@@ -503,10 +506,32 @@ object PayApps {
      *  3. 有支出词 → 支出
      *  4. 页面没写方向 → 看金额节点自身（负号 / 支出标签算支出，其余判不明）
      */
+    /**
+     * 中性字段标签：这些词后面的「收款/付款」只是字段名，不代表方向。
+     *
+     * 之前支付宝「支出」账单详情被判成收入的根因就在这：页面上有「收款方全称 星巴克」——
+     * 收入弱词「收款」被它凑出来，而详情页又没写「支出/支付金额」这类支出强词，
+     * inc>0 && exp==0 直接判成收入。判定前先把字段标签剔除，这一类误判就不存在了。
+     */
+    private val NEUTRAL_FIELD_LABELS = listOf(
+        "收款方全称", "收款方", "收款商户", "对方账户", "付款方", "对方名称"
+    )
+
+    private fun stripFieldLabels(texts: List<String>): List<String> =
+        texts.map { t ->
+            var s = t
+            NEUTRAL_FIELD_LABELS.forEach { s = s.replace(it, "") }
+            s
+        }
+
     fun direction(texts: List<String>, amt: Amt?): Int {
-        if (texts.any { t -> INCOME_DECISIVE.any { t.contains(it) } }) return DIR_INCOME
-        val inc = INCOME_WEAK.count { w -> texts.any { it.contains(w) } }
-        val exp = EXPENSE_STRONG.count { w -> texts.any { it.contains(w) } }
+        val clean = stripFieldLabels(texts)
+        if (clean.any { t -> INCOME_DECISIVE.any { t.contains(it) } }) return DIR_INCOME
+        // 金额节点带明确符号（「-47.52」「+500.00」）→ 符号优先于页面弱方向词。
+        // 收入页面也可能出现「优惠 -¥5.00」之类的行，但 findAmount 会优先取分更高的主金额。
+        if (amt != null && amt.signed) return if (amt.expense) DIR_EXPENSE else DIR_INCOME
+        val inc = INCOME_WEAK.count { w -> clean.any { it.contains(w) } }
+        val exp = EXPENSE_STRONG.count { w -> clean.any { it.contains(w) } }
         if (inc > 0 && exp == 0) return DIR_INCOME
         if (exp > 0) return DIR_EXPENSE
         if (inc > 0) return DIR_INCOME

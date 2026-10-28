@@ -151,23 +151,50 @@ class BillAccessibilityService : AccessibilityService() {
                 logSkip("foreign#$pkg#${foreign.joinToString(",")}",
                     "已丢弃非本页文字：${foreign.joinToString(", ")}（当前 ${appLabel(pkg)}）")
             }
+            if (attempt(pkg, texts, token)) {
+                hitToken = token
+                return
+            }
+
+            // v2.9：事件的 packageName 未必是页面真正所在的 App。
+            // MIUI 上指纹支付框、权限弹窗、侧边栏抢走 WINDOW_STATE_CHANGED 时，
+            // 微信/支付宝自己的窗口会被当成「非本页文字」全部丢弃 → 表现为微信消费不识别。
+            // 被丢弃的窗口里若有已登记的消费类 App，就用那个包名再扫一次（该 App 自己的窗口）。
+            val cands = foreign.filter { it != pkg && PayApps.of(it) != null }
+            for (p in cands) {
+                val f2 = LinkedHashSet<String>()
+                val t2 = grabTexts(p, f2)
+                if (attempt(p, t2, token)) {
+                    hitToken = token
+                    Diag.log(this, "按窗口归属重扫命中：$p")
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
+        }
+    }
+
+    /** 对给定包名的页面文本跑完整闸门，命中记账返回 true */
+    private fun attempt(pkg: String, texts: ArrayList<String>, token: Int): Boolean {
+        try {
             // 门槛不能太高：支付宝付款结果页这类页面往往只有「支付成功」「¥32.50」「完成」两三条文本，
             // 卡在 3 条会整页读不到。
-            if (texts.size < 2) return
+            if (texts.size < 2) return false
             // 排除本应用自己的界面（明细/待确认里的文字）
-            if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return
+            if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return false
 
             val app = PayApps.of(pkg)
             if (PayApps.isExcluded(texts, app)) {
                 logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）")
-                return
+                return false
             }
             if (!PayApps.hasTitle(texts, app)) {
                 if (app == null) noteSuspect(pkg, texts)
-                return
+                return false
             }
             // 未注册的 App：必须有方向佐证才敢认定，避免"订单详情"浏览页误抓
-            if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return
+            if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return false
 
             val name = app?.name ?: appLabel(pkg)
 
@@ -175,13 +202,13 @@ class BillAccessibilityService : AccessibilityService() {
             // 12306 首页有「我的行程 / 行程详情」入口，正好命中票务类标题词，光靠标题词挡不住。
             if (PayApps.looksLikeHome(texts)) {
                 logSkip("$pkg#home", "$name → 跳过：页面形态是首页/列表页，不是某笔账单")
-                return
+                return false
             }
 
             // 闸门一·补（v2.8）：一屏多笔（3 个以上金额 + 2 个以上单号）= 订单列表，不是某一笔账单
             if (PayApps.looksLikeList(texts)) {
                 logSkip("$pkg#list", "$name → 跳过：这一屏是多笔订单的列表，不是单笔账单")
-                return
+                return false
             }
 
             // 闸门二（v2.6）：必须是「已经扣款」的页面。
@@ -197,7 +224,7 @@ class BillAccessibilityService : AccessibilityService() {
             // 必须另有账单结构字段（时间 / 单号 / 分类），否则订单列表、行程卡片都能凑巧满足。
             if (PayApps.onlyWeakTitle(texts, app) && !PayApps.hasBillStructure(texts)) {
                 logSkip("$pkg#weak", "$name → 跳过：只有弱标题词且无账单字段（时间/单号/分类），按列表页处理")
-                return
+                return false
             }
 
             if (state != PayApps.STATE_PAID) {
@@ -209,12 +236,13 @@ class BillAccessibilityService : AccessibilityService() {
                     logSkip("$pkg#$state",
                         "$name → 跳过：页面上没有支付完成证据，按浏览页处理")
                 }
-                return
+                return false
             }
 
-            if (scan(pkg, texts, app)) hitToken = token
+            return scan(pkg, texts, app)
         } catch (e: Exception) {
             Diag.log(this, "扫描异常：${e.javaClass.simpleName}")
+            return false
         }
     }
 
