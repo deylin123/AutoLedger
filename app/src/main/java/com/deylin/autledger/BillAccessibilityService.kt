@@ -39,7 +39,7 @@ class BillAccessibilityService : AccessibilityService() {
          *  3. 之后页面静止，不再产生任何事件 —— 除非用户手动滑动。
          * 所以不能"收到事件扫一次"，必须进页面后按时间点反复扫，拿到即停。
          */
-        private val BURST_DELAYS = longArrayOf(0, 200, 500, 1000, 1800, 3000, 4500, 6500)
+        private val BURST_DELAYS = longArrayOf(0, 200, 500, 1000, 1800, 3000, 4500, 6500, 9000, 12000)
 
         /** 内容变化事件的节流间隔 */
         private const val CONTENT_THROTTLE = 700L
@@ -130,22 +130,39 @@ class BillAccessibilityService : AccessibilityService() {
     private fun runScan(pkg: String, token: Int) {
         try {
             val texts = grabTexts()
-            if (texts.size < 3) return
+            // 门槛不能太高：支付宝付款结果页这类页面往往只有「支付成功」「¥32.50」「完成」两三条文本，
+            // 卡在 3 条会整页读不到。
+            if (texts.size < 2) return
             // 排除本应用自己的界面（明细/待确认里的文字）
             if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return
 
             val app = PayApps.of(pkg)
+            if (PayApps.isExcluded(texts, app)) {
+                logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）")
+                return
+            }
             if (!PayApps.hasTitle(texts, app)) {
                 if (app == null) noteSuspect(pkg, texts)
                 return
             }
-            // 未注册的 App：必须有支出方向佐证才敢认定，避免"订单详情"浏览页误抓
-            if (app == null && !PayApps.hasExpenseSignal(texts)) return
+            // 未注册的 App：必须有方向佐证才敢认定，避免"订单详情"浏览页误抓
+            if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return
 
             // 关键闸门（v2.6）：必须是「已经扣款」的页面。
             // 收银台、输入金额页同样有「实付款 ¥89.00」这类强标签金额，不拦住就会在付款前先记一笔，
             // 付款成功后再记一笔 —— 用户看到的「一次支付识别两次」就是这个。
-            val state = PayApps.payState(texts)
+            var state = PayApps.payState(texts)
+            if (state == PayApps.STATE_UNKNOWN) {
+                // 结构兜底（v2.7）：极少数账单页既没写成功词，也没有我们认识的详情字段
+                // （简版/大字版界面、部分厂商定制版）。这种页面只要「标题是账单类」
+                // 且「金额带明确标签」（强标签 110 / 内联 105）就按已支付处理。
+                // 收银台不会走到这里 —— 它们一定命中未完成词，payState 会先返回 UNPAID。
+                val amt = PayApps.findAmount(texts)
+                if (amt != null && amt.score >= 105) {
+                    state = PayApps.STATE_PAID
+                    Diag.log(this, "${app?.name ?: appLabel(pkg)} → 按结构兜底放行（金额强度 ${amt.score}）")
+                }
+            }
             if (state != PayApps.STATE_PAID) {
                 val name = app?.name ?: appLabel(pkg)
                 val v = PayApps.findAmount(texts)?.value
@@ -176,23 +193,29 @@ class BillAccessibilityService : AccessibilityService() {
         }
         val amount = amt.value
 
-        if (!amt.expense && PayApps.hasIncomeSignal(texts)) {
-            Diag.log(this, "$appName ¥$amount → 跳过：退款/收入")
+        // 收支方向：这一笔是钱出去还是钱进来。
+        // 旧逻辑只在「金额行没有强标签」时才看收入词；金额行一旦命中「实付款/支付金额/合计」
+        // 就直接按支出入库 —— 收入账单里的「金额 ¥500.00」正好走这条路径，于是收入被记成支出。
+        val dir = PayApps.direction(texts, amt)
+        if (dir == PayApps.DIR_UNKNOWN) {
+            Diag.log(
+                this,
+                "$appName ¥$amount → 跳过：看不出收支方向（${texts.take(10).joinToString("/").take(140)}）"
+            )
             return false
         }
-        if (!amt.expense && !PayApps.hasExpenseSignal(texts)) {
-            Diag.log(this, "$appName ¥$amount → 跳过：不像支出")
-            return false
-        }
+        val income = dir == PayApps.DIR_INCOME
 
         val merchant = PayApps.fieldOf(texts, PayApps.MERCHANT_KEYS)
-            ?: goodsNear(texts, amt.idx, appName)
+            ?: goodsNear(texts, amt.idx, appName, income)
         val goods = PayApps.fieldOf(texts, PayApps.GOODS_KEYS) ?: ""
         val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
         val ts = PayApps.TIME.find(joined)?.groupValues?.getOrNull(1)
             ?.let { PayApps.parseTime(it) } ?: System.currentTimeMillis()
 
-        val cat = Category.of(merchant, goods, catHint, appName)
+        val cat = if (income) Category.incomeOf(merchant, goods, catHint, appName)
+        else Category.of(merchant, goods, catHint, appName)
+        val type = if (income) 1 else 0
         val note = if (goods.isNotBlank() && goods != merchant) "$merchant·$goods" else merchant
 
         // 同一笔在多次重试之间保持幂等：8 秒内同金额不再入库
@@ -207,12 +230,16 @@ class BillAccessibilityService : AccessibilityService() {
             val prev = db.recentSameAmount(amount, ts, MERGE_WINDOW)
             if (prev != null) {
                 if (prev.status == 0) {
-                    // 先前那条还没确认：用本次更完整的信息覆盖（商品名通常只有结果页才有），不新增、不重复弹卡片
+                    // 先前那条还没确认：用本次更完整的信息覆盖（商品名通常只有结果页才有），不新增、不重复弹卡片。
+                    // 方向也一并覆盖 —— 先前那条可能是被误判成支出的收入。
                     val merged = betterNote(prev.note, note)
-                    db.updateRecord(prev.id, amount, cat, merged, ts, 0)
+                    db.updateRecordFull(prev.id, amount, type, cat, merged, ts, 0)
                     lastAmount = amount
                     lastAmountAt = now
-                    Diag.log(this, "$appName ¥$amount → 同一笔已合并到待确认 #${prev.id}（备注：$merged）")
+                    Diag.log(
+                        this,
+                        "$appName ¥$amount（${if (income) "收入" else "支出"}）→ 同一笔已合并到待确认 #${prev.id}（$cat）"
+                    )
                     return true
                 }
                 Diag.log(this, "$appName ¥$amount → 跳过：${MERGE_WINDOW / 1000}秒内同金额已记账（#${prev.id}）")
@@ -220,15 +247,18 @@ class BillAccessibilityService : AccessibilityService() {
             }
             val id = db.addRecord(
                 Rec(
-                    amount = amount, type = 0, cat = cat, note = note, ts = ts,
+                    amount = amount, type = type, cat = cat, note = note, ts = ts,
                     book = bookOf(), status = 0, src = appName
                 )
             )
             if (id <= 0) return false
             lastAmount = amount
             lastAmountAt = now
-            Diag.log(this, "$appName ¥$amount $note → 已存为待确认（预分类：$cat）")
-            showCard(id, amount, note, cat)
+            Diag.log(
+                this,
+                "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat）"
+            )
+            showCard(id, amount, note, cat, income)
             return true
         } finally {
             db.close()
@@ -266,21 +296,27 @@ class BillAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 读当前页面文字：优先活动窗口；活动窗口内容太少时（常见于支付宝，
-     * 详情页在另一个 window 里），再把所有窗口的文本合并读一遍。
+     * 读当前页面文字：把活动窗口与所有其他窗口的文本合并。
+     *
+     * v2.7 起改为「始终合并」。旧版只在活动窗口文本少于 4 条时才去读其他窗口，
+     * 但支付宝账单详情、部分电商页面把内容挂在独立 window 上，而活动窗口本身
+     * 有标题栏等 4 条以上文本 —— 于是永远读不到金额，表现为「极个别页面识别不出来」。
+     * 合并前会过滤掉系统界面与本应用自己的窗口，避免混入无关文字。
      */
     private fun grabTexts(): ArrayList<String> {
         val set = LinkedHashSet<String>()
-        rootInActiveWindow?.let { collect(it, set) }
-        if (set.size < 4) {
-            try {
-                val ws = windows
-                ws?.forEach { w ->
-                    val r = w?.root ?: return@forEach
-                    collect(r, set)
-                }
-            } catch (_: Exception) {
+        try {
+            rootInActiveWindow?.let { collect(it, set) }
+        } catch (_: Exception) {
+        }
+        try {
+            windows?.forEach { w ->
+                val r = w?.root ?: return@forEach
+                val p = r.packageName?.toString()
+                if (p == null || p == "com.android.systemui" || p == packageName) return@forEach
+                collect(r, set)
             }
+        } catch (_: Exception) {
         }
         return ArrayList(set)
     }
@@ -294,7 +330,7 @@ class BillAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) collect(node.getChild(i), out)
     }
 
-    private fun goodsNear(texts: List<String>, idx: Int, appName: String): String {
+    private fun goodsNear(texts: List<String>, idx: Int, appName: String, income: Boolean): String {
         for (j in (idx - 1) downTo maxOf(0, idx - 5)) {
             val s = texts[j].trim()
             if (s.length in 2..24 && !PayApps.hasAmountIn(s) &&
@@ -304,7 +340,7 @@ class BillAccessibilityService : AccessibilityService() {
                 !s.contains("账单") && !s.contains("详情")
             ) return s
         }
-        return appName + "消费"
+        return appName + if (income) "收入" else "消费"
     }
 
     private fun appLabel(pkg: String): String {
@@ -325,18 +361,18 @@ class BillAccessibilityService : AccessibilityService() {
     // ---------------- 悬浮卡片 ----------------
 
     /** 同一笔只弹一次，避免重复触发反复重建窗口造成闪烁 */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String) {
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
         // 通道一：通知栏，无条件发送。
         // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、
         // 只是窗口不可见，代码会误判为"已显示"。通知不受该权限限制，是唯一可靠通道，故作为主通道。
-        notifyPending(id, amount, note, cat)
+        notifyPending(id, amount, note, cat, income)
 
         if (id == lastCardId) return
         lastCardId = id
 
         handler.post {
             try {
-                buildCard(id, amount, note, cat)
+                buildCard(id, amount, note, cat, income)
             } catch (e: Exception) {
                 Diag.log(this, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
@@ -353,7 +389,7 @@ class BillAccessibilityService : AccessibilityService() {
      *  2. 窗口宽度用 MATCH_PARENT。部分 ROM 下 overlay 窗口宽度会被测量成 0，
      *     卡片就塌缩成一个小圆角块（用户看到的"只剩一个圈"）。现在改为明确的像素宽度。
      */
-    private fun buildCard(id: Long, amount: Double, note: String, cat: String) {
+    private fun buildCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
         if (!Settings.canDrawOverlays(this)) {
             Diag.log(this, "悬浮卡片跳过：悬浮窗权限未开（通知已发）")
             return
@@ -362,7 +398,12 @@ class BillAccessibilityService : AccessibilityService() {
         removeCard()
 
         val v = android.view.LayoutInflater.from(this).inflate(R.layout.view_card, null)
-        (v.findViewById<View>(R.id.tvAmount) as TextView).text = "-¥" + Ui.money(amount)
+        (v.findViewById<View>(R.id.tvHead) as TextView).text =
+            if (income) "自动识别到收入" else "自动识别到消费"
+        (v.findViewById<View>(R.id.tvAmount) as TextView).apply {
+            text = (if (income) "+¥" else "-¥") + Ui.money(amount)
+            setTextColor(if (income) Ui.GREEN else Ui.TEXT)
+        }
         (v.findViewById<View>(R.id.tvNote) as TextView).text = note
         (v.findViewById<View>(R.id.tvCat) as TextView).text = "分类：" + cat
         (v.findViewById<View>(R.id.tvIcon) as TextView).text = emojiOf(cat)
@@ -394,7 +435,11 @@ class BillAccessibilityService : AccessibilityService() {
             }
             handler.removeCallbacks(hideTask)
             removeCard()
-            Toast.makeText(this, "已记账：$cat ¥" + Ui.money(amount), Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                (if (income) "已记收入：" else "已记账：") + "$cat ¥" + Ui.money(amount),
+                Toast.LENGTH_SHORT
+            ).show()
         }
 
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -443,7 +488,7 @@ class BillAccessibilityService : AccessibilityService() {
         card = null
     }
 
-    private fun notifyPending(id: Long, amount: Double, note: String, cat: String) {
+    private fun notifyPending(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
         try {
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             // 渠道一旦创建，重要性不可修改，故 v2.3 使用新渠道 id 以确保「弹窗+响铃+震动」生效
@@ -465,7 +510,7 @@ class BillAccessibilityService : AccessibilityService() {
             )
             val n = Notification.Builder(this, chId)
                 .setSmallIcon(android.R.drawable.sym_def_app_icon)
-                .setContentTitle("识别到消费 ¥" + Ui.money(amount))
+                .setContentTitle((if (income) "识别到收入 ¥" else "识别到消费 ¥") + Ui.money(amount))
                 .setContentText("$note · 分类：$cat · 点此确认")
                 .setContentIntent(pi)
                 .setAutoCancel(true)

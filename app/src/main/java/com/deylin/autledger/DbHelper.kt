@@ -176,6 +176,19 @@ class DbHelper(context: Context) :
         )
     }
 
+    /**
+     * 合并同一笔时用：连收支方向（type）与分类一起覆盖。
+     * 先前那条可能是把收入误判成了支出，只改金额/备注会把错误方向留下。
+     */
+    fun updateRecordFull(
+        id: Long, amount: Double, type: Int, cat: String, note: String, ts: Long, status: Int
+    ) {
+        writableDatabase.execSQL(
+            "UPDATE records SET amount=?,type=?,cat=?,note=?,ts=?,status=? WHERE id=?",
+            arrayOf(amount, type, cat, note, ts, status, id)
+        )
+    }
+
     fun delRecord(id: Long) {
         writableDatabase.execSQL("DELETE FROM records WHERE id=?", arrayOf(id))
     }

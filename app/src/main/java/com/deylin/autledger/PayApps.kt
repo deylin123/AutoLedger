@@ -24,8 +24,19 @@ object PayApps {
     const val MERGE_WINDOW_MS = 90_000L
 
 
-    /** 一个消费类应用。titleWords 命中其一，才认为当前页面是「支付明细 / 结果页」 */
-    class App(val pkg: String, val name: String, val titleWords: List<String>)
+    /**
+     * 一个消费类应用。
+     *
+     * @param titleWords   命中其一，才认为当前页面是「支付明细 / 结果页」
+     * @param excludeWords 命中任一，直接否掉。用于排掉「看起来像账单页」的其他界面，
+     *                     典型是微信聊天窗口 —— 微信支付服务号的聊天消息里也有「支付成功 + 金额」。
+     */
+    class App(
+        val pkg: String,
+        val name: String,
+        val titleWords: List<String>,
+        val excludeWords: List<String> = emptyList()
+    )
 
     // ---- 各类 App 的标题特征词模板，避免重复书写 ----
     /** 电商 / 商城：订单详情、支付成功页 */
@@ -79,8 +90,23 @@ object PayApps {
         App("com.MobileTicket", "铁路12306", TRIP),
         App("com.lucky.luckyclient", "瑞幸咖啡", LOCAL),
         App("com.starbucks.cn", "星巴克", LOCAL),
-        App("com.tencent.mm", "微信",
-            listOf("账单详情", "交易详情", "转账详情", "转账成功", "支付详情"))
+        // 微信：v2.7 补上「支付成功 / 付款成功 / 支付结果」。
+        // 上一版把它们去掉是为了躲开微信支付服务号的聊天窗口，但代价是真正的「支付结果页」
+        // （只有 支付成功 + 金额 + 商户 + 完成，没有「账单详情」四个字）整页被判为非账单页，
+        // 表现为「微信消费完全不识别、不弹窗」。现在改用 excludeWords 精确排掉聊天界面。
+        App(
+            "com.tencent.mm", "微信",
+            listOf(
+                "账单详情", "交易详情", "转账详情", "转账成功", "支付详情",
+                "支付成功", "付款成功", "支付结果", "交易记录"
+            ),
+            listOf(
+                "按住 说话", "按住说话", "发送消息", "聊天信息", "表情面板", "语音输入",
+                // 「微信支付凭证」是聊天里那张卡片的标题，支付结果页不会出现；
+                // 这是区分「聊天里的支付消息」与「真正的支付结果页」最稳的特征
+                "微信支付凭证"
+            )
+        )
     )
 
     private val byPkg: Map<String, App> = APPS.associateBy { it.pkg }
@@ -309,7 +335,11 @@ object PayApps {
     private val DETAIL_WORDS = listOf(
         "账单详情", "交易详情", "付款详情", "支付详情", "账单分类",
         "交易单号", "商户单号", "转账单号", "账单号", "付款时间", "支付时间",
-        "交易时间", "商品说明", "订单编号", "订单号"
+        "交易时间", "商品说明", "订单编号", "订单号",
+        // v2.7 补充：简版/大字版账单页常用这些字段名，缺了会被判成「看不出支付痕迹」；
+        // 「转账详情」是微信转账详情页自身的标题，漏了会导致收款页被判为无支付证据
+        "创建时间", "完成时间", "商户订单号", "交易状态", "当前状态", "订单时间",
+        "转账详情"
     )
 
     /**
@@ -352,10 +382,74 @@ object PayApps {
         return if (detail) STATE_PAID else STATE_UNKNOWN
     }
 
+    // ---------------- 收支方向 ----------------
+
+    const val DIR_UNKNOWN = 0
+    const val DIR_EXPENSE = 1
+    const val DIR_INCOME = 2
+
+    /**
+     * 决定性收入词：出现即判收入，不再比较支出词。
+     * 这些词几乎只出现在「钱进来了」的页面上，是修正「收入被记成支出」的主依据。
+     */
+    private val INCOME_DECISIVE = listOf(
+        "收款成功", "收款到账", "已收款", "已到账", "到账成功", "入账成功", "已入账",
+        "退款成功", "已退款", "退款到账", "收到转账", "已收钱", "收款金额",
+        "红包已存入", "已存入零钱", "收益到账", "利息到账"
+    )
+
+    /** 一般收入词（弱），需与支出词比较后再定方向 */
+    private val INCOME_WEAK = listOf(
+        "收入", "收款", "入账", "到账", "退款", "退回", "转入", "收益"
+    )
+
+    /** 支出方向的强词（页面级） */
+    private val EXPENSE_STRONG = listOf(
+        "支出", "实付", "付款成功", "支付成功", "扣款成功", "扣费成功",
+        "消费成功", "已支付", "已付款", "付款给", "支付金额",
+        // 微信「转账成功」页只有「转账成功 + 转账给 XX」，不补这两条会被判成方向不明而漏记
+        "转账给", "转给", "已转账"
+    )
+
+    /** 单条文本是不是收入语义（通知通道用） */
+    fun isIncomeText(s: String): Boolean {
+        if (INCOME_DECISIVE.any { s.contains(it) }) return true
+        return INCOME_WEAK.any { s.contains(it) } && EXPENSE_STRONG.none { s.contains(it) }
+    }
+
+    /**
+     * 判定这一页是「钱出去」还是「钱进来」。
+     *
+     * 旧逻辑的缺陷：只在金额行不带强标签时才看收入词；金额行一旦命中「实付款 / 支付金额 / 合计」，
+     * 就直接按支出入库。收入账单里的「金额 ¥500.00」正好走这条路径，于是收入被记成了支出。
+     *
+     * 现在的判定顺序：
+     *  1. 决定性收入词 → 收入（优先级最高：宁可漏记一笔支出，也不要把收入记成支出）
+     *  2. 只有收入词、没有支出词 → 收入
+     *  3. 有支出词 → 支出
+     *  4. 页面没写方向 → 看金额节点自身（负号 / 支出标签算支出，其余判不明）
+     */
+    fun direction(texts: List<String>, amt: Amt?): Int {
+        if (texts.any { t -> INCOME_DECISIVE.any { t.contains(it) } }) return DIR_INCOME
+        val inc = INCOME_WEAK.count { w -> texts.any { it.contains(w) } }
+        val exp = EXPENSE_STRONG.count { w -> texts.any { it.contains(w) } }
+        if (inc > 0 && exp == 0) return DIR_INCOME
+        if (exp > 0) return DIR_EXPENSE
+        if (inc > 0) return DIR_INCOME
+        amt ?: return DIR_UNKNOWN
+        return if (amt.expense) DIR_EXPENSE else DIR_UNKNOWN
+    }
+
     /** 单条文本是否属于「钱还没付」的提醒（订单待付款、请尽快支付之类），通知通道用 */
     fun isUnsettledText(s: String): Boolean = UNSETTLED_WORDS.any { s.contains(it) }
 
-    fun hasTitle(texts: List<String>, app: App?): Boolean {        val words = app?.titleWords ?: COMMON_TITLE_WORDS
+    /** 是否命中该 App 的排除词（聊天窗口等） */
+    fun isExcluded(texts: List<String>, app: App?): Boolean =
+        app != null && app.excludeWords.any { w -> texts.any { it.contains(w) } }
+
+    fun hasTitle(texts: List<String>, app: App?): Boolean {
+        if (isExcluded(texts, app)) return false
+        val words = app?.titleWords ?: COMMON_TITLE_WORDS
         return texts.any { t -> words.any { w -> t.contains(w) } }
     }
 

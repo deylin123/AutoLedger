@@ -120,7 +120,10 @@ class PendingActivity : Activity() {
     private fun bind(v: View, r: Rec) {
         val note = if (r.note.isBlank()) r.cat else r.note
         v.findViewById<TextView>(R.id.tvNote).text = note
-        v.findViewById<TextView>(R.id.tvAmount).text = "-¥" + Ui.money(r.amount)
+        v.findViewById<TextView>(R.id.tvAmount).apply {
+            text = (if (r.type == 0) "-¥" else "+¥") + Ui.money(r.amount)
+            setTextColor(if (r.type == 0) Ui.TEXT else Ui.GREEN)
+        }
         val src = if (r.src.isBlank()) "手工" else r.src
         v.findViewById<TextView>(R.id.tvCat).text = "分类：" + r.cat + " · " + src
         v.findViewById<TextView>(R.id.tvTime).text = fmt(r.ts)
@@ -154,7 +157,11 @@ class PendingActivity : Activity() {
     /** 按当前分类直接入正式账本 */
     private fun confirmOne(r: Rec) {
         helper.updateRecord(r.id, r.amount, r.cat, r.note, r.ts, 1)
-        Toast.makeText(this, "已记账：" + r.cat + " ¥" + Ui.money(r.amount), Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            this,
+            (if (r.type == 0) "已记账：" else "已记收入：") + r.cat + " ¥" + Ui.money(r.amount),
+            Toast.LENGTH_SHORT
+        ).show()
         load()
     }
 

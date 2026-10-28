@@ -88,4 +88,24 @@ object Category {
         }
         return "其它"
     }
+
+    // 收入侧预分类：类别名必须与 Cats.INCOME 完全一致，否则待确认页选不中分类
+    private val incomeRules = linkedMapOf(
+        "退款" to listOf("退款", "退回", "退货", "售后", "赔付"),
+        "报销" to listOf("报销"),
+        "红包收入" to listOf("红包", "压岁钱"),
+        "工资" to listOf("工资", "薪资", "代发", "劳务费"),
+        "奖金" to listOf("奖金", "绩效", "年终", "补贴", "津贴", "奖励"),
+        "兼职" to listOf("兼职", "稿费", "佣金", "外包", "劳务报酬"),
+        "投资" to listOf("收益", "利息", "分红", "理财", "基金", "股票", "余额宝", "零钱通")
+    )
+
+    /** 收入方向的预分类，兜底为「其它收入」 */
+    fun incomeOf(vararg texts: String): String {
+        val joined = texts.filter { it.isNotBlank() }.joinToString(" ")
+        for ((cat, kws) in incomeRules) {
+            if (kws.any { joined.contains(it) }) return cat
+        }
+        return "其它收入"
+    }
 }

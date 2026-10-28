@@ -38,6 +38,16 @@ class PayNotificationListener : NotificationListenerService() {
             "自动扣款", "已付款", "付款给"
         )
 
+        /**
+         * 收入类通知的进入门槛。
+         * 收入通知不会写「支付成功」，旧版因此一条都进不来 —— 用户看到的「收入被记成支出」
+         * 有一部分是通知通道把收入当支出处理，另一部分是收入通知被直接丢弃。
+         */
+        private val INCOME_NOTIFY_WORDS = listOf(
+            "收款成功", "收款到账", "已到账", "入账成功", "已入账",
+            "退款成功", "已退款", "退款到账", "收到转账", "已收款", "已收钱"
+        )
+
         /** 营销类通知：即使含金额也不是消费 */
         private val AD_WORDS = listOf(
             "优惠券", "立减", "满减", "活动", "红包", "抽奖", "限时", "领取",
@@ -51,6 +61,14 @@ class PayNotificationListener : NotificationListenerService() {
 
         /** 「向 XX 付款」「付款给 XX」这类句式，微信支付凭证里最常见 */
         private val PAY_PATTERN = Regex("向.{1,16}付款|付款给.{1,16}|已向.{1,16}付款")
+
+        /**
+         * 资金搬运：钱在自己名下的账户之间移动（提现、信用卡还款、转入零钱通），
+         * 既不是消费也不是收入，必须排掉。
+         */
+        private val TRANSFER_WORDS = listOf(
+            "提现", "还款", "转出", "转入余额宝", "零钱通转入", "转入零钱通"
+        )
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -73,18 +91,23 @@ class PayNotificationListener : NotificationListenerService() {
         val big = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString() ?: text
         val body = "$title $big $text"
 
-        // ① 必须是支付成功类通知（词表 + 「向XX付款」句式）
+        // ① 必须是支付成功 / 收款到账类通知（词表 + 「向XX付款」句式）
         val strongPay = STRONG_PAY_WORDS.any { body.contains(it) } || PAY_PATTERN.containsMatchIn(body)
-        if (!strongPay) return
+        val strongIncome = INCOME_NOTIFY_WORDS.any { body.contains(it) }
+        if (!strongPay && !strongIncome) return
         // ①.5 排除「还没付钱」的提醒：不少 App 会推「订单待付款，付款成功后将…」，
         //     里面同时含「付款成功」，不单独拦会被当成已支付
         if (PayApps.isUnsettledText(body)) return
-        // ② 排除退款 / 到账
-        if (PayApps.INCOME_WORDS.any { body.contains(it) }) return
-        // ③ 排除营销推送
+        // ② 资金搬运（提现 / 还款 / 转入零钱通）既不是消费也不是收入
+        if (TRANSFER_WORDS.any { body.contains(it) }) return
+        // ③ 方向：收入 / 退款类通知记成收入。
+        //    旧版这里直接 return 丢掉，导致「收到转账 / 退款到账」这类本来就是收入的钱彻底记不上；
+        //    若被误判成支出更是直接污染账本。现在统一走方向判定。
+        val income = PayApps.isIncomeText(body)
+        // ④ 排除营销推送
         if (AD_WORDS.any { body.contains(it) }) return
 
-        // ④ 金额：优先带 ¥ 的，其次 X元
+        // ⑤ 金额：优先带 ¥ 的，其次 X元
         var amount = 0.0
         val m1 = AMOUNT_YUAN.find(body)
         if (m1 != null) {
@@ -97,8 +120,11 @@ class PayNotificationListener : NotificationListenerService() {
 
         val appName = appLabel(sbn.packageName)
         val merchant = MERCHANT.find(body)?.groupValues?.getOrNull(1)?.trim()
-            ?.takeIf { it.isNotBlank() && !PayApps.hasAmountIn(it) } ?: (appName + "消费")
-        val cat = Category.of(merchant, body, appName)
+            ?.takeIf { it.isNotBlank() && !PayApps.hasAmountIn(it) }
+            ?: (appName + if (income) "收入" else "消费")
+        val cat = if (income) Category.incomeOf(merchant, body, appName)
+        else Category.of(merchant, body, appName)
+        val type = if (income) 1 else 0
         val ts = sbn.postTime.takeIf { it > 0 } ?: System.currentTimeMillis()
 
         val db = DbHelper(this)
@@ -108,8 +134,8 @@ class PayNotificationListener : NotificationListenerService() {
             if (prev != null) {
                 if (prev.status == 0 && prev.note.endsWith("消费") && !merchant.endsWith("消费")) {
                     // 待确认那条只是兜底名，用通知里的具体商户名补全，时间仍保留页面抓到的
-                    db.updateRecord(prev.id, amount, prev.cat, merchant, prev.ts, 0)
-                    Diag.log(this, "$appName 通知 ¥$amount → 合并商户名到待确认 #${prev.id}（$merchant）")
+                    db.updateRecordFull(prev.id, amount, type, cat, merchant, prev.ts, 0)
+                    Diag.log(this, "$appName 通知 ¥$amount → 合并到待确认 #${prev.id}（$merchant）")
                 } else {
                     Diag.log(this, "$appName 通知 ¥$amount → 跳过：90秒内同金额已有记录 #${prev.id}")
                 }
@@ -119,13 +145,16 @@ class PayNotificationListener : NotificationListenerService() {
                 .getString("book", "日常账本") ?: "日常账本"
             val id = db.addRecord(
                 Rec(
-                    amount = amount, type = 0, cat = cat, note = merchant,
+                    amount = amount, type = type, cat = cat, note = merchant,
                     ts = ts, book = book, status = 0, src = appName
                 )
             )
             if (id <= 0) return
-            Diag.log(this, "$appName 通知 ¥$amount $merchant → 已存为待确认（$cat）")
-            showConfirmNotification(id, amount, merchant, cat)
+            Diag.log(
+                this,
+                "$appName 通知 ¥$amount $merchant → 已存为待确认（${if (income) "收入" else "支出"}·$cat）"
+            )
+            showConfirmNotification(id, amount, merchant, cat, income)
         } finally {
             db.close()
         }
@@ -143,7 +172,9 @@ class PayNotificationListener : NotificationListenerService() {
         return name
     }
 
-    private fun showConfirmNotification(id: Long, amount: Double, merchant: String, category: String) {
+    private fun showConfirmNotification(
+        id: Long, amount: Double, merchant: String, category: String, income: Boolean
+    ) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel(CHAN, "消费提醒", NotificationManager.IMPORTANCE_HIGH)
@@ -157,7 +188,7 @@ class PayNotificationListener : NotificationListenerService() {
         )
         val n = Notification.Builder(this, CHAN)
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
-            .setContentTitle("识别到消费 ¥" + Ui.money(amount))
+            .setContentTitle((if (income) "识别到收入 ¥" else "识别到消费 ¥") + Ui.money(amount))
             .setContentText("$merchant · 分类：$category · 点击确认")
             .setContentIntent(pi)
             .setAutoCancel(true)
