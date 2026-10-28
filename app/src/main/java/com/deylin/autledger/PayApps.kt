@@ -111,6 +111,19 @@ object PayApps {
                 // 这是区分「聊天里的支付消息」与「真正的支付结果页」最稳的特征
                 "微信支付凭证"
             )
+        ),
+        // v2.11 补登记 QQ：QQ 钱包的支付结果页同样只有「支付成功 + 金额 + 完成」，
+        // 不登记的话走通用兜底，而通用标题词刻意不含「支付成功」→ 整页不命中 → QQ 消费漏记。
+        // 聊天窗口排除词与微信同一套（按住说话/发送消息等输入栏特征）。
+        App(
+            "com.tencent.mobileqq", "QQ",
+            listOf(
+                "账单详情", "交易详情", "支付详情", "支付成功", "付款成功",
+                "支付结果", "付款结果", "交易成功", "充值成功"
+            ),
+            listOf(
+                "按住 说话", "按住说话", "发送消息", "聊天信息", "表情面板", "语音输入"
+            )
         )
     )
 
@@ -400,7 +413,9 @@ object PayApps {
     private val PAID_WORDS = listOf(
         "支付成功", "付款成功", "交易成功", "扣款成功", "扣费成功", "消费成功",
         "购买成功", "下单成功", "支付完成", "付款完成", "转账成功", "缴费成功",
-        "已支付", "已付款", "已扣款", "支付结果", "付款结果"
+        "已支付", "已付款", "已扣款", "支付结果", "付款结果",
+        // v2.11：QQ 充值、话费充值等页面只写「充值成功」，缺了会整页漏记
+        "充值成功", "充值完成"
     )
 
     /**
@@ -475,6 +490,14 @@ object PayApps {
         "红包已存入", "已存入零钱", "已存入", "收益到账", "利息到账"
     )
 
+    /**
+     * 流出证据：字面像收款、实际是钱出去的词。
+     * 微信转出转账详情页写「朋友已收款 / 对方已收款」——那是对方收到了我的钱，
+     * 不加这道守卫会被 INCOME_DECISIVE 判成收入。
+     */
+    private val OUT_EVIDENCE = listOf(
+        "朋友已收款", "对方已收款", "转账给", "转给", "付款给", "已转账"
+    )
     /** 一般收入词（弱），需与支出词比较后再定方向 */
     private val INCOME_WEAK = listOf(
         "收入", "收款", "入账", "到账", "退款", "退回", "转入", "收益"
@@ -485,7 +508,9 @@ object PayApps {
         "支出", "实付", "付款成功", "支付成功", "扣款成功", "扣费成功",
         "消费成功", "已支付", "已付款", "付款给", "支付金额",
         // 微信「转账成功」页只有「转账成功 + 转账给 XX」，不补这两条会被判成方向不明而漏记
-        "转账给", "转给", "已转账"
+        "转账给", "转给", "已转账",
+        // v2.11：QQ 充值/话费充值页只有「充值成功 + 金额」，没有任何其他方向词
+        "充值成功", "充值完成", "已充值"
     )
 
     /** 单条文本是不是收入语义（通知通道用） */
@@ -526,10 +551,23 @@ object PayApps {
 
     fun direction(texts: List<String>, amt: Amt?): Int {
         val clean = stripFieldLabels(texts)
-        if (clean.any { t -> INCOME_DECISIVE.any { t.contains(it) } }) return DIR_INCOME
-        // 金额节点带明确符号（「-47.52」「+500.00」）→ 符号优先于页面弱方向词。
-        // 收入页面也可能出现「优惠 -¥5.00」之类的行，但 findAmount 会优先取分更高的主金额。
+        // v2.11：金额节点带明确 +/- 号是「这笔钱」方向最硬的证据，优先于页面级词。
+        // 放在决定性收入词之前：微信/支付宝账单详情里可能出现「已到账」等字样，
+        // 但金额自身的「-47.52」才是这笔钱真实方向的直接证据。
         if (amt != null && amt.signed) return if (amt.expense) DIR_EXPENSE else DIR_INCOME
+        // v2.11：微信转出转账详情页写「朋友已收款」——字面是收款，实际钱出去了。
+        // 且「朋友已收款」包含决定性收入词「已收款」的子串，必须先把它从文本里剔除再匹配，
+        // 否则转出页会被判成收入。
+        val decisiveSrc = clean.map { t ->
+            var s = t
+            OUT_EVIDENCE.forEach { w -> s = s.replace(w, "") }
+            s
+        }
+        val decisive = decisiveSrc.any { t -> INCOME_DECISIVE.any { t.contains(it) } }
+        val outgoing = OUT_EVIDENCE.any { w -> clean.any { it.contains(w) } }
+        // 决定性收入词与流出证据并存时（如退款页提到「付款给」），收入优先。
+        if (decisive) return DIR_INCOME
+        if (outgoing) return DIR_EXPENSE
         val inc = INCOME_WEAK.count { w -> clean.any { it.contains(w) } }
         val exp = EXPENSE_STRONG.count { w -> clean.any { it.contains(w) } }
         if (inc > 0 && exp == 0) return DIR_INCOME
