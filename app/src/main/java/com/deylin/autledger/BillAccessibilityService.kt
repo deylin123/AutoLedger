@@ -76,6 +76,9 @@ class BillAccessibilityService : AccessibilityService() {
             "返回", "确定", "取消", "更多", "全部", "查看", "加载"
         )
         private val NOISE_SHAPE = Regex("^[\\d.,:：\\s\\-+/%]+$")
+
+        /** 取消后同金额的抑制窗口：覆盖页面停留/划动重扫的场景，又不至于把下一笔真实同金额消费挡太久 */
+        private const val CANCEL_SUPPRESS_MS = 5 * 60_000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -89,6 +92,10 @@ class BillAccessibilityService : AccessibilityService() {
     private var lastContentAt = 0L
     private var lastAmount = -1.0
     private var lastAmountAt = 0L
+
+    /** 用户在弹窗上点过「取消」的笔：5 分钟内同金额不再重复弹/记（v2.10） */
+    private var lastCancelledAmount = -1.0
+    private var lastCancelledAt = 0L
 
     private val suspectLogged = HashMap<String, Long>()
     private val skipLogged = HashMap<String, Long>()
@@ -285,6 +292,12 @@ class BillAccessibilityService : AccessibilityService() {
         // 同一笔在多次重试之间保持幂等：8 秒内同金额不再入库
         val now = System.currentTimeMillis()
         if (amount == lastAmount && now - lastAmountAt < 8000) return false
+        // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
+        // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
+        if (amount == lastCancelledAmount && now - lastCancelledAt < CANCEL_SUPPRESS_MS) {
+            Diag.log(this, "$appName ¥$amount → 跳过：用户已取消这笔，${CANCEL_SUPPRESS_MS / 60000}分钟内不再重复弹")
+            return false
+        }
 
         val db = DbHelper(this)
         try {
@@ -502,6 +515,24 @@ class BillAccessibilityService : AccessibilityService() {
         (v.findViewById<View>(R.id.tvCat) as TextView).text = "分类：" + cat
         (v.findViewById<View>(R.id.tvIcon) as TextView).text = emojiOf(cat)
 
+        v.findViewById<View>(R.id.btnCancel).setOnClickListener {
+            // 取消：删掉已入库的待确认记录 + 撤掉通知栏提醒，不保留任何数据，无需二次确认。
+            // 误触的代价可控：明细里可手动补记；且 5 分钟内同笔不会因页面重扫而再次弹出。
+            try {
+                val db = DbHelper(this)
+                db.delRecord(id)
+                db.close()
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(id.toInt())
+                lastCancelledAmount = amount
+                lastCancelledAt = System.currentTimeMillis()
+                Diag.log(this, "用户取消：¥$amount $note 已删除待确认记录 #$id，不记账")
+            } catch (e: Exception) {
+                Diag.log(this, "取消失败：${e.javaClass.simpleName}")
+            }
+            handler.removeCallbacks(hideTask)
+            removeCard()
+            Toast.makeText(this, "已取消，不记这笔", Toast.LENGTH_SHORT).show()
+        }
         v.findViewById<View>(R.id.btnLater).setOnClickListener {
             handler.removeCallbacks(hideTask)
             removeCard()

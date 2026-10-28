@@ -91,6 +91,24 @@
         android:orientation="horizontal">
 
         <TextView
+            android:id="@+id/btnCancel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingLeft="12dp"
+            android:paddingTop="8dp"
+            android:paddingRight="12dp"
+            android:paddingBottom="8dp"
+            android:text="取消"
+            android:textColor="#B0B0B0"
+            android:textSize="13sp" />
+
+        <!-- 弹性占位：把 取消 推到最左、其余三个操作聚在右侧，避免误触确认类按钮 -->
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
             android:id="@+id/btnLater"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
