@@ -87,7 +87,12 @@ object PayApps {
         App("ctrip.android.view", "携程", TRIP),
         App("com.taobao.trip", "飞猪", TRIP),
         App("com.sdu.didi.psnger", "滴滴出行", TRIP),
-        App("com.MobileTicket", "铁路12306", TRIP),
+        // 12306 首页/功能区（不是某笔车票的账单页）：
+        // 它的「我的行程 / 行程详情」入口正好命中 TRIP 词表，光靠标题词挡不住，这里直接否掉。
+        App(
+            "com.MobileTicket", "铁路12306", TRIP,
+            listOf("时刻表", "车站大屏", "车票预订", "铁路会员", "积分兑换", "温馨服务", "出行指南")
+        ),
         App("com.lucky.luckyclient", "瑞幸咖啡", LOCAL),
         App("com.starbucks.cn", "星巴克", LOCAL),
         // 微信：v2.7 补上「支付成功 / 付款成功 / 支付结果」。
@@ -122,6 +127,49 @@ object PayApps {
         "账单详情", "交易详情", "付款详情", "支付详情", "订单详情", "订单信息",
         "支付结果", "付款结果", "交易结果", "支付凭证", "付款凭证", "消费详情"
     )
+
+    /**
+     * 弱标题词：这些词既能出现在账单页，也常出现在首页卡片、订单列表、行程卡片上。
+     * 只命中它们不足以认定「这是账单页」，必须再配合「已扣款」证据。
+     *
+     * 这是 v2.8 修「打开 12306 首页就弹窗」的第一道闸：
+     * 12306 首页的「我的行程 / 行程详情」入口正好命中 TRIP 词表。
+     */
+    private val WEAK_TITLE = setOf(
+        "订单详情", "订单信息", "订单列表", "我的订单",
+        "行程详情", "交易记录", "支付详情", "付款详情"
+    )
+
+    /**
+     * 只命中了弱标题词（没有命中任何强标题词）。
+     * 调用方据此要求更强的支付证据，避免首页/列表页误判。
+     */
+    fun onlyWeakTitle(texts: List<String>, app: App?): Boolean {
+        val words = app?.titleWords ?: COMMON_TITLE_WORDS
+        val hits = words.filter { w -> texts.any { it.contains(w) } }
+        return hits.isNotEmpty() && hits.all { WEAK_TITLE.contains(it) }
+    }
+
+    /** 主界面 / 列表页的导航特征词（底部 tab 栏、首页入口） */
+    private val HOME_WORDS = listOf(
+        "首页", "我的", "购物车", "推荐", "搜索", "发现", "消息", "分类",
+        "全部订单", "待付款", "待收货", "我的订单", "个人中心"
+    )
+
+    /**
+     * 是否明显是首页 / 列表页（而不是某笔账单的详情页）。
+     * 判据：导航类词命中 ≥3 个，且没有任何「账单结构」证据。
+     *
+     * 这是第二道闸：即便页面上某句话凑巧满足支付条件，只要整体形态是首页，一律不记。
+     */
+    fun looksLikeHome(texts: List<String>): Boolean {
+        // 页面自己写了「支付成功」这类字样的，一定不是首页 ——
+        // 电商的支付成功页底部同样有「首页/我的/购物车」导航，不能误判成首页。
+        if (PAID_WORDS.any { w -> texts.any { it.contains(w) } }) return false
+        val n = HOME_WORDS.count { w -> texts.any { t -> t.contains(w) } }
+        if (n < 3) return false
+        return DETAIL_WORDS.none { w -> texts.any { t -> t.contains(w) } }
+    }
 
     /** 支出方向的佐证词 */
     val EXPENSE_WORDS = listOf(
@@ -230,6 +278,24 @@ object PayApps {
     private fun toNum(s: String?): Double? =
         s?.replace(",", "")?.replace(" ", "")?.replace("．", ".")?.toDoubleOrNull()
 
+    /**
+     * 数字后面紧跟这些内容，说明它根本不是金额：
+     * 网速（92KB/s）、流量（1.5GB）、百分比（80%）、计数（3次 / 5笔）、
+     * 计量（2kg / 500ml）、广告起价（¥92起）。
+     *
+     * 这是 v2.8 修「把 92KB/s 当消费」的金额侧防线：
+     * 之前只挡住了整行纯数字，但行内抠取（"实付款…92"）没有任何单位校验。
+     */
+    private val NON_MONEY_AFTER = Regex(
+        "^\\s*(?:[A-Za-z%/‰]|起|次|笔|人|件|个|天|日|岁|分|秒|米|公里|kg|斤|克|毫升|ml|积分|里程|台|张|位|折|期|小时|分钟|步|层|楼|号)"
+    )
+
+    /** 匹配到的数字紧邻字符是不是「非货币单位」 */
+    private fun hasNonMoneyUnit(s: String, endExclusive: Int): Boolean {
+        if (endExclusive >= s.length) return false
+        return NON_MONEY_AFTER.containsMatchIn(s.substring(endExclusive))
+    }
+
     fun hasAmountIn(s: String): Boolean =
         STRONG_LABELED.containsMatchIn(s) || STRONG_INLINE.containsMatchIn(s) ||
             WEAK_LABELED.containsMatchIn(s) || AMOUNT_SIGNED.containsMatchIn(s) ||
@@ -272,7 +338,10 @@ object PayApps {
                 toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 110, i) }
             }
             if (cand == null) STRONG_INLINE.find(s)?.let { m ->
-                toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 105, i) }
+                // 行内抠取必须做单位校验，否则「实付款…92KB/s」这类也能过
+                if (!hasNonMoneyUnit(s, m.range.last + 1)) {
+                    toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 105, i) }
+                }
             }
             if (cand == null) WEAK_LABELED.find(s)?.let { m ->
                 toNum(m.groupValues.getOrNull(1))?.let { cand = Amt(it, true, 100, i) }
@@ -305,8 +374,13 @@ object PayApps {
         for (i in texts.indices) {
             val s = texts[i].trim()
             if (s.isEmpty() || TIME.containsMatchIn(s)) continue
-            val v = toNum(AMOUNT_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
-                ?: toNum(CURRENCY_IN_TEXT.find(s)?.groupValues?.getOrNull(1))
+            // 整行是网速/流量/百分比这类，直接否掉
+            if (Regex("^[\\d.,]+\\s*[A-Za-z%/]+.*$").containsMatchIn(s)) continue
+            val m1 = AMOUNT_IN_TEXT.find(s)
+            val m2 = if (m1 == null) CURRENCY_IN_TEXT.find(s) else null
+            val m = m1 ?: m2 ?: continue
+            if (hasNonMoneyUnit(s, m.range.last + 1)) continue
+            val v = toNum(m.groupValues.getOrNull(1))
             if (v != null && v >= 0.01 && v <= 500000.0) {
                 val exp = !MARKETING_WORDS.any { s.contains(it) }
                 return Amt(v, exp, 50, i)
@@ -455,6 +529,26 @@ object PayApps {
 
     fun hasExpenseSignal(texts: List<String>): Boolean =
         texts.any { t -> EXPENSE_WORDS.any { w -> t.contains(w) } }
+
+    /** 页面上有没有「账单结构」字段（付款时间 / 交易单号 / 账单分类 等） */
+    fun hasBillStructure(texts: List<String>): Boolean =
+        DETAIL_WORDS.any { w -> texts.any { t -> t.contains(w) } }
+
+    private val ORDER_KEYS = listOf("订单号", "订单编号", "交易单号")
+
+    /**
+     * 是否像「订单列表」而不是「某一笔的账单」。
+     *
+     * 判据：页面上出现 3 个以上金额节点，并且有 2 个以上单号字段 —— 一笔账单只有一个金额、一个单号。
+     * 这挡住 12306「我的订单」这类列表页：每行都是「已支付 + 票价 + 订单号」，
+     * 单看任何一行都像账单，但它们讲的不是同一笔。
+     */
+    fun looksLikeList(texts: List<String>): Boolean {
+        val amtNodes = texts.count { hasAmountIn(it) }
+        if (amtNodes < 3) return false
+        val orderNodes = texts.count { t -> ORDER_KEYS.any { t.contains(it) } }
+        return orderNodes >= 2
+    }
 
     fun hasIncomeSignal(texts: List<String>): Boolean =
         texts.any { t -> INCOME_WORDS.any { w -> t.contains(w) } }

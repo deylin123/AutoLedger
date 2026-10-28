@@ -61,6 +61,21 @@ class BillAccessibilityService : AccessibilityService() {
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
             "数量", "件数", "单价", "航班", "车次", "座位", "里程", "积分", "备注"
         )
+
+        /**
+         * 这些文本不可能是商户/商品名（v2.8）：
+         * 网速「92KB/s」、流量「1.5GB」、电量「80%」、纯数字、底部导航词。
+         *
+         * 之前备注取「金额上方最近的文本」时没有任何过滤，状态栏的网速被当成商户名记进了账。
+         */
+        private val TEXT_NOISE_UNITS = listOf(
+            "KB", "MB", "GB", "TB", "/s", "%", "‰", "℃", "dB", "mAh", "Hz", "ms"
+        )
+        private val TEXT_NOISE_WORDS = listOf(
+            "首页", "我的", "消息", "搜索", "购物车", "推荐", "发现", "设置",
+            "返回", "确定", "取消", "更多", "全部", "查看", "加载"
+        )
+        private val NOISE_SHAPE = Regex("^[\\d.,:：\\s\\-+/%]+$")
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -129,7 +144,13 @@ class BillAccessibilityService : AccessibilityService() {
 
     private fun runScan(pkg: String, token: Int) {
         try {
-            val texts = grabTexts()
+            val foreign = LinkedHashSet<String>()
+            val texts = grabTexts(pkg, foreign)
+            if (foreign.isNotEmpty()) {
+                // 排查「读到别家文字」用，同一组合 60 秒只记一次
+                logSkip("foreign#$pkg#${foreign.joinToString(",")}",
+                    "已丢弃非本页文字：${foreign.joinToString(", ")}（当前 ${appLabel(pkg)}）")
+            }
             // 门槛不能太高：支付宝付款结果页这类页面往往只有「支付成功」「¥32.50」「完成」两三条文本，
             // 卡在 3 条会整页读不到。
             if (texts.size < 2) return
@@ -148,23 +169,38 @@ class BillAccessibilityService : AccessibilityService() {
             // 未注册的 App：必须有方向佐证才敢认定，避免"订单详情"浏览页误抓
             if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return
 
-            // 关键闸门（v2.6）：必须是「已经扣款」的页面。
+            val name = app?.name ?: appLabel(pkg)
+
+            // 闸门一（v2.8）：页面形态是首页 / 列表页，一律不记。
+            // 12306 首页有「我的行程 / 行程详情」入口，正好命中票务类标题词，光靠标题词挡不住。
+            if (PayApps.looksLikeHome(texts)) {
+                logSkip("$pkg#home", "$name → 跳过：页面形态是首页/列表页，不是某笔账单")
+                return
+            }
+
+            // 闸门一·补（v2.8）：一屏多笔（3 个以上金额 + 2 个以上单号）= 订单列表，不是某一笔账单
+            if (PayApps.looksLikeList(texts)) {
+                logSkip("$pkg#list", "$name → 跳过：这一屏是多笔订单的列表，不是单笔账单")
+                return
+            }
+
+            // 闸门二（v2.6）：必须是「已经扣款」的页面。
             // 收银台、输入金额页同样有「实付款 ¥89.00」这类强标签金额，不拦住就会在付款前先记一笔，
             // 付款成功后再记一笔 —— 用户看到的「一次支付识别两次」就是这个。
-            var state = PayApps.payState(texts)
-            if (state == PayApps.STATE_UNKNOWN) {
-                // 结构兜底（v2.7）：极少数账单页既没写成功词，也没有我们认识的详情字段
-                // （简版/大字版界面、部分厂商定制版）。这种页面只要「标题是账单类」
-                // 且「金额带明确标签」（强标签 110 / 内联 105）就按已支付处理。
-                // 收银台不会走到这里 —— 它们一定命中未完成词，payState 会先返回 UNPAID。
-                val amt = PayApps.findAmount(texts)
-                if (amt != null && amt.score >= 105) {
-                    state = PayApps.STATE_PAID
-                    Diag.log(this, "${app?.name ?: appLabel(pkg)} → 按结构兜底放行（金额强度 ${amt.score}）")
-                }
+            //
+            // v2.8 去掉了 v2.7 的「金额强度≥105 就当已支付」兜底：
+            // 那条兜底让「标题像账单 + 页面上有个看着像金额的数」就能记账，
+            // 首页广告位、行程卡片都可能满足。现在只认成功词或账单结构字段。
+            val state = PayApps.payState(texts)
+
+            // 闸门三（v2.8）：只命中弱标题词（订单详情 / 行程详情 / 交易记录…）时，
+            // 必须另有账单结构字段（时间 / 单号 / 分类），否则订单列表、行程卡片都能凑巧满足。
+            if (PayApps.onlyWeakTitle(texts, app) && !PayApps.hasBillStructure(texts)) {
+                logSkip("$pkg#weak", "$name → 跳过：只有弱标题词且无账单字段（时间/单号/分类），按列表页处理")
+                return
             }
+
             if (state != PayApps.STATE_PAID) {
-                val name = app?.name ?: appLabel(pkg)
                 val v = PayApps.findAmount(texts)?.value
                 if (state == PayApps.STATE_UNPAID) {
                     logSkip("$pkg#$state#$v",
@@ -256,7 +292,7 @@ class BillAccessibilityService : AccessibilityService() {
             lastAmountAt = now
             Diag.log(
                 this,
-                "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat）"
+                "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
             showCard(id, amount, note, cat, income)
             return true
@@ -296,24 +332,40 @@ class BillAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 读当前页面文字：把活动窗口与所有其他窗口的文本合并。
+     * 读当前页面文字：活动窗口 + 同一 App 的其他窗口。
      *
-     * v2.7 起改为「始终合并」。旧版只在活动窗口文本少于 4 条时才去读其他窗口，
-     * 但支付宝账单详情、部分电商页面把内容挂在独立 window 上，而活动窗口本身
-     * 有标题栏等 4 条以上文本 —— 于是永远读不到金额，表现为「极个别页面识别不出来」。
-     * 合并前会过滤掉系统界面与本应用自己的窗口，避免混入无关文字。
+     * v2.8 的关键修正：**必须按包名过滤**。
+     *
+     * v2.7 为了读到支付宝挂在独立 window 上的账单内容，改成了「合并所有窗口」，
+     * 但只排除了 systemui 与本应用 —— 于是状态栏/网速悬浮窗的「92KB/s」、输入法、
+     * 其他 App 的悬浮通知文字全被拼进了页面文本：
+     *   ① 备注取了金额上方最近的文本，于是把「92KB/s」当成商户名；
+     *   ② 别的窗口若带「已支付 / 支付成功」，会让首页通过"已扣款"闸门，于是凭空记一笔。
+     * 现在只收 root.packageName 与当前 App 一致的窗口，其余（系统界面、输入法、悬浮窗、
+     * 其他 App）一律丢弃。支付宝/电商的独立 window 包名仍是自身，不影响读取。
+     *
+     * @param pkg 触发事件的包名
+     * @param foreign 输出：被丢弃的外来包名，用于诊断日志
      */
-    private fun grabTexts(): ArrayList<String> {
+    private fun grabTexts(pkg: String, foreign: MutableSet<String>): ArrayList<String> {
         val set = LinkedHashSet<String>()
         try {
-            rootInActiveWindow?.let { collect(it, set) }
+            val root = rootInActiveWindow
+            val rp = root?.packageName?.toString()
+            if (root != null && (rp == null || rp == pkg || rp == packageName)) collect(root, set)
         } catch (_: Exception) {
         }
         try {
             windows?.forEach { w ->
                 val r = w?.root ?: return@forEach
                 val p = r.packageName?.toString()
-                if (p == null || p == "com.android.systemui" || p == packageName) return@forEach
+                if (p == null) return@forEach
+                if (p == "com.android.systemui" || p == "android") return@forEach
+                if (p == packageName) return@forEach
+                if (p != pkg) {
+                    if (foreign.size < 6) foreign.add(p)
+                    return@forEach
+                }
                 collect(r, set)
             }
         } catch (_: Exception) {
@@ -333,7 +385,10 @@ class BillAccessibilityService : AccessibilityService() {
     private fun goodsNear(texts: List<String>, idx: Int, appName: String, income: Boolean): String {
         for (j in (idx - 1) downTo maxOf(0, idx - 5)) {
             val s = texts[j].trim()
-            if (s.length in 2..24 && !PayApps.hasAmountIn(s) &&
+            if (s.length !in 2..24) continue
+            // v2.8：先把「不像名字」的文本全部否掉，否则网速、百分比、纯数字都会被当商户名
+            if (isNoiseText(s)) continue
+            if (!PayApps.hasAmountIn(s) &&
                 PayApps.TIME.find(s) == null &&
                 !PayApps.hasExpenseSignal(listOf(s)) &&
                 FIELD_NOISE.none { s.contains(it) } &&
@@ -341,6 +396,17 @@ class BillAccessibilityService : AccessibilityService() {
             ) return s
         }
         return appName + if (income) "收入" else "消费"
+    }
+
+    /** 这段文字不可能是商户 / 商品名 */
+    private fun isNoiseText(s: String): Boolean {
+        if (NOISE_SHAPE.matches(s)) return true
+        if (s.contains("/")) return true
+        if (TEXT_NOISE_UNITS.any { s.contains(it) }) return true
+        if (TEXT_NOISE_WORDS.any { s == it || s.startsWith(it) }) return true
+        // 数字开头 + 字母单位（92KB、1.5G、3ms…）
+        if (Regex("^[\\d.,]+\\s*[A-Za-z%/]+.*$").containsMatchIn(s)) return true
+        return false
     }
 
     private fun appLabel(pkg: String): String {
