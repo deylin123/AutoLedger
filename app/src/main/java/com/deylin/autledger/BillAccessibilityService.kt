@@ -79,6 +79,12 @@ class BillAccessibilityService : AccessibilityService() {
 
         /** 取消后同金额的抑制窗口：覆盖页面停留/划动重扫的场景，又不至于把下一笔真实同金额消费挡太久 */
         private const val CANCEL_SUPPRESS_MS = 5 * 60_000L
+
+        /**
+         * v2.12：「刚刚发生」的判定窗。页面上的付款/交易时间比这更早 → 是在浏览历史账单，不记。
+         * 支付是有过程的行为（输金额→收银台→密码→成功页），10 分钟足以覆盖正常支付全程。
+         */
+        private const val FRESH_WINDOW_MS = 10 * 60_000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -108,7 +114,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.5 通用识别版）")
+        Diag.log(this, "无障碍服务已连接（v2.12 只认刚刚发生的支付）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -243,6 +249,25 @@ class BillAccessibilityService : AccessibilityService() {
                     logSkip("$pkg#$state",
                         "$name → 跳过：页面上没有支付完成证据，按浏览页处理")
                 }
+                return false
+            }
+
+            // 闸门四（v2.12）：只认「刚刚发生」的支付，浏览历史订单一律不记。
+            // 历史订单详情页与支付成功页结构完全相同（交易成功 + 实付款 + 订单编号），
+            // 结构闸门分不出来；唯一可靠的区别是时间。
+            // ① 页面能解析出时间、且最新时间早于 10 分钟前 → 历史账单。
+            //    取最新时间：补付款的订单页同时有创建时间（几天前）和付款时间（此刻），取最新才不会误杀。
+            // ② 「再次购买」按钮只出现在已完成的旧订单上，刚付完的结果页不会有。
+            // 页面上没有可解析时间的（微信/支付宝支付成功页）不受影响，照常识别。
+            val latest = PayApps.latestParsedTime(texts)
+            if (latest != null && latest < System.currentTimeMillis() - FRESH_WINDOW_MS) {
+                val whenStr = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA)
+                    .format(java.util.Date(latest))
+                logSkip("$pkg#history", "$name → 跳过：页面时间是 $whenStr（10 分钟前），这是在浏览历史账单，不是刚完成的支付")
+                return false
+            }
+            if (texts.any { it.contains("再次购买") }) {
+                logSkip("$pkg#oldorder", "$name → 跳过：页面带「再次购买」按钮，是历史订单详情，不是刚完成的支付")
                 return false
             }
 

@@ -35,7 +35,9 @@ class PayNotificationListener : NotificationListenerService() {
         private val STRONG_PAY_WORDS = listOf(
             "支付成功", "付款成功", "已支付", "支付完成", "付款完成",
             "扣款成功", "扣费成功", "交易成功", "缴费成功", "下单成功",
-            "自动扣款", "已付款", "付款给"
+            "自动扣款", "已付款", "付款给",
+            // v2.12：QQ/话费充值通知只写「充值成功」，缺了通知通道整类漏记（v2.11 只补了页面通道）
+            "充值成功", "充值完成"
         )
 
         /**
