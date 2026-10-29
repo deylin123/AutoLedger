@@ -29,8 +29,8 @@ android {
         applicationId = "com.deylin.autledger"
         minSdk = 26
         targetSdk = 34
-        versionCode = 19
-        versionName = "2.13"
+        versionCode = 20
+        versionName = "2.14"
     }
 
     compileOptions {

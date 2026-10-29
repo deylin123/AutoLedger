@@ -114,7 +114,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.13 微信账单详情修复版）")
+        Diag.log(this, "无障碍服务已连接（v2.14 会话流修复版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -221,6 +221,13 @@ class BillAccessibilityService : AccessibilityService() {
             // 闸门一·补（v2.8）：一屏多笔（3 个以上金额 + 2 个以上单号）= 订单列表，不是某一笔账单
             if (PayApps.looksLikeList(texts)) {
                 logSkip("$pkg#list", "$name → 跳过：这一屏是多笔订单的列表，不是单笔账单")
+                return false
+            }
+
+            // 闸门一·补二（v2.14）：消息流/会话页（微信支付会话等），一屏混着多条交易消息。
+            // 金额/商户/方向会跨消息块拼接（v2.14「收入 +1.30 拼多多」事故），浏览一律不记。
+            if (PayApps.looksLikeMessageStream(texts)) {
+                logSkip("$pkg#stream", "$name → 跳过：消息流/会话页（多条交易消息混排），浏览不记账")
                 return false
             }
 
