@@ -262,7 +262,8 @@ object PayApps {
     private val WEAK_LABELED = Regex(
         "^(?:支出|付款|支付|扣款|消费|合计|总计|订单金额|应付|应付款|小计|商品总额|待付款)\\s*[:：]?\\s*[¥￥]?\\s*($NUM)\\s*元?$"
     )
-    private val AMOUNT_SIGNED = Regex("^(?:-|－|\\+)\\s*[¥￥]?\\s*($NUM)\\s*元?$")
+    // v2.13：兼容「¥-25.00」形态（货币符号在前、负号在后），此前这种写法任何正则都吃不到
+    private val AMOUNT_SIGNED = Regex("^[¥￥]?\\s*(?:-|－|\\+)\\s*[¥￥]?\\s*($NUM)\\s*元?$")
     private val AMOUNT_SYMBOL = Regex("^[¥￥]\\s*($NUM)\\s*元?$")
     private val AMOUNT_PLAIN = Regex("^(\\d{1,7}(?:,\\d{3})*[.．]\\d{1,2})\\s*元?$")
     private val CURRENCY_IN_TEXT = Regex("[¥￥]\\s*($NUM)")
@@ -362,7 +363,8 @@ object PayApps {
             }
             if (cand == null) AMOUNT_SIGNED.find(s)?.let { m ->
                 toNum(m.groupValues.getOrNull(1))?.let {
-                    val neg = m.value.startsWith("-") || m.value.startsWith("－")
+                    // 符号可能在「¥-25.00」里排在货币符号后面，不能只看开头，全匹配串里找负号
+                    val neg = m.value.contains('-') || m.value.contains('－')
                     // 负号在账单页表示支出，但在电商页常是「优惠 -¥5.00」，
                     // 所以给 80 分，低于货币符号的 85 分：有正数金额时优先取正数。
                     // signed=true：「-47.52」「+500.00」这类明确符号，方向判定时优先级最高。
@@ -514,7 +516,14 @@ object PayApps {
         // v2.11：QQ 充值/话费充值页只有「充值成功 + 金额」，没有任何其他方向词
         "充值成功", "充值完成", "已充值",
         // v2.12：出行/票务结果页只有「预订成功 + 金额」，没有任何其他方向词
-        "预订成功", "购票成功", "出票成功"
+        "预订成功", "购票成功", "出票成功",
+        // v2.13 修「微信账单详情不弹窗」：微信账单详情页（支出）只有这些字段，
+        // 一个方向词都没有 —— 金额大字又是无符号的「¥25.00」，方向判不出直接被跳过。
+        // 支付宝账单详情金额带「-47.50」符号所以一直正常，这正是两端结构差异。
+        // （微信收入详情有「已存入零钱/退款」这类决定性收入词，优先级更高，不受影响）
+        "付款时间", "付款方式", "已收货",
+        // 支付宝账单详情的时间字段叫「交易时间」，同样承担无符号金额时的方向兜底
+        "交易时间"
     )
 
     /** 单条文本是不是收入语义（通知通道用） */
@@ -701,6 +710,17 @@ object PayApps {
     val CAT_KEYS = listOf("账单分类", "交易类型", "订单类型", "消费类型", "业务类型")
 
     /**
+     * 字段值里出现这些词说明取到的是字段名延续/编号，不是真正的值。
+     *
+     * v2.13 修「微信账单详情识别结果错误」：商户键「商户」前缀匹配上了
+     * 「商户单号 4200002026102912345678」，把「单号 42000020…」当成商户名写进了备注。
+     */
+    private val NOISE_VALUE = listOf(
+        "单号", "编号", "号码", "批次", "流水", "时间", "日期"
+        // 注意：不放「订单」——「美团-外卖订单」是正常商品名，放进来会把真值误杀
+    )
+
+    /**
      * 取字段值。兼容两类排版：
      *  ①「标签」「值」分属两个节点（支付宝账单详情）
      *  ②「标签：值」同一节点（电商订单页）
@@ -711,18 +731,53 @@ object PayApps {
                 val s = t.trim()
                 if (!s.startsWith(k)) continue
                 val rest = s.substring(k.length).trim().trimStart('：', ':', '-')
-                if (rest.isNotEmpty() && rest.length in 1..30 &&
-                    !hasAmountIn(rest) && TIME.find(rest) == null
-                ) return rest
+                if (rest.isEmpty() || rest.length !in 1..30) continue
+                if (hasAmountIn(rest) || TIME.find(rest) != null) continue
+                // v2.13：值里带单号/时间等字样的，是字段名延续（如「商户单号 42000020…」），不是真值
+                if (NOISE_VALUE.any { rest.contains(it) }) continue
+                return rest
             }
             for (i in texts.indices) {
                 if (texts[i].trim() != k) continue
                 val next = texts.getOrNull(i + 1)?.trim() ?: continue
                 if (next.isEmpty() || next.length > 30) continue
                 if (hasAmountIn(next) || EXPENSE_WORDS.any { next.contains(it) }) continue
+                if (NOISE_VALUE.any { next.contains(it) }) continue
                 return next
             }
         }
         return null
     }
+
+    // ---------------- 钱包账单详情（v2.13） ----------------
+
+    /**
+     * 账单详情本质上就是「事后核对页」：支付成功页几秒就关，用户是靠它回看每一笔的。
+     * v2.12 的 10 分钟历史闸门把这类页面一刀切拦掉，是「微信账单详情不弹窗」的另一根因。
+     * 但电商「订单详情」必须继续拦 —— 那是 v2.12 刚修掉的「浏览历史订单误记账」。
+     * 所以只对支付工具（支付宝/微信/QQ）的「单笔账单详情」放行，判据极严：
+     * 页面标题必须是账单/交易/转账详情，列表页（交易记录/账单）不会是这个标题。
+     */
+    private val WALLET_PKGS = setOf(
+        "com.eg.android.AlipayGphone", "com.tencent.mm", "com.tencent.mobileqq"
+    )
+    private val BILL_DETAIL_TITLES = listOf("账单详情", "交易详情", "转账详情")
+
+    /**
+     * 单笔钱包账单详情页（支付宝/微信/QQ）。
+     * 命中时可豁免「10 分钟历史」闸门：记录的入账时间用页面上的付款时间，
+     * 配合更宽的同额查重窗口（[MERGE_WINDOW_DETAIL_MS]），不会与支付成功页那次识别重复。
+     */
+    fun isWalletBillDetail(texts: List<String>, app: App?): Boolean {
+        val pkg = app?.pkg ?: return false
+        if (pkg !in WALLET_PKGS) return false
+        return BILL_DETAIL_TITLES.any { w -> texts.any { it.contains(w) } }
+    }
+
+    /**
+     * 账单详情能解析出页面付款时间时的查重窗口（30 分钟）：
+     * 支付成功页那次识别的入账时间 ≈ 付款时间，同一笔在详情页再被打开时
+     * 按页面时间查重能对上，不再落第二条；真的漏记的历史账单则照常补录。
+     */
+    const val MERGE_WINDOW_DETAIL_MS = 30 * 60_000L
 }

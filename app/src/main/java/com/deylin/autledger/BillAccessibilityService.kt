@@ -114,7 +114,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.12 只认刚刚发生的支付）")
+        Diag.log(this, "无障碍服务已连接（v2.13 微信账单详情修复版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -258,17 +258,23 @@ class BillAccessibilityService : AccessibilityService() {
             // ① 页面能解析出时间、且最新时间早于 10 分钟前 → 历史账单。
             //    取最新时间：补付款的订单页同时有创建时间（几天前）和付款时间（此刻），取最新才不会误杀。
             // ② 「再次购买」按钮只出现在已完成的旧订单上，刚付完的结果页不会有。
-            // 页面上没有可解析时间的（微信/支付宝支付成功页）不受影响，照常识别。
-            val latest = PayApps.latestParsedTime(texts)
-            if (latest != null && latest < System.currentTimeMillis() - FRESH_WINDOW_MS) {
-                val whenStr = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA)
-                    .format(java.util.Date(latest))
-                logSkip("$pkg#history", "$name → 跳过：页面时间是 $whenStr（10 分钟前），这是在浏览历史账单，不是刚完成的支付")
-                return false
-            }
-            if (texts.any { it.contains("再次购买") }) {
-                logSkip("$pkg#oldorder", "$name → 跳过：页面带「再次购买」按钮，是历史订单详情，不是刚完成的支付")
-                return false
+            //
+            // v2.13 豁免：支付工具（支付宝/微信/QQ）的单笔「账单详情」本质是事后核对页，
+            // 支付成功页几秒就关，用户靠它回看每一笔 —— 一刀切拦截正是「微信账单详情不弹窗」的
+            // 根因之一。豁免后靠「页面付款时间 + 30 分钟同额查重」防与成功页那一次重复。
+            // 电商「订单详情」不在豁免范围，v2.12 修的误记账照旧拦截。
+            if (!PayApps.isWalletBillDetail(texts, app)) {
+                val latest = PayApps.latestParsedTime(texts)
+                if (latest != null && latest < System.currentTimeMillis() - FRESH_WINDOW_MS) {
+                    val whenStr = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA)
+                        .format(java.util.Date(latest))
+                    logSkip("$pkg#history", "$name → 跳过：页面时间是 $whenStr（10 分钟前），这是在浏览历史账单，不是刚完成的支付")
+                    return false
+                }
+                if (texts.any { it.contains("再次购买") }) {
+                    logSkip("$pkg#oldorder", "$name → 跳过：页面带「再次购买」按钮，是历史订单详情，不是刚完成的支付")
+                    return false
+                }
             }
 
             return scan(pkg, texts, app)
@@ -306,8 +312,11 @@ class BillAccessibilityService : AccessibilityService() {
             ?: goodsNear(texts, amt.idx, appName, income)
         val goods = PayApps.fieldOf(texts, PayApps.GOODS_KEYS) ?: ""
         val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
-        val ts = PayApps.TIME.find(joined)?.groupValues?.getOrNull(1)
-            ?.let { PayApps.parseTime(it) } ?: System.currentTimeMillis()
+        // 入账时间优先用页面上的付款/交易时间：账单详情是事后核对页，
+        // 页面时间才是这笔钱真实发生的时间（v2.13）。
+        val pageTs = PayApps.TIME.find(joined)?.groupValues?.getOrNull(1)
+            ?.let { PayApps.parseTime(it) }
+        val ts = pageTs ?: System.currentTimeMillis()
 
         val cat = if (income) Category.incomeOf(merchant, goods, catHint, appName)
         else Category.of(merchant, goods, catHint, appName)
@@ -328,8 +337,11 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             // 一笔支付只允许落一条记录。
             // 同一笔可能在「结果页」和「账单详情」各被识别一次（两个页面文字不同、商户名不同），
-            // 也可能页面和通知各命中一次 —— 所以按「金额 + 90 秒」收敛，不按商户名比对。
-            val prev = db.recentSameAmount(amount, ts, MERGE_WINDOW)
+            // 也可能页面和通知各命中一次 —— 所以按「金额 + 时间窗」收敛，不按商户名比对。
+            // v2.13：页面带付款时间（账单详情）时用 30 分钟窗 —— 详情页是事后打开的，
+            // 按页面付款时间查重仍能对上成功页那一次；页面无时间的支付现场仍用 90 秒。
+            val win = if (pageTs != null) PayApps.MERGE_WINDOW_DETAIL_MS else MERGE_WINDOW
+            val prev = db.recentSameAmount(amount, ts, win)
             if (prev != null) {
                 if (prev.status == 0) {
                     // 先前那条还没确认：用本次更完整的信息覆盖（商品名通常只有结果页才有），不新增、不重复弹卡片。
@@ -342,9 +354,21 @@ class BillAccessibilityService : AccessibilityService() {
                         this,
                         "$appName ¥$amount（${if (income) "收入" else "支出"}）→ 同一笔已合并到待确认 #${prev.id}（$cat）"
                     )
+                    // v2.13：合并后仍要弹卡。典型场景：支付成功时通知通道已记下待确认（只发了通知栏提醒），
+                    // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
+                    // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
+                    // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
+                    showCard(prev.id, amount, merged, cat, income)
                     return true
                 }
-                Diag.log(this, "$appName ¥$amount → 跳过：${MERGE_WINDOW / 1000}秒内同金额已记账（#${prev.id}）")
+                // 已确认入账的：不弹卡也不重复记，Toast 一句让用户知道 App 看到了这页、
+                // 只是这笔已经在账本里 —— 否则表现上和「完全没识别」无法区分。
+                Diag.log(this, "$appName ¥$amount → 跳过：该笔已确认入账（#${prev.id}），不重复记账")
+                Toast.makeText(
+                    this,
+                    "该笔已在账本中：" + (if (income) "收入 " else "支出 ") + "¥" + Ui.money(amount) + "，不重复记账",
+                    Toast.LENGTH_SHORT
+                ).show()
                 return false
             }
             val id = db.addRecord(
