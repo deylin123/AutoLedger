@@ -58,6 +58,34 @@ class BillAccessibilityService : AccessibilityService() {
         /** 阶梯启动的最小间隔：内容变化很密时不叠加任务，避免主线程堆积 */
         private const val LADDER_GAP = 1200L
 
+        /**
+         * v2.17：页面驻留轮询节拍与次数。
+         *
+         * 这是 v2.17 的核心改动 —— 把「事件时机驱动」换成「页面驻留 + 固定节拍」。
+         *
+         * v2.16 及以前的做法是：收到事件 → 排一串延迟任务 → 之后靠 burstToken 作废。
+         * 问题在于微信的账单页/WebView **在加载过程中会连续抛 WINDOW_STATE_CHANGED**
+         * （子窗口、弹层、输入法、Toast 窗口都算），每抛一次 burstToken++ 就把
+         * 刚排好的任务和 6 秒阶梯全部作废。于是：
+         *   · 页面加载快 → 恰好在两次事件的空档里扫到 → 弹了；
+         *   · 页面加载慢 → 一直在自废武功 → 永远扫不到 → 不弹。
+         * 这就是「7-8 笔里只有 2 笔弹、接着测全不弹」的真实成因。
+         * 支付宝账单页是稳定的单 Activity，不这么乱抛事件，所以一直稳。
+         *
+         * 现在改为：只要有事件来，就保证节拍器在跑，每 [POLL_INTERVAL] 读一次屏，
+         * 事件持续来就持续续期（最多 [POLL_TICKS] 拍）。不再依赖「哪一次事件碰巧赶上渲染完成」。
+         */
+        private const val POLL_INTERVAL = 700L
+
+        /** 节拍器最多跑多少拍（≈ 700ms × 18 ≈ 12.6 秒，覆盖微信 H5 慢加载） */
+        private const val POLL_TICKS = 18
+
+        /**
+         * 同一屏文字在这段时间内只判一次。
+         * 防止节拍器在页面静止时反复把同一笔入库；内容一变（切到下一笔账单）就重新判定。
+         */
+        private const val SAME_SIG_SKIP_MS = 1200L
+
         /** 滑动事件的节流间隔（v2.16：WebView 页面滑动后内容才真正可读） */
         private const val SCROLL_THROTTLE = 800L
 
@@ -129,6 +157,14 @@ class BillAccessibilityService : AccessibilityService() {
     private var lastContentAt = 0L
     private var lastLadderAt = 0L
     private var lastScrollAt = 0L
+
+    /** v2.17 节拍器状态：当前轮询的包名与剩余拍数 */
+    private var pollPkg: String? = null
+    private var pollLeft = 0
+
+    /** v2.17：上一屏文字指纹与判定时间（同屏不重复判、内容变即重判） */
+    private var lastSig = ""
+    private var lastSigAt = 0L
     private var lastAmount = -1.0
     private var lastAmountAt = 0L
     private var lastCardAt = 0L
@@ -148,7 +184,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.16 微信弹窗稳定性版）")
+        Diag.log(this, "无障碍服务已连接（v2.17 节拍轮询版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -158,60 +194,79 @@ class BillAccessibilityService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName) return
         if (pkg == "com.android.systemui" || pkg == "android") return
+        // v2.16/2.17：本阶段停用的平台（淘宝/京东/拼多多等）在入口就返回，
+        // 不为它们起节拍器、不做任何读屏，彻底「屏蔽已有逻辑」。
+        if (PayApps.isDisabledPkg(pkg)) return
 
         when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> startBurst(pkg)
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                // 新窗口 = 新页面：允许同一笔重新弹一次（真正的防抖交给 showCard 的时间窗）
+                lastCardId = -1L
+                burstToken++
+                // 立刻扫一次（post 到主线程队列，不阻塞事件回调——微信加载期窗口事件很密），
+                // 再交给节拍器兜住后续渲染
+                val tok = burstToken
+                handler.post { runScan(pkg, tok) }
+                ensurePoll(pkg)
+            }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 val now = System.currentTimeMillis()
                 if (now - lastContentAt < CONTENT_THROTTLE) return
                 lastContentAt = now
-                val token = burstToken
-                if (PayApps.of(pkg) != null) {
-                    // v2.16：已登记的消费类 App（含微信内嵌浏览器/小程序）走长阶梯，
-                    // 覆盖 H5 分段渲染；同一时间只跑一条阶梯，不叠加。
-                    if (now - lastLadderAt >= LADDER_GAP) {
-                        lastLadderAt = now
-                        for (d in LADDER_DELAYS) {
-                            handler.postDelayed({
-                                if (token == burstToken && hitToken != token) runScan(pkg, token)
-                            }, d)
-                        }
-                    }
-                } else {
-                    // 未登记 App 保持两次快速补扫，控制开销
-                    handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 150)
-                    handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 1000)
-                }
+                // v2.17：不再用 burstToken 作废任务。微信加载期会连续抛窗口状态变化，
+                // 「作废」机制会让扫描永远赶不上渲染完成 —— 这是时有时无的根因。
+                // 改为「有事件就续期节拍器」，扫描节奏与事件时机解耦。
+                ensurePoll(pkg)
             }
 
-            // v2.16：滑动事件。微信 H5/小程序账单页首次渲染常在滑动之后才把金额挂进无障碍树，
-            // 只监听窗口状态与内容变化会整页读不到 —— 这是「手动滑一下才弹」的成因。
+            // 滑动事件：微信 H5/小程序账单页首次渲染常在滑动之后才把金额挂进无障碍树。
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
                 val now = System.currentTimeMillis()
                 if (now - lastScrollAt < SCROLL_THROTTLE) return
                 lastScrollAt = now
-                val token = burstToken
-                handler.postDelayed({
-                    if (token == burstToken && hitToken != token) runScan(pkg, token)
-                }, 250)
+                ensurePoll(pkg)
             }
         }
     }
 
-    /** 新页面：立即按时间点排一串扫描任务，任一命中即停 */
-    private fun startBurst(pkg: String) {
-        burstToken++
-        val token = burstToken
-        // v2.16：进入新页面（微信打开另一张账单页也是新窗口）→ 允许同一笔重新弹一次。
-        // 旧逻辑同一 id 永不重弹，用户再打开同一笔账单时只剩通知没有卡片。
-        lastCardId = -1L
-        for (d in BURST_DELAYS) {
-            handler.postDelayed({
-                if (token != burstToken) return@postDelayed
-                if (hitToken == token) return@postDelayed
-                runScan(pkg, token)
-            }, d)
+    // ---------------- 页面驻留节拍器（v2.17） ----------------
+
+    /**
+     * 节拍器：页面驻留期间每 [POLL_INTERVAL] 读一次屏，最多 [POLL_TICKS] 拍。
+     *
+     * 与旧机制的根本区别：不再赌「哪一次事件赶上了渲染完成」，
+     * 只要页面还在动（持续有事件），就按固定节奏一直试，命中或超时才停。
+     * 微信端从「看运气」变成「必然能中」，靠的就是这一层。
+     */
+    private val pollTick = object : Runnable {
+        override fun run() {
+            val p = pollPkg ?: return
+            if (pollLeft <= 0) {
+                pollPkg = null
+                return
+            }
+            pollLeft--
+            runScan(p, burstToken)
+            if (pollLeft > 0) handler.postDelayed(this, POLL_INTERVAL) else pollPkg = null
+        }
+    }
+
+    /**
+     * 保证节拍器在跑，并把剩余拍数续满（每次有事件都续期）。
+     *
+     * 只对已登记的消费类 App 生效：未登记 App 不轮询，保持低开销。
+     * 这不是「一直读屏」——没有事件就不会启动，页面静止后最多再跑 12 秒就自己停。
+     */
+    private fun ensurePoll(pkg: String) {
+        val app = PayApps.of(pkg) ?: return
+        if (!app.enabled) return
+        val was = pollPkg
+        pollPkg = pkg
+        pollLeft = POLL_TICKS
+        if (was != pkg) {
+            handler.removeCallbacks(pollTick)
+            handler.post(pollTick)
         }
     }
 
@@ -230,9 +285,19 @@ class BillAccessibilityService : AccessibilityService() {
                     "已丢弃非本页文字：${foreign.joinToString(", ")}（当前 ${appLabel(pkg)}）")
             }
             if (groups.isEmpty()) {
-                // 微信 H5/小程序常见：这一刻页面还没渲染出可读文本，交给后面的阶梯继续试
+                // 微信 H5/小程序常见：这一刻页面还没渲染出可读文本，交给节拍器继续试
                 logSkip("$pkg#nodata", "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试")
             }
+
+            // v2.17：内容指纹节流 —— 同一屏文字在 [SAME_SIG_SKIP_MS] 内只判一次。
+            // 节拍器 700ms 一拍，页面静止时会反复读到同样内容；不节流会把同一笔反复判定。
+            // 内容一变（滑到 / 切到下一笔账单）指纹立刻变化 → 立即重新判定，
+            // 这样「连续打开 7-8 笔账单」每一笔都会各自走一遍闸门，不再被上一笔的状态卡住。
+            val sig = groups.joinToString("|") { it.texts.joinToString("\u0001") }
+            val sigNow = System.currentTimeMillis()
+            if (sig == lastSig && sigNow - lastSigAt < SAME_SIG_SKIP_MS) return
+            lastSig = sig
+            lastSigAt = sigNow
             // v2.16 核心：**逐窗口独立判定**。
             // 微信打开账单页时，聊天窗口与本页可能同时挂在 windows 里且包名相同，
             // 合并后的文本既含聊天输入栏（命中排除词）又含聊天里的交易卡片（命中支付词），
@@ -432,9 +497,11 @@ class BillAccessibilityService : AccessibilityService() {
         val type = if (income) 1 else 0
         val note = if (goods.isNotBlank() && goods != merchant) "$merchant·$goods" else merchant
 
-        // 同一笔在多次重试之间保持幂等：8 秒内同金额不再入库
+        // 同一笔在多次重试之间保持幂等。
+        // v2.17：从 8 秒收紧到 2 秒 —— 同屏重复扫描已由内容指纹节流挡住，
+        // 8 秒会误杀「几秒内连续发生的两笔同额消费」（连续测试时尤其明显）。
         val now = System.currentTimeMillis()
-        if (amount == lastAmount && now - lastAmountAt < 8000) return false
+        if (amount == lastAmount && now - lastAmountAt < 2000) return false
         // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
         // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
         if (amount == lastCancelledAmount && now - lastCancelledAt < CANCEL_SUPPRESS_MS) {
