@@ -178,7 +178,9 @@ object PayApps {
     fun looksLikeHome(texts: List<String>): Boolean {
         // 页面自己写了「支付成功」这类字样的，一定不是首页 ——
         // 电商的支付成功页底部同样有「首页/我的/购物车」导航，不能误判成首页。
-        if (PAID_WORDS.any { w -> texts.any { it.contains(w) } }) return false
+        // v2.15：广告行里的「支付成功」不算 —— 否则首页挂一条租机广告
+        // （「到期自动扣款成功继续租用」）就把首页判定短路掉。
+        if (PAID_WORDS.any { w -> texts.any { isEvidenceLine(it) && it.contains(w) } }) return false
         val n = HOME_WORDS.count { w -> texts.any { t -> t.contains(w) } }
         if (n < 3) return false
         return DETAIL_WORDS.none { w -> texts.any { t -> t.contains(w) } }
@@ -203,6 +205,44 @@ object PayApps {
         "优惠", "立减", "满减", "折扣", "领券", "优惠券", "红包", "返现",
         "积分", "减免", "秒杀", "限时", "会员日", "抽奖"
     )
+
+    /**
+     * 广告/营销语境词（v2.15）：一行里出现这些词，说明这行是营销话术，
+     * 其中的「支付成功 / 自动扣款成功」只是广告文案，不能当作账单页标题或支付证据。
+     *
+     * 刻意不放「优惠」「红包」「积分」这类单词——真实结果页常写
+     * 「支付成功 实付¥47.52（已优惠¥5）」，把它们算广告词会误杀真账单。
+     */
+    val AD_CONTEXT = listOf(
+        "领券", "优惠券", "立减", "满减", "折扣", "返现", "抽奖", "秒杀", "限时",
+        "特价", "免押", "体验价", "试用", "免费领", "赠", "去看看", "去领取",
+        "立即领", "点击领取", "签到", "勋章", "特权", "额度", "月租", "日租",
+        "租机", "租金", "押金", "租用", "租赁", "续租", "元起", "种草", "爆款",
+        "清仓", "特卖", "上新", "包邮", "大促", "好评", "立省", "直降", "做任务"
+    )
+
+    /** 这一行是广告/营销话术 */
+    fun isAdLine(s: String): Boolean = AD_CONTEXT.any { s.contains(it) }
+
+    /**
+     * 结果页抬头词。打头即真证据，即便后半句带营销词 ——
+     * 「支付成功，可领取优惠券」是真结果页抬头；「新人支付成功立减5元」是广告。
+     */
+    private val HEAD_WORDS = listOf(
+        "支付成功", "付款成功", "交易成功", "扣款成功", "扣费成功", "支付完成", "付款完成",
+        "转账成功", "充值成功", "充值完成", "缴费成功", "购买成功", "下单成功",
+        "预订成功", "购票成功", "出票成功", "已支付", "已付款", "已扣款",
+        "自动扣款成功", "支付结果", "付款结果",
+        "账单详情", "交易详情", "付款详情", "支付详情", "转账详情", "退款成功", "退款到账"
+    )
+
+    /**
+     * 这一行能否作为标题/支付证据（v2.15）：广告行不行，结果词打头的行可以。
+     */
+    fun isEvidenceLine(s: String): Boolean {
+        val t = s.trim()
+        return !isAdLine(t) || HEAD_WORDS.any { t.startsWith(it) }
+    }
 
     // ---------------- 时间 ----------------
 
@@ -287,7 +327,12 @@ object PayApps {
     )
     /** 有优惠/营销词的行：只有当这行没有「实付款/支付金额」这类强标签时才跳过 */
     private val SOFT_SKIP = listOf(
-        "优惠", "立减", "满减", "折扣", "减免", "积分", "运费险", "手续费说明"
+        "优惠", "立减", "满减", "折扣", "减免", "积分", "运费险", "手续费说明",
+        // v2.15：广告价签行（免押租机价、领券价、秒杀价…）里的数字不是消费金额。
+        // 芝麻信用页广告卡「¥37.26」被当消费金额的根因之一就在这。
+        "免押", "领券", "优惠券", "红包", "返现", "秒杀", "限时", "特价", "体验", "试用",
+        "免费", "赠", "勋章", "特权", "额度", "种草", "爆款", "清仓", "特卖", "上新",
+        "包邮", "立省", "直降", "好评", "月租", "日租", "租机", "租金", "押金", "元起"
     )
 
     private fun toNum(s: String?): Double? =
@@ -394,6 +439,11 @@ object PayApps {
             if (s.isEmpty() || TIME.containsMatchIn(s)) continue
             // 整行是网速/流量/百分比这类，直接否掉
             if (Regex("^[\\d.,]+\\s*[A-Za-z%/]+.*$").containsMatchIn(s)) continue
+            // v2.15：广告价签行（免押租机 ¥37.26 / 秒杀价 ¥99）兜底阶段同样不取。
+            // 与主循环一致：带强标签的行不受影响（「实付款 ¥47.52（已优惠 ¥5）」照取）。
+            val strongLine = STRONG_LABELED.containsMatchIn(s) || STRONG_INLINE.containsMatchIn(s) ||
+                STRONG_LABELS.any { s.contains(it) }
+            if (!strongLine && SOFT_SKIP.any { s.contains(it) }) continue
             val m1 = AMOUNT_IN_TEXT.find(s)
             val m2 = if (m1 == null) CURRENCY_IN_TEXT.find(s) else null
             val m = m1 ?: m2 ?: continue
@@ -470,7 +520,8 @@ object PayApps {
      * 必须让未完成信号优先，否则收银台会被结构证据放行。
      */
     fun payState(texts: List<String>): Int {
-        val hasPaid = PAID_WORDS.any { w -> texts.any { it.contains(w) } }
+        // v2.15：广告行里的「支付成功」不算已扣款证据（同 hasTitle 的理由）
+        val hasPaid = PAID_WORDS.any { w -> texts.any { isEvidenceLine(it) && it.contains(w) } }
         if (hasPaid) return STATE_PAID
         val hasUnsettled = UNSETTLED_WORDS.any { w -> texts.any { it.contains(w) } }
         if (hasUnsettled) return STATE_UNPAID
@@ -600,7 +651,10 @@ object PayApps {
     fun hasTitle(texts: List<String>, app: App?): Boolean {
         if (isExcluded(texts, app)) return false
         val words = app?.titleWords ?: COMMON_TITLE_WORDS
-        return texts.any { t -> words.any { w -> t.contains(w) } }
+        // v2.15：广告话术里的钱包词不算标题证据。
+        // 「免押租手机，自动扣款成功继续租用」这类营销行命中词表后，
+        // 门户页被当账单页放进闸门链 —— 芝麻信用页误记账的触发路径之一。
+        return texts.any { t -> isEvidenceLine(t) && words.any { w -> t.contains(w) } }
     }
 
     fun hasExpenseSignal(texts: List<String>): Boolean =
@@ -636,6 +690,53 @@ object PayApps {
         "支付成功", "付款成功", "支付完成", "付款完成", "充值成功",
         "预订成功", "购票成功"
     )
+
+    // ---------------- 门户/营销页判定（v2.15） ----------------
+
+    /**
+     * 营销门户页特征词：芝麻信用/会员中心/活动会场/频道首页这类页面。
+     *
+     * v2.15 事故：支付宝「芝麻信用」页被整页记账（-¥37.26 商户「挪了个箭」）。
+     * 该页是典型的营销门户：信用分、额度、特权、领券、勋章、免押租机广告……
+     * 没有任何账单结构字段，但广告模块里的价签（¥37.26）+ 扣款类广告词
+     * 把「标题/支付状态/金额/方向」四道闸门全部凑齐了。
+     */
+    private val PORTAL_WORDS = listOf(
+        "芝麻分", "信用分", "信用名片", "可用额度", "可用特权", "可享优惠",
+        "领券", "优惠券", "去看看", "免押", "勋章", "签到", "特权", "额度",
+        "秒杀", "限时", "爆款", "种草", "上新", "大促", "清仓", "特卖", "抽奖",
+        "返现", "立减", "满减", "体验价", "试用", "免费领", "去领取", "立即领",
+        "点击领取", "做任务", "包邮", "月租", "日租", "租机", "租金", "押金",
+        "热卖", "热销", "抢购", "新品", "领红包", "积分兑换", "领取", "会员"
+    )
+
+    /**
+     * 结果页/账单页的出口词：有这些词说明这是某笔交易的落地页，不是营销会场。
+     * 用于给门户判定兜底 —— 真实支付结果页底部常挂营销模块，不能被门户词误杀。
+     */
+    private val RESULT_EXIT = listOf(
+        "查看账单", "再付一笔", "再转一笔", "继续支付", "交易详情", "付款详情"
+    )
+
+    /**
+     * 是否是「营销门户/活动会场」页（不是某笔账单）。
+     *
+     * 判据（同时满足）：
+     *  ① 营销词命中 ≥4 个 —— 真账单页顶多底部挂一两个广告模块，凑不齐 4 个；
+     *  ② 页面没有任何账单结构字段（时间/单号/分类，[DETAIL_WORDS]）；
+     *  ③ 页面没有强标签金额（实付款/支付金额/配对标签）——
+     *     门户页的数字都是额度、分数、价签，不会写「实付款」；
+     *  ④ 没有结果页出口词（查看账单/再付一笔…）——防误杀带广告的支付结果页。
+     */
+    fun looksLikePortal(texts: List<String>): Boolean {
+        val hits = PORTAL_WORDS.count { w -> texts.any { it.contains(w) } }
+        if (hits < 4) return false
+        if (DETAIL_WORDS.any { w -> texts.any { it.contains(w) } }) return false
+        if (texts.any { STRONG_LABELED.containsMatchIn(it) || STRONG_INLINE.containsMatchIn(it) }) return false
+        if (texts.any { t -> STRONG_LABELS.contains(t.trim().trimEnd('：', ':').trim()) }) return false
+        if (RESULT_EXIT.any { w -> texts.any { it.contains(w) } }) return false
+        return true
+    }
 
     /**
      * 账单流水列表页专属词（微信「交易记录」、支付宝账单列表、零钱明细）。

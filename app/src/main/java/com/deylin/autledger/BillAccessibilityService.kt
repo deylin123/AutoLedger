@@ -114,7 +114,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.14 会话流修复版）")
+        Diag.log(this, "无障碍服务已连接（v2.15 门户页修复版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -228,6 +228,15 @@ class BillAccessibilityService : AccessibilityService() {
             // 金额/商户/方向会跨消息块拼接（v2.14「收入 +1.30 拼多多」事故），浏览一律不记。
             if (PayApps.looksLikeMessageStream(texts)) {
                 logSkip("$pkg#stream", "$name → 跳过：消息流/会话页（多条交易消息混排），浏览不记账")
+                return false
+            }
+
+            // 闸门一·补三（v2.15）：营销门户/活动会场页（支付宝芝麻信用等）。
+            // 该类页面满屏额度、特权、领券、免押租机广告，广告价签+扣款类广告词
+            // 会把标题/支付状态/金额/方向四道闸门全部凑齐（-¥37.26「挪了个箭」事故）。
+            // 没有账单结构字段、没有强标签金额、没有结果页出口词的营销页，浏览一律不记。
+            if (PayApps.looksLikePortal(texts)) {
+                logSkip("$pkg#portal", "$name → 跳过：营销门户/活动会场页（无账单结构字段），浏览不记账")
                 return false
             }
 
