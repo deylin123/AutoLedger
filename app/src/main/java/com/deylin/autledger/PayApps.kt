@@ -35,7 +35,15 @@ object PayApps {
         val pkg: String,
         val name: String,
         val titleWords: List<String>,
-        val excludeWords: List<String> = emptyList()
+        val excludeWords: List<String> = emptyList(),
+        /**
+         * v2.16：本阶段是否参与「识别 + 弹窗」。
+         *
+         * 购物平台（淘宝/天猫/京东/拼多多等）本阶段不接入弹窗 —— 它们的页面形态
+         * （订单列表、推荐流、活动会场）与账单高度相似，识别收益低、误记风险高。
+         * 登记信息保留，接入时把这里改回 true 即可，不用改任何流程代码。
+         */
+        val enabled: Boolean = true
     )
 
     // ---- 各类 App 的标题特征词模板，避免重复书写 ----
@@ -66,19 +74,21 @@ object PayApps {
      */
     val APPS: List<App> = listOf(
         App("com.eg.android.AlipayGphone", "支付宝", WALLET),
-        App("com.taobao.taobao", "淘宝", ECOM),
-        App("com.tmall.wireless", "天猫", ECOM),
-        App("com.jingdong.app.mall", "京东", ECOM),
-        App("com.jd.jrapp", "京东金融", ECOM),
-        App("com.xunmeng.pinduoduo", "拼多多", ECOM),
-        App("com.ss.android.ugc.aweme", "抖音", ECOM),
-        App("com.ss.android.ugc.aweme.lite", "抖音极速版", ECOM),
-        App("com.xingin.xhs", "小红书", ECOM),
-        App("com.achievo.vipshop", "唯品会", ECOM),
-        App("com.shizhuang.duapp", "得物", ECOM),
-        App("com.taobao.idlefish", "闲鱼", ECOM),
-        App("com.suning.mobile.ebuy", "苏宁易购", ECOM),
-        App("com.netease.yanxuan", "网易严选", ECOM),
+        // v2.16：购物平台本阶段不接入弹窗（enabled = false）。
+        // 页面通道与通知通道都会在入口处直接跳过，不记待确认、不弹卡、不发通知。
+        App("com.taobao.taobao", "淘宝", ECOM, enabled = false),
+        App("com.tmall.wireless", "天猫", ECOM, enabled = false),
+        App("com.jingdong.app.mall", "京东", ECOM, enabled = false),
+        App("com.jd.jrapp", "京东金融", ECOM, enabled = false),
+        App("com.xunmeng.pinduoduo", "拼多多", ECOM, enabled = false),
+        App("com.ss.android.ugc.aweme", "抖音", ECOM, enabled = false),
+        App("com.ss.android.ugc.aweme.lite", "抖音极速版", ECOM, enabled = false),
+        App("com.xingin.xhs", "小红书", ECOM, enabled = false),
+        App("com.achievo.vipshop", "唯品会", ECOM, enabled = false),
+        App("com.shizhuang.duapp", "得物", ECOM, enabled = false),
+        App("com.taobao.idlefish", "闲鱼", ECOM, enabled = false),
+        App("com.suning.mobile.ebuy", "苏宁易购", ECOM, enabled = false),
+        App("com.netease.yanxuan", "网易严选", ECOM, enabled = false),
         App("com.sankuai.meituan", "美团", LOCAL),
         App("com.sankuai.meituan.takeoutnew", "美团外卖", LOCAL),
         App("com.dianping.v1", "大众点评", LOCAL),
@@ -107,9 +117,10 @@ object PayApps {
             ),
             listOf(
                 "按住 说话", "按住说话", "发送消息", "聊天信息", "表情面板", "语音输入",
-                // 「微信支付凭证」是聊天里那张卡片的标题，支付结果页不会出现；
-                // 这是区分「聊天里的支付消息」与「真正的支付结果页」最稳的特征
-                "微信支付凭证"
+                // v2.16 去掉「微信支付凭证」：它正是微信里点开支付消息后那张账单页的标题
+                // （「微信支付凭证」页），把它当聊天特征会把真账单页整页否掉。
+                // 聊天窗口仍由输入栏特征（按住说话/发送消息…）+ 消息流闸门双重拦截。
+                "聊天记录", "搜索聊天记录"
             )
         ),
         // v2.11 补登记 QQ：QQ 钱包的支付结果页同样只有「支付成功 + 金额 + 完成」，
@@ -130,6 +141,14 @@ object PayApps {
     private val byPkg: Map<String, App> = APPS.associateBy { it.pkg }
 
     fun of(pkg: String): App? = byPkg[pkg]
+
+    /**
+     * v2.16：本阶段不参与识别/弹窗的 App（购物平台）。
+     * 页面通道与通知通道都在最前面判这一条，命中即整页跳过。
+     */
+    fun isDisabled(app: App?): Boolean = app != null && !app.enabled
+
+    fun isDisabledPkg(pkg: String): Boolean = isDisabled(byPkg[pkg])
 
     /**
      * 未注册 App 的通用标题词。
@@ -912,7 +931,19 @@ object PayApps {
     private val WALLET_PKGS = setOf(
         "com.eg.android.AlipayGphone", "com.tencent.mm", "com.tencent.mobileqq"
     )
-    private val BILL_DETAIL_TITLES = listOf("账单详情", "交易详情", "转账详情")
+    /**
+     * 单笔账单详情页的标题特征（v2.16 补「支付凭证」）。
+     *
+     * 微信里点开聊天中的支付消息，落地页标题是「微信支付凭证」——
+     * 它就是微信的账单详情页（含金额、支付方式、支付时间、商户单号）。
+     * v2.16 之前它不在本表里，享受不到支付宝「账单详情」的新鲜度豁免，
+     * 打开稍早一点的账单就被 10 分钟闸门拦成「历史」——
+     * 支付宝每次必弹、微信看运气，差异的一大来源就在这。
+     */
+    private val BILL_DETAIL_TITLES = listOf(
+        "账单详情", "交易详情", "转账详情",
+        "微信支付凭证", "支付凭证"
+    )
 
     /**
      * 单笔钱包账单详情页（支付宝/微信/QQ）。

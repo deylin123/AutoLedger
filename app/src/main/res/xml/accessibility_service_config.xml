@@ -4,9 +4,11 @@
   不加这个 flag，collect() 读不到金额行。
   flagRetrieveInteractiveWindows：允许跨窗口取内容，支付宝账单详情页常在独立 window 里。
   notificationTimeout 由 300 降到 100，让"进入页面"的事件更快送达。
+  v2.16 增加 typeViewScrolled：微信内嵌浏览器/小程序账单页常在滑动后才把金额挂进无障碍树，
+  不订阅滑动事件会整页读不到，表现是"手动滑一下才弹"。
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"

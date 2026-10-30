@@ -44,6 +44,37 @@ class BillAccessibilityService : AccessibilityService() {
         /** 内容变化事件的节流间隔 */
         private const val CONTENT_THROTTLE = 700L
 
+        /**
+         * v2.16：已登记消费类 App（支付宝/微信/QQ…）在内容变化后走的补扫阶梯。
+         *
+         * 旧版内容变化只补扫两次（150ms / 1000ms），并且之后页面静止就不再有任何扫描。
+         * 微信的内嵌浏览器（X5）、公众号页、小程序容器是**分段渲染**的：
+         * 骨架先出、标题再出、金额往往 1.5~3 秒后才画出来，之后不再产生事件。
+         * 于是「弹不弹」完全取决于当时加载快慢 —— 这就是微信端时有时无的主要成因。
+         * 阶梯覆盖到 6 秒，拿到即停（hitToken 拦住后续），既稳又不空转。
+         */
+        private val LADDER_DELAYS = longArrayOf(150, 500, 1000, 1800, 2800, 4000, 6000)
+
+        /** 阶梯启动的最小间隔：内容变化很密时不叠加任务，避免主线程堆积 */
+        private const val LADDER_GAP = 1200L
+
+        /** 滑动事件的节流间隔（v2.16：WebView 页面滑动后内容才真正可读） */
+        private const val SCROLL_THROTTLE = 800L
+
+        /**
+         * v2.16：同一笔卡片的去重窗口。
+         * 旧逻辑是「同一 id 永不重弹」，用户重新打开同一笔账单时只响通知、不弹卡 ——
+         * 观感上就是「有时弹有时不弹」。现在改为：进入新页面允许重弹，但 5 秒内不重复闪。
+         */
+        private const val CARD_DEDUP_MS = 5000L
+
+        /**
+         * v2.16：这些 App 会把「聊天窗口」和「当前页面」同时挂在 windows 里，
+         * 两者包名相同。合并多窗口文本会把聊天内容（含交易卡片文字）拼进账单页，
+         * 造成 v2.14 那类跨消息块串味，所以只做逐窗口判定、不做合并兜底。
+         */
+        private val NO_MERGE_PKGS = setOf("com.tencent.mm", "com.tencent.mobileqq")
+
         /** 同一包名的"疑似未接入"日志间隔，避免刷屏 */
         private const val SUSPECT_LOG_GAP = 10 * 60 * 1000L
 
@@ -96,8 +127,11 @@ class BillAccessibilityService : AccessibilityService() {
     private var hitToken = -1
 
     private var lastContentAt = 0L
+    private var lastLadderAt = 0L
+    private var lastScrollAt = 0L
     private var lastAmount = -1.0
     private var lastAmountAt = 0L
+    private var lastCardAt = 0L
 
     /** 用户在弹窗上点过「取消」的笔：5 分钟内同金额不再重复弹/记（v2.10） */
     private var lastCancelledAmount = -1.0
@@ -114,7 +148,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.15 门户页修复版）")
+        Diag.log(this, "无障碍服务已连接（v2.16 微信弹窗稳定性版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -133,9 +167,34 @@ class BillAccessibilityService : AccessibilityService() {
                 if (now - lastContentAt < CONTENT_THROTTLE) return
                 lastContentAt = now
                 val token = burstToken
-                // 内容变化后补两次，覆盖「先出标题、再加载金额」的页面
-                handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 150)
-                handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 1000)
+                if (PayApps.of(pkg) != null) {
+                    // v2.16：已登记的消费类 App（含微信内嵌浏览器/小程序）走长阶梯，
+                    // 覆盖 H5 分段渲染；同一时间只跑一条阶梯，不叠加。
+                    if (now - lastLadderAt >= LADDER_GAP) {
+                        lastLadderAt = now
+                        for (d in LADDER_DELAYS) {
+                            handler.postDelayed({
+                                if (token == burstToken && hitToken != token) runScan(pkg, token)
+                            }, d)
+                        }
+                    }
+                } else {
+                    // 未登记 App 保持两次快速补扫，控制开销
+                    handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 150)
+                    handler.postDelayed({ if (token == burstToken) runScan(pkg, token) }, 1000)
+                }
+            }
+
+            // v2.16：滑动事件。微信 H5/小程序账单页首次渲染常在滑动之后才把金额挂进无障碍树，
+            // 只监听窗口状态与内容变化会整页读不到 —— 这是「手动滑一下才弹」的成因。
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                val now = System.currentTimeMillis()
+                if (now - lastScrollAt < SCROLL_THROTTLE) return
+                lastScrollAt = now
+                val token = burstToken
+                handler.postDelayed({
+                    if (token == burstToken && hitToken != token) runScan(pkg, token)
+                }, 250)
             }
         }
     }
@@ -144,6 +203,9 @@ class BillAccessibilityService : AccessibilityService() {
     private fun startBurst(pkg: String) {
         burstToken++
         val token = burstToken
+        // v2.16：进入新页面（微信打开另一张账单页也是新窗口）→ 允许同一笔重新弹一次。
+        // 旧逻辑同一 id 永不重弹，用户再打开同一笔账单时只剩通知没有卡片。
+        lastCardId = -1L
         for (d in BURST_DELAYS) {
             handler.postDelayed({
                 if (token != burstToken) return@postDelayed
@@ -155,18 +217,42 @@ class BillAccessibilityService : AccessibilityService() {
 
     // ---------------- 扫描 ----------------
 
+    /** 一个窗口里读到的同包文本（v2.16）。active = 活动窗口 */
+    private class PageGroup(val texts: ArrayList<String>, val active: Boolean)
+
     private fun runScan(pkg: String, token: Int) {
         try {
             val foreign = LinkedHashSet<String>()
-            val texts = grabTexts(pkg, foreign)
+            val groups = grabGroups(pkg, foreign)
             if (foreign.isNotEmpty()) {
                 // 排查「读到别家文字」用，同一组合 60 秒只记一次
                 logSkip("foreign#$pkg#${foreign.joinToString(",")}",
                     "已丢弃非本页文字：${foreign.joinToString(", ")}（当前 ${appLabel(pkg)}）")
             }
-            if (attempt(pkg, texts, token)) {
-                hitToken = token
-                return
+            if (groups.isEmpty()) {
+                // 微信 H5/小程序常见：这一刻页面还没渲染出可读文本，交给后面的阶梯继续试
+                logSkip("$pkg#nodata", "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试")
+            }
+            // v2.16 核心：**逐窗口独立判定**。
+            // 微信打开账单页时，聊天窗口与本页可能同时挂在 windows 里且包名相同，
+            // 合并后的文本既含聊天输入栏（命中排除词）又含聊天里的交易卡片（命中支付词），
+            // 于是整页判定结果随窗口存续时机漂移 —— 这就是支付宝稳定、微信时有时无的结构性原因。
+            // 现在每个窗口单独跑一遍闸门链，活动窗口优先，任一窗口判定通过即记账。
+            for (g in groups.sortedByDescending { it.active }) {
+                if (attempt(pkg, g.texts, token)) {
+                    hitToken = token
+                    return
+                }
+            }
+            // 合并兜底：支付宝的账单内容常挂在独立 window 上，单窗口取不全 —— 与 v2.8 行为一致。
+            // 微信/QQ 例外（NO_MERGE_PKGS）：合并会把聊天窗口文字混进账单页，宁可漏记也不串味。
+            if (groups.size > 1 && pkg !in NO_MERGE_PKGS) {
+                val merged = LinkedHashSet<String>()
+                groups.forEach { merged.addAll(it.texts) }
+                if (attempt(pkg, ArrayList(merged), token)) {
+                    hitToken = token
+                    return
+                }
             }
 
             // v2.9：事件的 packageName 未必是页面真正所在的 App。
@@ -176,11 +262,12 @@ class BillAccessibilityService : AccessibilityService() {
             val cands = foreign.filter { it != pkg && PayApps.of(it) != null }
             for (p in cands) {
                 val f2 = LinkedHashSet<String>()
-                val t2 = grabTexts(p, f2)
-                if (attempt(p, t2, token)) {
-                    hitToken = token
-                    Diag.log(this, "按窗口归属重扫命中：$p")
-                    return
+                for (g in grabGroups(p, f2).sortedByDescending { it.active }) {
+                    if (attempt(p, g.texts, token)) {
+                        hitToken = token
+                        Diag.log(this, "按窗口归属重扫命中：$p")
+                        return
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -198,6 +285,12 @@ class BillAccessibilityService : AccessibilityService() {
             if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return false
 
             val app = PayApps.of(pkg)
+            // v2.16：购物平台（淘宝/天猫/京东/拼多多等）本阶段不接入识别与弹窗。
+            // 放在所有闸门之前：既不做判定，也不落待确认、不弹卡片、不发通知。
+            if (PayApps.isDisabled(app)) {
+                logSkip("$pkg#off", "${app?.name ?: pkg} → 跳过：该平台本阶段不接入弹窗（v2.16 范围限制）")
+                return false
+            }
             if (PayApps.isExcluded(texts, app)) {
                 logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）")
                 return false
@@ -453,12 +546,22 @@ class BillAccessibilityService : AccessibilityService() {
      * @param pkg 触发事件的包名
      * @param foreign 输出：被丢弃的外来包名，用于诊断日志
      */
-    private fun grabTexts(pkg: String, foreign: MutableSet<String>): ArrayList<String> {
-        val set = LinkedHashSet<String>()
+    private fun grabGroups(pkg: String, foreign: MutableSet<String>): List<PageGroup> {
+        val out = ArrayList<PageGroup>()
+        // 活动窗口常同时出现在 windows 列表里，不去重会把同一页判两遍；
+        // 用文本签名去重（窗口 id 在不同 Android 版本上不稳定）。
+        val seen = HashSet<String>()
         try {
             val root = rootInActiveWindow
             val rp = root?.packageName?.toString()
-            if (root != null && (rp == null || rp == pkg || rp == packageName)) collect(root, set)
+            if (root != null && (rp == null || rp == pkg || rp == packageName)) {
+                val set = LinkedHashSet<String>()
+                collect(root, set)
+                if (set.isNotEmpty()) {
+                    val sig = set.joinToString("\u0001")
+                    if (seen.add(sig)) out.add(PageGroup(ArrayList(set), true))
+                }
+            }
         } catch (_: Exception) {
         }
         try {
@@ -472,11 +575,16 @@ class BillAccessibilityService : AccessibilityService() {
                     if (foreign.size < 6) foreign.add(p)
                     return@forEach
                 }
+                val set = LinkedHashSet<String>()
                 collect(r, set)
+                if (set.isNotEmpty()) {
+                    val sig = set.joinToString("\u0001")
+                    if (seen.add(sig)) out.add(PageGroup(ArrayList(set), false))
+                }
             }
         } catch (_: Exception) {
         }
-        return ArrayList(set)
+        return out
     }
 
     private fun collect(node: AccessibilityNodeInfo?, out: MutableSet<String>) {
@@ -534,13 +642,18 @@ class BillAccessibilityService : AccessibilityService() {
 
     /** 同一笔只弹一次，避免重复触发反复重建窗口造成闪烁 */
     private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
-        // 通道一：通知栏，无条件发送。
+        // v2.16：去重判断放在通知之前。
+        // 旧顺序是「先发通知、再判断是否弹卡」，同一笔被重复识别时会出现
+        // 「铃声响了、卡片没出来」—— 用户侧就是「时有时无」。
+        val now = System.currentTimeMillis()
+        if (id == lastCardId && now - lastCardAt < CARD_DEDUP_MS) return
+        lastCardId = id
+        lastCardAt = now
+
+        // 通道一：通知栏。
         // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、
         // 只是窗口不可见，代码会误判为"已显示"。通知不受该权限限制，是唯一可靠通道，故作为主通道。
         notifyPending(id, amount, note, cat, income)
-
-        if (id == lastCardId) return
-        lastCardId = id
 
         handler.post {
             try {

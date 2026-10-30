@@ -87,6 +87,9 @@ class PayNotificationListener : NotificationListenerService() {
 
     private fun handle(sbn: StatusBarNotification) {
         if (sbn.packageName == packageName) return
+        // v2.16：购物平台（淘宝/天猫/京东/拼多多等）本阶段不接入弹窗 ——
+        // 通知通道同样在入口直接跳过，不落待确认、不发提醒。
+        if (PayApps.isDisabledPkg(sbn.packageName)) return
         if (seen.contains(sbn.key)) return
         seen.add(sbn.key)
         if (seen.size > 800) seen.clear()
