@@ -270,6 +270,22 @@ object PayApps {
         "((?:20\\d{2}[-/年.])?\\d{1,2}[-/月.]\\d{1,2}日?\\s+\\d{1,2}:\\d{2}(?::\\d{2})?)"
     )
 
+    /**
+     * 相对时间小字（v2.18）：刚刚 / 3分钟前 / 3小时前 / 2天前 / 昨天 22:55。
+     *
+     * 消息列表、首页消息卡片、聊天会话一律用相对时间标注「这条消息多久之前来的」；
+     * 而真正的账单详情/支付结果页写的是绝对时间（付款时间 2026年10月30日 00:33:20）。
+     * 这是区分「消息条目」与「单笔账单页」最干净的形态特征，
+     * 也是 v2.18 修「支付宝首页最近消息被当账单记账（-¥4.00 商户『蚂蚁保』）」的判据来源。
+     */
+    private val REL_TIME = Regex(
+        "(刚刚|\\d{1,2}\\s*分钟前|\\d{1,2}\\s*小时前|\\d{1,2}\\s*天前|昨天|前天)"
+    )
+
+    /** 页面上是否有独立的「相对时间」小字（限长 24，避免长句商品名里的「昨天」误伤） */
+    fun hasRelativeTime(texts: List<String>): Boolean =
+        texts.any { t -> t.trim().length <= 24 && REL_TIME.containsMatchIn(t) }
+
     fun parseTime(s: String?): Long? {
         if (s.isNullOrBlank()) return null
         val raw = s.trim().replace("年", "-").replace("月", "-").replace("日", "")
@@ -836,7 +852,51 @@ object PayApps {
     fun looksLikeMessageStream(texts: List<String>): Boolean {
         if (texts.any { STREAM_SEPARATOR.matches(it.trim()) }) return true
         val buckets = RESULT_BLOCK_BUCKETS.count { b -> b.any { w -> texts.any { it.contains(w) } } }
-        return buckets >= 2
+        if (buckets >= 2) return true
+        // v2.18：同一屏出现 ≥2 条「结果词 + 金额」且金额互不相同的行 —— 一定是多条交易消息。
+        // v2.14 的语义桶把「支付成功/付款成功」合并成同一桶，所以支付宝首页「最近消息」卡片
+        // 里两条都是「付款成功」时只算 1 个桶，闸门失效（截图事故：¥4.00 与 ¥50.00 并列）。
+        // 单笔账单页不可能同时出现两个不同金额的成功行，因此按「金额不同」判定是安全的：
+        // 支付结果页重复写「支付成功 ¥89.00 / 支付成功 ¥89.00」金额相同，不会误杀。
+        val amounts = LinkedHashSet<Double>()
+        for (t in texts) {
+            val s = t.trim()
+            if (s.isEmpty() || s.length > 40) continue
+            if (RESULT_WORDS.none { s.contains(it) }) continue
+            val v = AMOUNT_SYMBOL.find(s)?.groupValues?.getOrNull(1)
+                ?: CURRENCY_IN_TEXT.find(s)?.groupValues?.getOrNull(1)
+                ?: AMOUNT_SIGNED.find(s)?.groupValues?.getOrNull(1)
+                ?: continue
+            toNum(v)?.let { amounts.add(it) }
+            if (amounts.size >= 2) return true
+        }
+        return false
+    }
+
+    // ---------------- 首页信息流判定（v2.18） ----------------
+
+    /**
+     * 是否是「首页 / 信息流 / 消息卡片列表」，而不是某笔账单页。
+     *
+     * v2.18 实测事故：支付宝首页（推荐页）被整页记账 ——
+     * 「最近消息」卡片里躺着两条服务消息「万家乐百货 付款成功 ¥4.00」「*明 付款成功 ¥50.00」，
+     * 页面因此凑齐了「标题/已扣款/金额/方向」四道闸门，
+     * 备注还取了页面上无关的功能入口名，记成「-¥4.00 蚂蚁保」。
+     *
+     * 为什么 [looksLikeHome] 没拦住：它的短路条件是「页面出现支付证据行就当结果页」，
+     * 本意是给电商支付成功页放行（那类页面底部同样有「首页/我的/购物车」导航），
+     * 但首页消息卡片里的「付款成功 ¥4.00」也是真实证据行，于是首页判定被整体短路。
+     *
+     * 本闸门改用形态特征，躲开那条短路：**相对时间小字 + 首页导航 + 无账单字段** 三者同时成立。
+     *  ① 相对时间（3小时前）—— 消息条目的标注方式，账单页写绝对时间；
+     *  ② 没有任何账单结构字段（付款时间/交易单号/账单分类…）；
+     *  ③ 页面带 ≥2 个首页导航特征词（推荐/消息/我的/搜索…）。
+     */
+    fun looksLikeHomeFeed(texts: List<String>): Boolean {
+        if (!hasRelativeTime(texts)) return false
+        if (hasBillStructure(texts)) return false
+        val nav = HOME_WORDS.count { w -> texts.any { t -> t.contains(w) } }
+        return nav >= 2
     }
 
     /**
@@ -917,6 +977,83 @@ object PayApps {
             }
         }
         return null
+    }
+
+    // ---------------- 商户名同行提取（v2.18） ----------------
+
+    /**
+     * 这些词是首页/服务页的功能入口名，不可能是商户名。
+     *
+     * v2.18 事故：支付宝首页「最近消息」里的「万家乐百货 付款成功 ¥4.00」被识别时，
+     * 商户名取了金额节点上方最近的文本，抓到的是页面上的功能入口「蚂蚁保」，
+     * 于是记成「-¥4.00 蚂蚁保」。功能入口名必须整词否掉，让取值继续往前找或走兜底名。
+     */
+    private val ENTRY_NOISE = listOf(
+        "蚂蚁保", "蚂蚁森林", "蚂蚁庄园", "余额宝", "花呗", "借呗", "网商银行",
+        "市民中心", "车生活", "淘票票", "手机营业厅", "铁路12306", "交管12123",
+        "淘宝闪购", "飞猪旅行", "玩赚支付宝", "支付宝会员", "芝麻信用", "扫一扫",
+        "收付款", "出行", "卡包", "更多", "全部", "常用", "最近消息", "服务消息",
+        "未读服务消息", "全部消息", "查看全部", "立即查看"
+    )
+
+    /** 金额行里除商户以外的固定文案（提取同行商户时先剔除） */
+    private val LINE_NOISE_WORDS = listOf(
+        "支付成功", "付款成功", "交易成功", "扣款成功", "缴费成功", "充值成功",
+        "支付完成", "付款完成", "下单成功", "购买成功", "已支付", "已付款", "已扣款",
+        "实付款", "实付金额", "实付", "支付金额", "付款金额", "扣款金额", "交易金额",
+        "支出金额", "本次支付", "本次付款", "订单金额", "应付金额", "合计", "总计", "小计"
+    )
+
+    /** 行内任意位置的金额（含货币符号 / 正负号 / 裸小数） */
+    private val ANY_MONEY = Regex(
+        "[¥￥]\\s*(?:-|－|\\+)?\\s*($NUM)|(?:-|－|\\+)\\s*[¥￥]?\\s*($NUM)|(?:^|\\s)($NUM)(?=\\s*元|\\s*$)"
+    )
+
+    /**
+     * 从「金额所在的那一行」里抠出商户名。
+     *
+     * 支付宝首页消息卡片、微信支付消息这类条目是「万家乐百货 付款成功 ¥4.00」一整条文本，
+     * 商户和金额在同一个节点里。只往前找邻居节点（goodsNear）会抓到无关的相邻文字；
+     * 先把这一行里的金额与固定文案剔掉，剩下的就是商户名。
+     *
+     * @return 提取到的商户名；该行除了金额与状态词没有别的信息时返回 null（交给上层继续往前找）
+     */
+    fun merchantInLine(line: String): String? {
+        val raw = line.trim()
+        if (raw.length !in 4..40) return null
+        // 注意：这里不能用 hasAmountIn —— 它的六个正则都要求金额整行或紧跟标签，
+        // 「万家乐百货 付款成功 ¥4.00」这种行内任意位置的金额只有 ANY_MONEY 认得出。
+        if (!ANY_MONEY.containsMatchIn(raw)) return null
+        if (TIME.containsMatchIn(raw)) return null
+        var t = ANY_MONEY.replace(raw, " ")
+        for (w in LINE_NOISE_WORDS) t = t.replace(w, " ")
+        t = tidyMerchant(t.replace(Regex("[\\s\\u00a0]+"), " "))
+        if (t.length !in 2..20) return null
+        if (t.any { it.isDigit() }) return null
+        if (ENTRY_NOISE.any { t == it || t.startsWith(it) }) return null
+        if (LINE_NOISE_WORDS.any { t.contains(it) }) return null
+        return t
+    }
+
+    /**
+     * 清洗商户名首尾的分隔符与成对括号。
+     * 只剥「整体被括号包裹」的一层 —— 商户名本身带括号（麦当劳(深南店)）必须原样保留。
+     */
+    private fun tidyMerchant(raw: String): String {
+        var s = raw.trim().trim('-', '－', '—', '|', '·', ':', '：', '，', ',', '、', '/').trim()
+        val pairs = listOf('(' to ')', '（' to '）', '[' to ']', '【' to '】')
+        for ((a, b) in pairs) {
+            if (s.length > 2 && s.first() == a && s.last() == b) {
+                s = s.substring(1, s.length - 1).trim()
+            }
+        }
+        return s
+    }
+
+    /** 该文本是不是首页/服务页的功能入口名（不能当商户名） */
+    fun isEntryNoise(s: String): Boolean {
+        val t = s.trim()
+        return ENTRY_NOISE.any { t == it || t.startsWith(it) }
     }
 
     // ---------------- 钱包账单详情（v2.13） ----------------

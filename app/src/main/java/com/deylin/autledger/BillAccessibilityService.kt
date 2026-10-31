@@ -184,7 +184,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.17 节拍轮询版）")
+        Diag.log(this, "无障碍服务已连接（v2.18 首页信息流拦截版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -369,6 +369,21 @@ class BillAccessibilityService : AccessibilityService() {
 
             val name = app?.name ?: appLabel(pkg)
 
+            // 闸门一·补四（v2.18）：首页 / 信息流 / 消息卡片页。
+            //
+            // v2.18 实测事故：支付宝首页「最近消息」卡片里躺着两条真实服务消息
+            // 「万家乐百货 付款成功 ¥4.00」「*明 付款成功 ¥50.00」，
+            // 页面因此凑齐标题/已扣款/金额/方向四道闸门，整页被记成「-¥4.00 蚂蚁保」。
+            //
+            // [PayApps.looksLikeHome] 在这里拦不住：它的短路条件是「页面出现支付证据行就当结果页」，
+            // 本意是给电商支付成功页放行（那类页面底部同样有首页/我的/购物车导航），
+            // 但首页消息卡片里的「付款成功 ¥4.00」也是真实证据行，首页判定被整体短路。
+            // 本闸门改用形态特征（相对时间小字 + 首页导航 + 无账单字段），不受该短路影响。
+            if (PayApps.looksLikeHomeFeed(texts)) {
+                logSkip("$pkg#feed", "$name → 跳过：首页/信息流/消息卡片页（带相对时间标注、无账单字段），不是某笔账单")
+                return false
+            }
+
             // 闸门一（v2.8）：页面形态是首页 / 列表页，一律不记。
             // 12306 首页有「我的行程 / 行程详情」入口，正好命中票务类标题词，光靠标题词挡不住。
             if (PayApps.looksLikeHome(texts)) {
@@ -482,7 +497,14 @@ class BillAccessibilityService : AccessibilityService() {
         }
         val income = dir == PayApps.DIR_INCOME
 
+        // 商户名取值顺序（v2.18）：
+        // ① 页面有「商户/收款方」字段 → 直接用；
+        // ② 金额那一行本身就带商户名（「万家乐百货 付款成功 ¥4.00」这种消息/条目形态）→ 剔除金额与状态词后取；
+        // ③ 都没有才回落「金额上方最近的文本」。
+        // 第 ② 步是 v2.18 新增：只靠 ③ 时，金额节点的上一个邻居可能是个毫不相干的功能入口，
+        // 首页消息卡片被记成「蚂蚁保」就是这么来的。
         val merchant = PayApps.fieldOf(texts, PayApps.MERCHANT_KEYS)
+            ?: PayApps.merchantInLine(texts.getOrNull(amt.idx) ?: "")
             ?: goodsNear(texts, amt.idx, appName, income)
         val goods = PayApps.fieldOf(texts, PayApps.GOODS_KEYS) ?: ""
         val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
@@ -685,6 +707,8 @@ class BillAccessibilityService : AccessibilityService() {
         if (s.contains("/")) return true
         if (TEXT_NOISE_UNITS.any { s.contains(it) }) return true
         if (TEXT_NOISE_WORDS.any { s == it || s.startsWith(it) }) return true
+        // v2.18：首页/服务页的功能入口名（蚂蚁保、蚂蚁森林、市民中心…）不是商户名
+        if (PayApps.isEntryNoise(s)) return true
         // 数字开头 + 字母单位（92KB、1.5G、3ms…）
         if (Regex("^[\\d.,]+\\s*[A-Za-z%/]+.*$").containsMatchIn(s)) return true
         return false
