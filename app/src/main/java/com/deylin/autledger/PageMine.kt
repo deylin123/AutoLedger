@@ -102,7 +102,7 @@ class PageMine(private val act: MainActivity) {
         autoCard.addView(permRow("通知监听", "读取各 App 的支付成功通知", hasNotifListener()) { act.openNotifListener() })
         autoCard.addView(permRow("账单页抓取", "支付宝/微信/电商/外卖/出行等账单页", hasAccessibility()) { act.openAccessibility() })
         autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
-        autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", true) { act.openBattery() })
+        autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", batteryOk()) { act.openBattery() })
         autoCard.addView(rowItem("支持范围", "26 个消费类 App + 通用兜底", true) { supportGuide() })
         autoCard.addView(rowItem("小米 / 红米 必看", "4 处设置，缺一项就不弹", true) { miuiGuide() })
         autoCard.addView(rowItem("测试弹窗", "点一下验证悬浮窗能不能弹") { testOverlay() })
@@ -422,16 +422,38 @@ class PageMine(private val act: MainActivity) {
 
     private fun showDiag() {
         val txt = TextView(c)
-        txt.text = Diag.dump(act, 30)
+        txt.text = Diag.dump(act, 200)
         txt.setTextSize(11f)
         txt.setTextColor(Ui.TEXT)
         txt.setPadding(Ui.dp(c, 14f), Ui.dp(c, 10f), Ui.dp(c, 14f), Ui.dp(c, 10f))
         val sv = ScrollView(c)
         sv.addView(txt)
         AlertDialog.Builder(act)
-            .setTitle("抓取诊断（最近 30 条）")
+            .setTitle("抓取诊断（最近 200 条，共 300 条上限）")
             .setView(sv)
-            .setPositiveButton("关闭", null)
+            // v2.19：新增导出。旧版只能在屏幕上看 30 条，日志无法回传，
+            // 「哪几笔没弹、为什么没弹」永远查不到 —— 这是多版反复修不收敛的直接原因。
+            .setPositiveButton("导出到「下载」") { _, _ ->
+                val path = Diag.export(act)
+                if (path != null) {
+                    Toast.makeText(c, "已导出：$path\n可在文件管理「下载」里找到并发回", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(c, "导出失败，请改用截图", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("清空") { _, _ ->
+                Diag.clear(act)
+                Toast.makeText(c, "诊断日志已清空", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("关闭", null)
             .show()
+    }
+
+    /** v2.19：后台保活改成真实检测。旧版这一行写死 true，永远显示「已开启」，属于假状态。 */
+    private fun batteryOk(): Boolean = try {
+        val pm = act.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        pm.isIgnoringBatteryOptimizations(act.packageName)
+    } catch (_: Exception) {
+        false
     }
 }

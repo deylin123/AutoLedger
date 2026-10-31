@@ -217,9 +217,19 @@ class MainActivity : Activity() {
     }
 
     fun openBattery() {
+        // v2.19：直接申请本应用豁免，而不是把用户丢到一堆 App 的列表里自己找
         try {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
         } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+            }
         }
     }
 }

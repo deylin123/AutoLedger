@@ -163,7 +163,12 @@ class PayNotificationListener : NotificationListenerService() {
                 this,
                 "$appName 通知 ¥$amount $merchant → 已存为待确认（${if (income) "收入" else "支出"}·$cat）"
             )
-            showConfirmNotification(id, amount, merchant, cat, income)
+            // v2.19：通知通道也弹同一套卡片。
+            // 旧版这里只发通知栏提醒，用户侧表现就是「有的弹卡片、有的只响一声」——
+            // 差别只在于这一笔是被页面通道还是通知通道先抓到的。
+            if (!BillAccessibilityService.presentCard(this, id, amount, merchant, cat, income)) {
+                showConfirmNotification(id, amount, merchant, cat, income)
+            }
         } finally {
             db.close()
         }

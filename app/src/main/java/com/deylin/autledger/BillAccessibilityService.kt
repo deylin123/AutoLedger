@@ -144,6 +144,31 @@ class BillAccessibilityService : AccessibilityService() {
          * 支付是有过程的行为（输金额→收银台→密码→成功页），10 分钟足以覆盖正常支付全程。
          */
         private const val FRESH_WINDOW_MS = 10 * 60_000L
+
+        /**
+         * v2.19：当前活着的无障碍服务实例。
+         *
+         * 用途：让**通知通道也能弹同一套卡片**。
+         * 旧版只有无障碍通道弹卡，通知通道只发通知栏提醒 ——
+         * 同一笔消费若由通知通道记下（常见于页面一闪而过、或页面文本没读到的场景），
+         * 用户就「只听到铃声响、没看到卡片」，表现出来正是「有的弹有的没弹」。
+         */
+        @Volatile
+        private var live: BillAccessibilityService? = null
+
+        /** 通知通道调用：复用无障碍服务的卡片呈现（含确认/取消/改分类三个按钮） */
+        fun presentCard(
+            ctx: android.content.Context,
+            id: Long, amount: Double, note: String, cat: String, income: Boolean
+        ): Boolean {
+            val s = live
+            if (s == null) {
+                Diag.logCard(ctx, "跳过：无障碍服务未运行，无法弹卡（已存入待确认，改由通知栏提醒）")
+                return false
+            }
+            s.showCard(id, amount, note, cat, income)
+            return true
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -184,7 +209,8 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.18 首页信息流拦截版）")
+        live = this
+        Diag.log(this, "无障碍服务已连接（v2.19 双通道弹窗版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -279,12 +305,15 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             val foreign = LinkedHashSet<String>()
             val groups = grabGroups(pkg, foreign)
-            if (foreign.isNotEmpty()) {
+            // v2.19：未登记的 App（桌面/输入法/智能助理/安全服务…）不写这两类日志。
+            // 旧版它们在用户测试期间刷了几十条，「最近 40 条」里真正有价值的支付宝/微信记录被整屏挤掉。
+            val registered = PayApps.of(pkg) != null
+            if (foreign.isNotEmpty() && registered) {
                 // 排查「读到别家文字」用，同一组合 60 秒只记一次
                 logSkip("foreign#$pkg#${foreign.joinToString(",")}",
                     "已丢弃非本页文字：${foreign.joinToString(", ")}（当前 ${appLabel(pkg)}）")
             }
-            if (groups.isEmpty()) {
+            if (groups.isEmpty() && registered) {
                 // 微信 H5/小程序常见：这一刻页面还没渲染出可读文本，交给节拍器继续试
                 logSkip("$pkg#nodata", "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试")
             }
@@ -737,9 +766,14 @@ class BillAccessibilityService : AccessibilityService() {
         // 旧顺序是「先发通知、再判断是否弹卡」，同一笔被重复识别时会出现
         // 「铃声响了、卡片没出来」—— 用户侧就是「时有时无」。
         val now = System.currentTimeMillis()
-        if (id == lastCardId && now - lastCardAt < CARD_DEDUP_MS) return
+        if (id == lastCardId && now - lastCardAt < CARD_DEDUP_MS) {
+            // v2.19：这里以前是静默 return，导致「明明识别到了却不弹」无法回溯
+            Diag.logCard(this, "跳过重复弹卡 #$id ¥$amount（${now - lastCardAt}ms 内已弹过同一笔）")
+            return
+        }
         lastCardId = id
         lastCardAt = now
+        Diag.logCard(this, "弹卡 #$id ¥$amount $note（${if (income) "收入" else "支出"}·$cat）")
 
         // 通道一：通知栏。
         // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、
@@ -750,7 +784,7 @@ class BillAccessibilityService : AccessibilityService() {
             try {
                 buildCard(id, amount, note, cat, income)
             } catch (e: Exception) {
-                Diag.log(this, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
+                Diag.logCard(this, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
         }
     }
@@ -767,7 +801,7 @@ class BillAccessibilityService : AccessibilityService() {
      */
     private fun buildCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
         if (!Settings.canDrawOverlays(this)) {
-            Diag.log(this, "悬浮卡片跳过：悬浮窗权限未开（通知已发）")
+            Diag.logCard(this, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
             return
         }
         handler.removeCallbacks(hideTask)
@@ -850,15 +884,16 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             wm.addView(v, params)
             card = v
-            Diag.log(this, "悬浮卡片已显示（通知同时已发）")
+            Diag.logCard(this, "卡片已 addView（通知同时已发）")
         } catch (e: Exception) {
-            Diag.log(this, "悬浮卡片显示失败（${e.javaClass.simpleName}），通知已发")
+            Diag.logCard(this, "addView 失败（${e.javaClass.simpleName}），通知已发。小米/红米请确认「后台弹出界面」权限")
             return
         }
         // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
         v.postDelayed({
-            Diag.log(this, "卡片实际尺寸 " + v.width + "x" + v.height +
-                "，屏幕宽 " + resources.displayMetrics.widthPixels)
+            Diag.logCard(this, "卡片尺寸 " + v.width + "x" + v.height +
+                "，屏幕宽 " + resources.displayMetrics.widthPixels +
+                (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了" else ""))
         }, 500)
         handler.postDelayed(hideTask, 45000)
     }
@@ -922,7 +957,13 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        live = null
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        live = null
         removeCard()
         super.onDestroy()
     }
