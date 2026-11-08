@@ -163,12 +163,11 @@ class PayNotificationListener : NotificationListenerService() {
                 this,
                 "$appName 通知 ¥$amount $merchant → 已存为待确认（${if (income) "收入" else "支出"}·$cat）"
             )
-            // v2.19：通知通道也弹同一套卡片。
-            // 旧版这里只发通知栏提醒，用户侧表现就是「有的弹卡片、有的只响一声」——
-            // 差别只在于这一笔是被页面通道还是通知通道先抓到的。
-            if (!BillAccessibilityService.presentCard(this, id, amount, merchant, cat, income)) {
-                showConfirmNotification(id, amount, merchant, cat, income)
-            }
+            // v2.20：直接调用 OverlayUi 呈现（通知栏提醒 + 悬浮卡片）。
+            // 关键改动：不再依赖无障碍服务实例是否存在。
+            // 旧版委托给 BillAccessibilityService.presentCard，无障碍一关（银行类 App 强制要求）
+            // 这条路径就永远失败，用户侧表现就是「记账还在跑，但卡片再也不弹」。
+            OverlayUi.show(this, id, amount, merchant, cat, income)
         } finally {
             db.close()
         }
@@ -186,6 +185,7 @@ class PayNotificationListener : NotificationListenerService() {
         return name
     }
 
+    /** 历史兜底通道。v2.20 起 OverlayUi 内部已统一发通知，此处保留以便回退排查。 */
     private fun showConfirmNotification(
         id: Long, amount: Double, merchant: String, category: String, income: Boolean
     ) {

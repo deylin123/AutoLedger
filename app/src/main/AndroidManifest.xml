@@ -10,7 +10,7 @@
         android:label="自动记账"
         android:icon="@android:drawable/ic_menu_agenda"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
-        android:allowBackup="true">
+        android:allowBackup="false">
 
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

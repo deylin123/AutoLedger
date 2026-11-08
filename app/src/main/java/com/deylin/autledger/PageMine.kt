@@ -99,12 +99,23 @@ class PageMine(private val act: MainActivity) {
                 act.startActivity(Intent(act, PendingActivity::class.java))
             }
         )
-        autoCard.addView(permRow("通知监听", "读取各 App 的支付成功通知", hasNotifListener()) { act.openNotifListener() })
-        autoCard.addView(permRow("账单页抓取", "支付宝/微信/电商/外卖/出行等账单页", hasAccessibility()) { act.openAccessibility() })
+        // v2.20：通道定位调整。通知监听是主通道（不依赖无障碍，银行 App 不拦）；
+        // 账单页抓取降级为可选增强（精度更高，但开启无障碍会被银行类 App 判为风险）。
+        autoCard.addView(
+            permRow("通知监听（主通道）", "读各 App 的支付成功通知，不依赖无障碍", hasNotifListener()) {
+                act.openNotifListener()
+            }
+        )
+        autoCard.addView(
+            permRow("账单页抓取（可选）", "页面级识别更准，但银行 App 可能因此拒绝运行", hasAccessibility()) {
+                act.openAccessibility()
+            }
+        )
         autoCard.addView(permRow("悬浮窗", "抓取后屏幕顶部弹记账表单", Settings.canDrawOverlays(act)) { act.openOverlay() })
         autoCard.addView(permRow("后台保活", "关闭省电限制，避免被系统清理", batteryOk()) { act.openBattery() })
         autoCard.addView(rowItem("支持范围", "26 个消费类 App + 通用兜底", true) { supportGuide() })
         autoCard.addView(rowItem("小米 / 红米 必看", "4 处设置，缺一项就不弹", true) { miuiGuide() })
+        autoCard.addView(rowItem("银行 App 打不开", "招商永隆等会检测无障碍", true) { bankGuide() })
         autoCard.addView(rowItem("测试弹窗", "点一下验证悬浮窗能不能弹") { testOverlay() })
         val acp = Ui.lp(Ui.MP, Ui.WC)
         acp.topMargin = Ui.dp(c, 10f)
@@ -160,6 +171,40 @@ class PageMine(private val act: MainActivity) {
             .setTitle("自动识别支持范围")
             .setMessage(msg)
             .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    /**
+     * v2.20：银行类 App 与无障碍服务的冲突说明。
+     *
+     * 事实：招商永隆等银行 App 会检测设备上的无障碍服务，判定为账户被盗风险
+     * （无障碍能读取屏幕一切内容，包括密码与验证码），部分版本直接要求卸载。
+     * 该检测读的是系统无障碍服务列表，无法通过改名或伪装规避。
+     */
+    private fun bankGuide() {
+        val msg = "部分银行 App（招商永隆、招行等）会检测「无障碍服务」，判定为风险后拒绝运行，\n" +
+            "个别版本直接要求卸载本应用。\n\n" +
+            "原因：无障碍能读取屏幕上的一切，包括密码框和验证码，银行把它视为账户被盗的典型特征。\n" +
+            "这个检测读的是系统无障碍服务列表，无法通过改名或伪装绕过。\n\n" +
+            "处理办法（二选一）：\n" +
+            "① 关闭无障碍：设置 → 无障碍 → 已下载的服务 → 账单抓取 → 关闭。\n" +
+            "   关闭后通知通道仍然工作，支付成功通知照样能记账并弹卡片，只是识别精度下降。\n" +
+            "② 进银行前临时关闭，出来后重新打开。\n\n" +
+            "如果关闭无障碍后银行仍要求卸载，请把提示原文截图给我，那说明它检测的是别的东西。"
+
+        val tv = TextView(c)
+        tv.text = msg
+        tv.setTextSize(12.5f)
+        tv.setTextColor(Ui.TEXT)
+        tv.setLineSpacing(Ui.dp(c, 3f).toFloat(), 1f)
+        tv.setPadding(Ui.dp(c, 16f), Ui.dp(c, 12f), Ui.dp(c, 16f), Ui.dp(c, 12f))
+        val sv = ScrollView(c)
+        sv.addView(tv)
+        AlertDialog.Builder(act)
+            .setTitle("银行 App 打不开怎么办")
+            .setView(sv)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton("去关闭无障碍") { _, _ -> act.openAccessibility() }
             .show()
     }
 

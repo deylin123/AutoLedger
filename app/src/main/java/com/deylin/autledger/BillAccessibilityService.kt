@@ -6,13 +6,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
-import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.view.Gravity
 import android.view.View
-import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
@@ -94,7 +91,6 @@ class BillAccessibilityService : AccessibilityService() {
          * 旧逻辑是「同一 id 永不重弹」，用户重新打开同一笔账单时只响通知、不弹卡 ——
          * 观感上就是「有时弹有时不弹」。现在改为：进入新页面允许重弹，但 5 秒内不重复闪。
          */
-        private const val CARD_DEDUP_MS = 5000L
 
         /**
          * v2.16：这些 App 会把「聊天窗口」和「当前页面」同时挂在 windows 里，
@@ -145,30 +141,9 @@ class BillAccessibilityService : AccessibilityService() {
          */
         private const val FRESH_WINDOW_MS = 10 * 60_000L
 
-        /**
-         * v2.19：当前活着的无障碍服务实例。
-         *
-         * 用途：让**通知通道也能弹同一套卡片**。
-         * 旧版只有无障碍通道弹卡，通知通道只发通知栏提醒 ——
-         * 同一笔消费若由通知通道记下（常见于页面一闪而过、或页面文本没读到的场景），
-         * 用户就「只听到铃声响、没看到卡片」，表现出来正是「有的弹有的没弹」。
-         */
-        @Volatile
-        private var live: BillAccessibilityService? = null
-
-        /** 通知通道调用：复用无障碍服务的卡片呈现（含确认/取消/改分类三个按钮） */
-        fun presentCard(
-            ctx: android.content.Context,
-            id: Long, amount: Double, note: String, cat: String, income: Boolean
-        ): Boolean {
-            val s = live
-            if (s == null) {
-                Diag.logCard(ctx, "跳过：无障碍服务未运行，无法弹卡（已存入待确认，改由通知栏提醒）")
-                return false
-            }
-            s.showCard(id, amount, note, cat, income)
-            return true
-        }
+        // v2.20：live / presentCard 已移除。
+        // 通知通道不再依赖「无障碍服务实例是否存在」，而是直接调用 OverlayUi.show()，
+        // 这样无障碍关闭时通知通道依然能弹卡。
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -192,25 +167,14 @@ class BillAccessibilityService : AccessibilityService() {
     private var lastSigAt = 0L
     private var lastAmount = -1.0
     private var lastAmountAt = 0L
-    private var lastCardAt = 0L
-
-    /** 用户在弹窗上点过「取消」的笔：5 分钟内同金额不再重复弹/记（v2.10） */
-    private var lastCancelledAmount = -1.0
-    private var lastCancelledAt = 0L
 
     private val suspectLogged = HashMap<String, Long>()
     private val skipLogged = HashMap<String, Long>()
     private val labelCache = HashMap<String, String>()
 
-    private var card: View? = null
-    private var lastCardId = -1L
-
-    private val hideTask = Runnable { removeCard() }
-
     override fun onServiceConnected() {
         super.onServiceConnected()
-        live = this
-        Diag.log(this, "无障碍服务已连接（v2.19 双通道弹窗版）")
+        Diag.log(this, "无障碍服务已连接（v2.20 卡片独立版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -226,8 +190,8 @@ class BillAccessibilityService : AccessibilityService() {
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // 新窗口 = 新页面：允许同一笔重新弹一次（真正的防抖交给 showCard 的时间窗）
-                lastCardId = -1L
+                // 新窗口 = 新页面：允许同一笔重新弹一次（真正的防抖交给 OverlayUi 的时间窗）
+                OverlayUi.resetDedup()
                 burstToken++
                 // 立刻扫一次（post 到主线程队列，不阻塞事件回调——微信加载期窗口事件很密），
                 // 再交给节拍器兜住后续渲染
@@ -555,7 +519,7 @@ class BillAccessibilityService : AccessibilityService() {
         if (amount == lastAmount && now - lastAmountAt < 2000) return false
         // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
         // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
-        if (amount == lastCancelledAmount && now - lastCancelledAt < CANCEL_SUPPRESS_MS) {
+        if (OverlayUi.isCancelledRecently(amount)) {
             Diag.log(this, "$appName ¥$amount → 跳过：用户已取消这笔，${CANCEL_SUPPRESS_MS / 60000}分钟内不再重复弹")
             return false
         }
@@ -758,213 +722,26 @@ class BillAccessibilityService : AccessibilityService() {
     private fun bookOf(): String =
         getSharedPreferences("cfg", MODE_PRIVATE).getString("book", "日常账本") ?: "日常账本"
 
-    // ---------------- 悬浮卡片 ----------------
-
-    /** 同一笔只弹一次，避免重复触发反复重建窗口造成闪烁 */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
-        // v2.16：去重判断放在通知之前。
-        // 旧顺序是「先发通知、再判断是否弹卡」，同一笔被重复识别时会出现
-        // 「铃声响了、卡片没出来」—— 用户侧就是「时有时无」。
-        val now = System.currentTimeMillis()
-        if (id == lastCardId && now - lastCardAt < CARD_DEDUP_MS) {
-            // v2.19：这里以前是静默 return，导致「明明识别到了却不弹」无法回溯
-            Diag.logCard(this, "跳过重复弹卡 #$id ¥$amount（${now - lastCardAt}ms 内已弹过同一笔）")
-            return
-        }
-        lastCardId = id
-        lastCardAt = now
-        Diag.logCard(this, "弹卡 #$id ¥$amount $note（${if (income) "收入" else "支出"}·$cat）")
-
-        // 通道一：通知栏。
-        // 原因：小米/红米（MIUI/HyperOS）的「后台弹出界面」权限被拒时，WindowManager.addView 不报错、
-        // 只是窗口不可见，代码会误判为"已显示"。通知不受该权限限制，是唯一可靠通道，故作为主通道。
-        notifyPending(id, amount, note, cat, income)
-
-        handler.post {
-            try {
-                buildCard(id, amount, note, cat, income)
-            } catch (e: Exception) {
-                Diag.logCard(this, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
-            }
-        }
-    }
+    // ---------------- 悬浮卡片（v2.20 已剥离到 OverlayUi） ----------------
 
     /**
-     * 通道二：悬浮记账卡片。
+     * 呈现逻辑全部在 [OverlayUi]，本服务只做转发。
      *
-     * v2.4 修掉两个会导致"不稳定"的真实缺陷：
-     *  1. 自动关闭定时器无法取消。之前每笔都 post 一个 60 秒匿名 Runnable，
-     *     连续抓多笔时，先前的定时器到点会把当前正在显示的卡片移除，表现为"卡片闪一下就不见了"。
-     *     现在改为可取消的 hideTask，显示新卡片前先 removeCallbacks。
-     *  2. 窗口宽度用 MATCH_PARENT。部分 ROM 下 overlay 窗口宽度会被测量成 0，
-     *     卡片就塌缩成一个小圆角块（用户看到的"只剩一个圈"）。现在改为明确的像素宽度。
+     * 剥离原因：卡片窗口是 TYPE_APPLICATION_OVERLAY，只需要悬浮窗权限，技术上不依赖无障碍服务。
+     * 旧版写在这里，导致无障碍一关（银行 App 要求）两条通道都不弹卡。
      */
-    private fun buildCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
-        if (!Settings.canDrawOverlays(this)) {
-            Diag.logCard(this, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
-            return
-        }
-        handler.removeCallbacks(hideTask)
-        removeCard()
-
-        val v = android.view.LayoutInflater.from(this).inflate(R.layout.view_card, null)
-        (v.findViewById<View>(R.id.tvHead) as TextView).text =
-            if (income) "自动识别到收入" else "自动识别到消费"
-        (v.findViewById<View>(R.id.tvAmount) as TextView).apply {
-            text = (if (income) "+¥" else "-¥") + Ui.money(amount)
-            setTextColor(if (income) Ui.GREEN else Ui.TEXT)
-        }
-        (v.findViewById<View>(R.id.tvNote) as TextView).text = note
-        (v.findViewById<View>(R.id.tvCat) as TextView).text = "分类：" + cat
-        (v.findViewById<View>(R.id.tvIcon) as TextView).text = emojiOf(cat)
-
-        v.findViewById<View>(R.id.btnCancel).setOnClickListener {
-            // 取消：删掉已入库的待确认记录 + 撤掉通知栏提醒，不保留任何数据，无需二次确认。
-            // 误触的代价可控：明细里可手动补记；且 5 分钟内同笔不会因页面重扫而再次弹出。
-            try {
-                val db = DbHelper(this)
-                db.delRecord(id)
-                db.close()
-                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(id.toInt())
-                lastCancelledAmount = amount
-                lastCancelledAt = System.currentTimeMillis()
-                Diag.log(this, "用户取消：¥$amount $note 已删除待确认记录 #$id，不记账")
-            } catch (e: Exception) {
-                Diag.log(this, "取消失败：${e.javaClass.simpleName}")
-            }
-            handler.removeCallbacks(hideTask)
-            removeCard()
-            Toast.makeText(this, "已取消，不记这笔", Toast.LENGTH_SHORT).show()
-        }
-        v.findViewById<View>(R.id.btnLater).setOnClickListener {
-            handler.removeCallbacks(hideTask)
-            removeCard()
-            Toast.makeText(this, "已存入待确认", Toast.LENGTH_SHORT).show()
-        }
-        v.findViewById<View>(R.id.btnCat).setOnClickListener {
-            handler.removeCallbacks(hideTask)
-            removeCard()
-            try {
-                startActivity(
-                    Intent(this, PendingActivity::class.java)
-                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        .putExtra("focus", id)
-                )
-            } catch (_: Exception) {
-            }
-        }
-        v.findViewById<View>(R.id.btnOk).setOnClickListener {
-            try {
-                val db = DbHelper(this)
-                db.updateRecord(id, amount, cat, note, System.currentTimeMillis(), 1)
-                db.close()
-            } catch (e: Exception) {
-                Diag.log(this, "确认记账失败：${e.javaClass.simpleName}")
-            }
-            handler.removeCallbacks(hideTask)
-            removeCard()
-            Toast.makeText(
-                this,
-                (if (income) "已记收入：" else "已记账：") + "$cat ¥" + Ui.money(amount),
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val winW = resources.displayMetrics.widthPixels - Ui.dp(this, 28f)
-        val params = WindowManager.LayoutParams(
-            winW,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.BOTTOM
-        params.y = Ui.dp(this, 96f)
-        try {
-            wm.addView(v, params)
-            card = v
-            Diag.logCard(this, "卡片已 addView（通知同时已发）")
-        } catch (e: Exception) {
-            Diag.logCard(this, "addView 失败（${e.javaClass.simpleName}），通知已发。小米/红米请确认「后台弹出界面」权限")
-            return
-        }
-        // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
-        v.postDelayed({
-            Diag.logCard(this, "卡片尺寸 " + v.width + "x" + v.height +
-                "，屏幕宽 " + resources.displayMetrics.widthPixels +
-                (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了" else ""))
-        }, 500)
-        handler.postDelayed(hideTask, 45000)
-    }
-
-    private fun emojiOf(cat: String): String {
-        val db = DbHelper(this)
-        return try {
-            db.emojiOf(cat)
-        } catch (e: Exception) {
-            "🧾"
-        } finally {
-            db.close()
-        }
-    }
-
-    private fun removeCard() {
-        try {
-            card?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
-        } catch (_: Exception) {
-        }
-        card = null
-    }
-
-    private fun notifyPending(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
-        try {
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            // 渠道一旦创建，重要性不可修改，故 v2.3 使用新渠道 id 以确保「弹窗+响铃+震动」生效
-            val chId = "bill_capture_v2"
-            if (nm.getNotificationChannel(chId) == null) {
-                val ch = NotificationChannel(chId, "自动记账提醒", NotificationManager.IMPORTANCE_HIGH)
-                ch.description = "识别到消费时提醒确认"
-                ch.enableVibration(true)
-                ch.vibrationPattern = longArrayOf(0, 220, 120, 220)
-                ch.enableLights(true)
-                nm.createNotificationChannel(ch)
-            }
-            val pi = PendingIntent.getActivity(
-                this, id.toInt(),
-                Intent(this, PendingActivity::class.java)
-                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    .putExtra("focus", id),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            )
-            val n = Notification.Builder(this, chId)
-                .setSmallIcon(android.R.drawable.sym_def_app_icon)
-                .setContentTitle((if (income) "识别到收入 ¥" else "识别到消费 ¥") + Ui.money(amount))
-                .setContentText("$note · 分类：$cat · 点此确认")
-                .setContentIntent(pi)
-                .setAutoCancel(true)
-                .setCategory(Notification.CATEGORY_REMINDER)
-                .setVisibility(Notification.VISIBILITY_PUBLIC)
-                .setWhen(System.currentTimeMillis())
-                .setShowWhen(true)
-                .build()
-            nm.notify(id.toInt(), n)
-            Diag.log(this, "已发送通知提醒：¥$amount $note")
-        } catch (e: Exception) {
-            Diag.log(this, "通知发送失败（${e.javaClass.simpleName}）：请检查通知权限是否开启")
-        }
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
+        OverlayUi.show(this, id, amount, note, cat, income)
     }
 
     override fun onInterrupt() {}
 
     override fun onUnbind(intent: Intent?): Boolean {
-        live = null
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
-        live = null
-        removeCard()
+        // 服务销毁只收掉自己触发的卡片；OverlayUi 由进程持有，通知通道仍可继续使用
         super.onDestroy()
     }
 }
