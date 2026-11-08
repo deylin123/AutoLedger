@@ -13,7 +13,6 @@ import android.view.View
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
-import android.widget.Toast
 
 /**
  * 账单页抓取。
@@ -174,7 +173,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.20 卡片独立版）")
+        Diag.log(this, "无障碍服务已连接（v2.21 账单核对版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -516,13 +515,6 @@ class BillAccessibilityService : AccessibilityService() {
         // v2.17：从 8 秒收紧到 2 秒 —— 同屏重复扫描已由内容指纹节流挡住，
         // 8 秒会误杀「几秒内连续发生的两笔同额消费」（连续测试时尤其明显）。
         val now = System.currentTimeMillis()
-        if (amount == lastAmount && now - lastAmountAt < 2000) return false
-        // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
-        // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
-        if (OverlayUi.isCancelledRecently(amount)) {
-            Diag.log(this, "$appName ¥$amount → 跳过：用户已取消这笔，${CANCEL_SUPPRESS_MS / 60000}分钟内不再重复弹")
-            return false
-        }
 
         val db = DbHelper(this)
         try {
@@ -534,6 +526,34 @@ class BillAccessibilityService : AccessibilityService() {
             val win = if (pageTs != null) PayApps.MERGE_WINDOW_DETAIL_MS else MERGE_WINDOW
             val prev = db.recentSameAmount(amount, ts, win)
             if (prev != null) {
+                if (prev.status == 1) {
+                    // v2.21：这一笔已经确认入账。
+                    //
+                    // 旧版这里只 Toast 一句就返回，用户主动打开账单核对时看到的是
+                    // 「屏幕上闪了一行字」，很容易理解成「它没识别到」或「又要我记一遍」。
+                    // 现在统一弹卡片并显著标注「该笔消费已记录」，附记入时间与分类，
+                    // 按钮收敛为「知道了」—— 不给重复入账的入口。
+                    //
+                    // 这段刻意放在「2 秒同额闸 / 取消抑制闸」之前：
+                    // 用户翻历史账单核对，和「刚记完一笔又被重扫」是两件事，不能被防抖挡掉。
+                    // 走这条分支不写库、不发通知提醒，因此不会产生重复记录，也不会反复响铃。
+                    lastAmount = amount
+                    lastAmountAt = now
+                    Diag.log(
+                        this,
+                        "$appName ¥$amount → 已在账本 #${prev.id}（${prev.cat}），弹「已记录」提示，不重复记账"
+                    )
+                    OverlayUi.show(
+                        this,
+                        prev.id,
+                        prev.amount,
+                        prev.note,
+                        prev.cat,
+                        prev.type == 1,
+                        OverlayUi.RecordedInfo(prev.ts, prev.cat, 1)
+                    )
+                    return true
+                }
                 if (prev.status == 0) {
                     // 先前那条还没确认：用本次更完整的信息覆盖（商品名通常只有结果页才有），不新增、不重复弹卡片。
                     // 方向也一并覆盖 —— 先前那条可能是被误判成支出的收入。
@@ -552,16 +572,20 @@ class BillAccessibilityService : AccessibilityService() {
                     showCard(prev.id, amount, merged, cat, income)
                     return true
                 }
-                // 已确认入账的：不弹卡也不重复记，Toast 一句让用户知道 App 看到了这页、
-                // 只是这笔已经在账本里 —— 否则表现上和「完全没识别」无法区分。
-                Diag.log(this, "$appName ¥$amount → 跳过：该笔已确认入账（#${prev.id}），不重复记账")
-                Toast.makeText(
-                    this,
-                    "该笔已在账本中：" + (if (income) "收入 " else "支出 ") + "¥" + Ui.money(amount) + "，不重复记账",
-                    Toast.LENGTH_SHORT
-                ).show()
+            }
+
+            // 走到这里说明账本里没有这一笔。
+            // 下面两道闸只作用于「要新入库」的路径 —— 已入账的核对提示不该被它们挡住（见上）。
+            // v2.17：同额闸从 8 秒收紧到 2 秒，同屏重复扫描已由内容指纹节流挡住，
+            // 8 秒会误杀「几秒内连续发生的两笔同额消费」（连续测试时尤其明显）。
+            if (amount == lastAmount && now - lastAmountAt < 2000) return false
+            // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
+            // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
+            if (OverlayUi.isCancelledRecently(amount)) {
+                Diag.log(this, "$appName ¥$amount → 跳过：用户已取消这笔，${CANCEL_SUPPRESS_MS / 60000}分钟内不再重复弹")
                 return false
             }
+
             val id = db.addRecord(
                 Rec(
                     amount = amount, type = type, cat = cat, note = note, ts = ts,

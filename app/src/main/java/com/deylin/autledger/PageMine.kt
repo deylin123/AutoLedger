@@ -107,7 +107,7 @@ class PageMine(private val act: MainActivity) {
             }
         )
         autoCard.addView(
-            permRow("账单页抓取（可选）", "页面级识别更准，但银行 App 可能因此拒绝运行", hasAccessibility()) {
+            permRow("账单页抓取（可选）", "打开账单详情自动识别；已记录的会标注，不会重复记", hasAccessibility()) {
                 act.openAccessibility()
             }
         )
