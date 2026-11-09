@@ -203,7 +203,12 @@ class BillAccessibilityService : AccessibilityService() {
                 // 现在去重状态只在换 App 时归零；同一 App 内换到另一笔账单，
                 // 记录 id 本身就不同，不依赖清空状态也能正常弹。
                 // 真正的防抖由 OverlayUi 的 60 秒时间窗承担。
-                if (pkg != lastWinPkg) {
+                //
+                // 只在**已登记的支付类 App** 之间比较：输入法、桌面、系统弹层也会抛
+                // 窗口状态变化（日志里 com.iflytek.inputmethod.miui / com.miui.home 极频繁），
+                // 若把它们算作「换 App」，在支付宝账单页弹一下输入法就会清空去重状态，
+                // 同一笔又能立刻重弹一次 —— 等于白改。
+                if (PayApps.of(pkg) != null && pkg != lastWinPkg) {
                     lastWinPkg = pkg
                     OverlayUi.resetDedup()
                 }
