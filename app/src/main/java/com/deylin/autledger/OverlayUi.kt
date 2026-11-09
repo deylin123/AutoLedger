@@ -45,8 +45,30 @@ import java.util.Locale
  */
 object OverlayUi {
 
-    /** 同一笔的去重窗：避免页面重扫/双通道命中时反复重建窗口造成闪烁 */
-    private const val CARD_DEDUP_MS = 5_000L
+    /**
+     * 同一笔记账卡在这段时间内不重复弹。
+     *
+     * v2.23：从 5 秒放宽到 60 秒，定位也随之改变 —— 不再是「防抖」，而是
+     * 「同一次页面驻留内，同一笔只弹一次」。
+     *
+     * 为什么必须改：v2.21 的 5 秒窗配合「每次窗口事件就 resetDedup」等于每 5 秒重弹一次。
+     * 实测量化（用户日志 10:14:05–10:14:12）：同一笔 #13 ¥15.12 先后弹了 3 次，
+     * 每次 addView 都重建窗口 —— 用户看到的就是「卡片反复闪」。
+     * 现在的两道防线：
+     *   ① 服务端只在**切换 App** 时 resetDedup，同页窗口事件不再清空状态；
+     *   ② 这里按记录 id 去重，同一笔在账本里有唯一 id，不同笔天然不会互相挡。
+     * 60 秒覆盖页面驻留轮询窗口（12.6 秒）且留足余量，同时保证「隔一会儿重新打开同一笔」仍会提示。
+     */
+    private const val CARD_DEDUP_MS = 60_000L
+
+    /**
+     * 「已记录」提示的抑制窗（v2.23）。
+     *
+     * v2.22 该去重键不设时间窗 —— 只要 id/金额/分类/状态不变就永不重弹。
+     * 好处是不骚扰，代价是「重新打开同一笔核对」永远看不到提示。
+     * 现在改为 60 秒窗：页面静止时轮询不会重弹（12.6 秒内），离开再回来超过 1 分钟则重新提示。
+     */
+    private const val RECORDED_DEDUP_MS = 60_000L
 
     /** 卡片自动收起时间 */
     private const val CARD_AUTO_HIDE_MS = 45_000L
@@ -88,6 +110,7 @@ object OverlayUi {
     private var lastCardId = -1L
     private var lastCardAt = 0L
     private var lastRecordedKey = ""
+    private var lastRecordedAt = 0L
 
     private var cancelledAmount = -1.0
     private var cancelledAt = 0L
@@ -98,10 +121,17 @@ object OverlayUi {
 
     private val hideTask = Runnable { removeCard() }
 
-    /** 进入新窗口时允许同一笔重新弹一次（真正的防抖交给 [CARD_DEDUP_MS] 时间窗） */
+    /**
+     * 切换 App 时放行同一笔重新提示（真正的防抖交给 [CARD_DEDUP_MS] / [RECORDED_DEDUP_MS] 时间窗）。
+     *
+     * v2.23：调用点从「每次 TYPE_WINDOW_STATE_CHANGED」收窄到「包名变化」。
+     * 旧调用点等于把去重状态归零的动作交给了最频繁的事件 —— 用户日志里
+     * 同一笔 5 秒内弹 3 次，就是被这条清空动作一次次放出来的。
+     */
     fun resetDedup() {
         lastCardId = -1L
         lastRecordedKey = ""
+        lastRecordedAt = 0L
         // v2.22：新窗口 = 新页面，允许对同一笔重新给出提示（用户重新打开账单核对属于新场景）
         handledId = -1L
         handledAt = 0L
@@ -180,17 +210,16 @@ object OverlayUi {
             return false
         }
 
-        // 已记录模式按「记录 id + 金额 + 分类 + 状态」做去重键，且**不设时间窗**：
-        // 节拍器在页面静止时每 1.2 秒还会判一次，若沿用 5 秒时间窗，
-        // 用户盯着账单看 30 秒就会看到卡片反复弹出 —— 那是骚扰，不是提示。
-        // 只有真正换了一笔（id/金额/分类变化）或重进页面（resetDedup）才重新弹。
+        // 已记录模式按「记录 id + 金额 + 分类 + 状态」做去重键，配 [RECORDED_DEDUP_MS] 时间窗：
+        // 页面静止时轮询（最多 12.6 秒）不会重弹，用户离开再回来超过 1 分钟会重新提示。
         if (recorded != null) {
             val key = "$id|$amount|${recorded.cat}|${recorded.status}"
-            if (key == lastRecordedKey) {
-                Diag.logCard(app, "跳过重复「已记录」提示 #$id ¥$amount（同页同笔只提示一次）")
+            if (key == lastRecordedKey && now - lastRecordedAt < RECORDED_DEDUP_MS) {
+                Diag.logCard(app, "跳过重复「已记录」提示 #$id ¥$amount（${now - lastRecordedAt}ms 内已提示过同一笔）")
                 return false
             }
             lastRecordedKey = key
+            lastRecordedAt = now
             Diag.logCard(
                 app,
                 "已记录提示 #$id ¥$amount $note（${if (income) "收入" else "支出"}·${recorded.cat}）"

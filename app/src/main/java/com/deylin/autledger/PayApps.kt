@@ -113,7 +113,17 @@ object PayApps {
             "com.tencent.mm", "微信",
             listOf(
                 "账单详情", "交易详情", "转账详情", "转账成功", "支付详情",
-                "支付成功", "付款成功", "支付结果", "交易记录"
+                "支付成功", "付款成功", "支付结果", "交易记录",
+                // v2.23：补「支付凭证」——这是微信里点开支付消息后的落地页标题
+                // （页面顶部就写「微信支付凭证」）。
+                //
+                // 此前这是一处**死代码级**的漏判：BILL_DETAIL_TITLES 里虽然写了
+                // 「微信支付凭证」，但 hasTitle() 用的是本表的 titleWords，
+                // 而本表原来没有任何一个词能匹配到「微信支付凭证」，
+                // 页面在标题闸门就被判成「不是账单页」直接返回，
+                // 根本走不到 isWalletBillDetail() —— 那句豁免等于从未生效。
+                // 用户看到的正是「微信账单详情怎么都不弹窗」。
+                "微信支付凭证", "支付凭证"
             ),
             listOf(
                 "按住 说话", "按住说话", "发送消息", "聊天信息", "表情面板", "语音输入",
@@ -683,6 +693,19 @@ object PayApps {
     fun isExcluded(texts: List<String>, app: App?): Boolean =
         app != null && app.excludeWords.any { w -> texts.any { it.contains(w) } }
 
+    /**
+     * v2.23：命中排除词时，具体命中的是哪一个。
+     *
+     * 只用于诊断日志。旧版日志只写「跳过：命中排除词（聊天窗口等非账单界面）」，
+     * 不写命中的是哪个词 —— 于是「微信账单页被当聊天窗口拦掉」这件事
+     * 在日志里完全看不出原因，只能靠猜。现在把词本身打出来。
+     */
+    fun excludeHit(texts: List<String>, app: App?): String? {
+        val w = app?.excludeWords?.firstOrNull { w -> texts.any { it.contains(w) } } ?: return null
+        val line = texts.firstOrNull { it.contains(w) }?.take(40) ?: ""
+        return "$w「$line」"
+    }
+
     fun hasTitle(texts: List<String>, app: App?): Boolean {
         if (isExcluded(texts, app)) return false
         val words = app?.titleWords ?: COMMON_TITLE_WORDS
@@ -946,8 +969,14 @@ object PayApps {
     private val NOISE_VALUE = listOf(
         "单号", "编号", "号码", "批次", "流水", "时间", "日期",
         // v2.14：「商品详情」是字段标签本身，商品键「商品」前缀匹配上它会把「详情」当商品名
-        "详情"
+        "详情",
         // 注意：不放「订单」——「美团-外卖订单」是正常商品名，放进来会把真值误杀
+        // v2.23：按钮/操作类文案。实测事故：支付宝账单详情页的「备注」标签后面紧跟
+        // 一个「添加」按钮，fieldOf() 走「标签节点 → 下一节点」分支把「添加」当成了备注值，
+        // 最终记账结果写成「-¥15.12 支付宝·添加」。按钮文字永远不是字段值。
+        "添加", "编辑", "修改", "删除", "保存", "复制", "粘贴", "分享", "更多",
+        "设置", "管理", "查看", "立即", "去支", "去付", "去评", "去看看", "去使用",
+        "联系", "客服", "投诉", "申请", "开票", "开发票", "再来一单"
     )
 
     /**

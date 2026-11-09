@@ -161,6 +161,9 @@ class BillAccessibilityService : AccessibilityService() {
     private var pollPkg: String? = null
     private var pollLeft = 0
 
+    /** v2.23：上一个收到窗口状态变化的包名，用于判定「是否真的切换了 App」 */
+    private var lastWinPkg: String? = null
+
     /** v2.17：上一屏文字指纹与判定时间（同屏不重复判、内容变即重判） */
     private var lastSig = ""
     private var lastSigAt = 0L
@@ -173,7 +176,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.22 提示去噪版）")
+        Diag.log(this, "无障碍服务已连接（v2.23 凭证页修复版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -189,8 +192,21 @@ class BillAccessibilityService : AccessibilityService() {
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // 新窗口 = 新页面：允许同一笔重新弹一次（真正的防抖交给 OverlayUi 的时间窗）
-                OverlayUi.resetDedup()
+                // v2.23：只在**切换 App** 时才清空卡片去重状态。
+                //
+                // 旧版每次窗口状态变化都 resetDedup()，而微信/支付宝加载期会连抛窗口事件
+                // （子窗口、弹层、输入法、Toast 都算）。实测日志（v2.21）：
+                //   10:14:05 弹卡 #13 → 10:14:06 又弹 #13 → 10:14:10 第三次弹 #13
+                //   10:14:40/41/44 同一笔 #11 ¥55.0 弹了三次
+                // 每次 addView 都重建窗口，用户看到卡片反复闪。
+                //
+                // 现在去重状态只在换 App 时归零；同一 App 内换到另一笔账单，
+                // 记录 id 本身就不同，不依赖清空状态也能正常弹。
+                // 真正的防抖由 OverlayUi 的 60 秒时间窗承担。
+                if (pkg != lastWinPkg) {
+                    lastWinPkg = pkg
+                    OverlayUi.resetDedup()
+                }
                 burstToken++
                 // 立刻扫一次（post 到主线程队列，不阻塞事件回调——微信加载期窗口事件很密），
                 // 再交给节拍器兜住后续渲染
@@ -349,7 +365,9 @@ class BillAccessibilityService : AccessibilityService() {
                 return false
             }
             if (PayApps.isExcluded(texts, app)) {
-                logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）｜本页：${sampleOf(texts)}")
+                // v2.23：把命中的具体排除词与所在行打出来。旧版只写「命中排除词」，
+                // 微信账单页被误当聊天窗口时无从判断，是「微信不弹窗」长期无法定位的原因之一。
+                logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词 ${PayApps.excludeHit(texts, app)}｜本页：${sampleOf(texts)}")
                 return false
             }
             if (!PayApps.hasTitle(texts, app)) {
