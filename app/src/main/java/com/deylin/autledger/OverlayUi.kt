@@ -55,6 +55,25 @@ object OverlayUi {
     private const val CANCEL_SUPPRESS_MS = 5 * 60_000L
 
     /**
+     * v2.22：用户处理过某笔后，同一页面内不再对它重复提示的静默窗。
+     *
+     * 修的是「确认记账后卡片又弹一次『该笔消费已记录』」：
+     * 确认后这条记录变成 status=1，而节拍器还在同一页上继续扫（每 1.2 秒一拍），
+     * 下一拍必然命中 status=1 分支 → 又弹一张「已记录」卡。
+     * 静默窗只作用于「同一页面、同一笔」，重新进入页面（[resetDedup]）会清空。
+     */
+    private const val HANDLED_QUIET_MS = 10 * 60_000L
+
+    /**
+     * v2.22：通知栏提醒的存活时间。
+     *
+     * 旧版没有超时，用户处理完这笔后通知仍留在通知栏（只有「取消」会撤掉），
+     * 表现为「通知一直在，不会自动消失」。现在用户任何操作都会立即撤销，
+     * 完全不操作时最多留 [NOTIF_TIMEOUT_MS] 自动过期。
+     */
+    private const val NOTIF_TIMEOUT_MS = 10 * 60_000L
+
+    /**
      * 「这一笔已经在账本里」的信息。
      *
      * [status] 1 = 已确认入账；0 = 仍是待确认。
@@ -73,12 +92,50 @@ object OverlayUi {
     private var cancelledAmount = -1.0
     private var cancelledAt = 0L
 
+    /** 用户刚刚处理过的记录（确认 / 取消 / 存入待确认 / 改分类） */
+    private var handledId = -1L
+    private var handledAt = 0L
+
     private val hideTask = Runnable { removeCard() }
 
     /** 进入新窗口时允许同一笔重新弹一次（真正的防抖交给 [CARD_DEDUP_MS] 时间窗） */
     fun resetDedup() {
         lastCardId = -1L
         lastRecordedKey = ""
+        // v2.22：新窗口 = 新页面，允许对同一笔重新给出提示（用户重新打开账单核对属于新场景）
+        handledId = -1L
+        handledAt = 0L
+    }
+
+    /**
+     * v2.22：登记「这一笔用户已经处理过」。
+     *
+     * 由卡片的四个按钮调用。作用有两点：
+     * 1. 同页静默 —— 处理完后节拍器还会继续扫，不登记就会立刻再弹一张
+     *    「该笔消费已记录」（用户确认后又被提示一次）或重弹确认卡（用户点了存入待确认）；
+     * 2. 去重键同步刷新，避免紧接着的一次重扫绕过 [CARD_DEDUP_MS] 又弹一次。
+     */
+    fun markHandled(id: Long) {
+        if (id <= 0) return
+        handledId = id
+        handledAt = System.currentTimeMillis()
+        lastCardId = id
+        lastCardAt = handledAt
+    }
+
+    private fun isHandledRecently(id: Long): Boolean {
+        return id > 0 && id == handledId &&
+            System.currentTimeMillis() - handledAt < HANDLED_QUIET_MS
+    }
+
+    /** 撤掉某笔的通知栏提醒（用户一旦处理过，这条提醒就不该继续占着通知栏） */
+    private fun cancelNotification(app: Context, id: Long) {
+        if (id <= 0) return
+        try {
+            (app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .cancel(id.toInt())
+        } catch (_: Exception) {
+        }
     }
 
     /** 用户是否在最近 5 分钟内取消过「这个金额」的账单 */
@@ -114,6 +171,14 @@ object OverlayUi {
     ): Boolean {
         val app = ctx.applicationContext
         val now = System.currentTimeMillis()
+
+        // v2.22：用户刚处理过这一笔（确认/取消/存入待确认/改分类），本页不再对它提示。
+        // 确认后记录变成 status=1，节拍器下一拍必然命中「已记录」分支 —— 这是
+        // 「记完又弹一次『该笔消费已记录』」的直接来源。重新进入页面会清空该状态。
+        if (isHandledRecently(id)) {
+            Diag.logCard(app, "跳过 #$id ¥$amount：用户刚处理过这一笔，同一页面不再重复提示")
+            return false
+        }
 
         // 已记录模式按「记录 id + 金额 + 分类 + 状态」做去重键，且**不设时间窗**：
         // 节拍器在页面静止时每 1.2 秒还会判一次，若沿用 5 秒时间窗，
@@ -213,10 +278,14 @@ object OverlayUi {
             btnLater.setOnClickListener {
                 handler.removeCallbacks(hideTask)
                 removeCard()
+                markHandled(id)
+                cancelNotification(app, id)
             }
             btnOk.setOnClickListener {
                 handler.removeCallbacks(hideTask)
                 removeCard()
+                markHandled(id)
+                cancelNotification(app, id)
                 Toast.makeText(app, "这笔已在账本中，未重复记账", Toast.LENGTH_SHORT).show()
             }
         } else {
@@ -233,14 +302,14 @@ object OverlayUi {
                     val db = DbHelper(app)
                     db.delRecord(id)
                     db.close()
-                    (app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                        .cancel(id.toInt())
                     cancelledAmount = amount
                     cancelledAt = System.currentTimeMillis()
                     Diag.log(app, "用户取消：¥$amount $note 已删除待确认记录 #$id，不记账")
                 } catch (e: Exception) {
                     Diag.log(app, "取消失败：${e.javaClass.simpleName}")
                 }
+                markHandled(id)
+                cancelNotification(app, id)
                 handler.removeCallbacks(hideTask)
                 removeCard()
                 Toast.makeText(app, "已取消，不记这笔", Toast.LENGTH_SHORT).show()
@@ -248,11 +317,15 @@ object OverlayUi {
             btnLater.setOnClickListener {
                 handler.removeCallbacks(hideTask)
                 removeCard()
+                markHandled(id)
+                cancelNotification(app, id)
                 Toast.makeText(app, "已存入待确认", Toast.LENGTH_SHORT).show()
             }
             btnCat.setOnClickListener {
                 handler.removeCallbacks(hideTask)
                 removeCard()
+                markHandled(id)
+                cancelNotification(app, id)
                 try {
                     app.startActivity(
                         Intent(app, PendingActivity::class.java)
@@ -270,6 +343,12 @@ object OverlayUi {
                 } catch (e: Exception) {
                     Diag.log(app, "确认记账失败：${e.javaClass.simpleName}")
                 }
+                // v2.22：登记已处理 + 撤通知。
+                // 旧版只 removeCard()，通知栏那条提醒永远留着，用户看到的就是
+                // 「每次记录完消费，悬浮窗的通知一直在」。同时登记后节拍器不会
+                // 立刻再弹一张「该笔消费已记录」。
+                markHandled(id)
+                cancelNotification(app, id)
                 handler.removeCallbacks(hideTask)
                 removeCard()
                 Toast.makeText(
@@ -365,6 +444,11 @@ object OverlayUi {
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setWhen(System.currentTimeMillis())
                 .setShowWhen(true)
+                // v2.22：用户不处理时的兜底过期时间。
+                // 关键路径：用户点了卡片按钮 → cancelNotification 立即撤销；
+                // 用户完全没碰（例如自动扣费发生在锁屏状态）→ 最多留 10 分钟自动消失，
+                // 不再像旧版那样一直挂在通知栏。
+                .setTimeoutAfter(NOTIF_TIMEOUT_MS)
                 .build()
             nm.notify(id.toInt(), n)
             Diag.log(app, "已发送通知提醒：¥$amount $note")

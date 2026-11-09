@@ -173,7 +173,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.21 账单核对版）")
+        Diag.log(this, "无障碍服务已连接（v2.22 提示去噪版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -349,11 +349,18 @@ class BillAccessibilityService : AccessibilityService() {
                 return false
             }
             if (PayApps.isExcluded(texts, app)) {
-                logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）")
+                logSkip("$pkg#excl", "${app?.name ?: appLabel(pkg)} → 跳过：命中排除词（聊天窗口等非账单界面）｜本页：${sampleOf(texts)}")
                 return false
             }
             if (!PayApps.hasTitle(texts, app)) {
-                if (app == null) noteSuspect(pkg, texts)
+                if (app == null) {
+                    noteSuspect(pkg, texts)
+                } else {
+                    // v2.22：这是微信端最大的诊断盲区 —— 页面读到了、没有任何排除词，
+                    // 只是标题特征没命中，旧版在日志里一行都不写，看起来和「什么都没发生」一样。
+                    // 现在把本页文本摘要一并落下，下一轮就能直接判断是缺标题词还是整页没读到。
+                    logSkip("$pkg#notitle#${texts.hashCode()}", "$name → 跳过：页面没有账单标题特征（不是单笔账单页）｜本页：${sampleOf(texts)}")
+                }
                 return false
             }
             // 未注册的 App：必须有方向佐证才敢认定，避免"订单详情"浏览页误抓
@@ -624,6 +631,21 @@ class BillAccessibilityService : AccessibilityService() {
         if (skipLogged.size > 60) skipLogged.clear()
         skipLogged[key] = now
         Diag.log(this, msg)
+    }
+
+    /**
+     * v2.22：页面文本摘要，只用于诊断日志。
+     *
+     * 微信端「页面读到了但被某道闸门拦下」时，光有闸门名无法判断是缺词还是整页没读到，
+     * 因此把前 12 条文本拼进日志。长度截断到 170 字，避免刷屏。
+     */
+    private fun sampleOf(texts: List<String>): String {
+        return texts.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(12)
+            .joinToString("/")
+            .take(170)
     }
 
     /** 未登记 App 的疑似消费页：只记一次包名，方便后续在 PayApps 里补登记 */
