@@ -359,7 +359,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // v2.22：这是微信端最大的诊断盲区 —— 页面读到了、没有任何排除词，
                     // 只是标题特征没命中，旧版在日志里一行都不写，看起来和「什么都没发生」一样。
                     // 现在把本页文本摘要一并落下，下一轮就能直接判断是缺标题词还是整页没读到。
-                    logSkip("$pkg#notitle#${texts.hashCode()}", "$name → 跳过：页面没有账单标题特征（不是单笔账单页）｜本页：${sampleOf(texts)}")
+                    logSkip("$pkg#notitle#${texts.hashCode()}", "${app.name} → 跳过：页面没有账单标题特征（不是单笔账单页）｜本页：${sampleOf(texts)}")
                 }
                 return false
             }
