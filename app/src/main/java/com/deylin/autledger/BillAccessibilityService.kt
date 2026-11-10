@@ -110,6 +110,15 @@ class BillAccessibilityService : AccessibilityService() {
          */
         private const val MERGE_WINDOW = PayApps.MERGE_WINDOW_MS
 
+        /**
+         * v2.25：页面时间与账本记录的「同一时刻」容差。
+         *
+         * 同一笔在结果页与账单详情页的付款时间最多差几十秒（页面四舍五入、时区无差异），
+         * 5 分钟足够覆盖；不同日期的同额账单相差至少几小时，必然被挡在外面。
+         * 这道闸不是为了收敛重复，而是为了**防止把两天的账并成一条**。
+         */
+        private const val SAME_MOMENT_MS = 5 * 60_000L
+
         /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
         private val FIELD_NOISE = listOf(
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
@@ -185,7 +194,7 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.24 卡片跟随页面版）")
+        Diag.log(this, "无障碍服务已连接（v2.25 页面绑定版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -393,6 +402,17 @@ class BillAccessibilityService : AccessibilityService() {
                 logSkip("$pkg#off", "${app?.name ?: pkg} → 跳过：该平台本阶段不接入弹窗（v2.16 范围限制）")
                 return false
             }
+            // v2.25：**在任何页面闸门之前**把屏幕上那张卡片与本页绑定。
+            //
+            // 旧版只在 scan() 里收卡，而 scan() 要等标题/首页/列表/消息流/门户/支付状态/
+            // 新鲜度、以及金额与方向判定全部通过后才会被调用。也就是说：本页只要被任何一道闸门
+            // 拦下（历史账单、方向不明、读不到金额……），屏幕上那张属于上一笔的卡片就没人管，
+            // 一直挂到它自己 45 秒超时 —— 用户看到的就是「这一页明明是 A，卡上写着 B」。
+            // 放在这里（识别出包名之后、任何判定之前），收卡与后续所有结论无关。
+            if (app != null) {
+                OverlayUi.bindPage(PayApps.pageTime(texts))
+            }
+
             if (PayApps.isExcluded(texts, app)) {
                 // v2.23：把命中的具体排除词与所在行打出来。旧版只写「命中排除词」，
                 // 微信账单页被误当聊天窗口时无从判断，是「微信不弹窗」长期无法定位的原因之一。
@@ -556,8 +576,10 @@ class BillAccessibilityService : AccessibilityService() {
         val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
         // 入账时间优先用页面上的付款/交易时间：账单详情是事后核对页，
         // 页面时间才是这笔钱真实发生的时间（v2.13）。
-        val pageTs = PayApps.TIME.find(joined)?.groupValues?.getOrNull(1)
-            ?.let { PayApps.parseTime(it) }
+        // v2.25：改用 PayApps.pageTime —— 兼容「付款时间」「2026-11-04」「16:13:24」被拆成
+        // 三个节点的页面。旧写法只在整页拼接串上跑一次正则，拆开时匹配不到，
+        // ts 会退化成「现在」，两笔同额不同日期的账单于是都被记成今天（用户反馈的「两天搞混」）。
+        val pageTs = PayApps.pageTime(texts)
         val ts = pageTs ?: System.currentTimeMillis()
 
         val cat = if (income) Category.incomeOf(merchant, goods, catHint, appName)
@@ -574,11 +596,6 @@ class BillAccessibilityService : AccessibilityService() {
         // 只用金额 + 页面付款时间：账单页滚动、加载、动态内容都不会改变这两项，
         // 换一笔账单则必然变化。页面没有绝对时间（支付现场页）时退化为「live|金额」。
         val pageSig = if (pageTs != null) "b|$amount|$pageTs" else "live|$amount"
-        // 屏幕上如果还挂着上一笔的卡片，这里就地收掉。
-        // 实测（v2.23 截图）：11-07 那笔的「已记录」卡还挂着时翻到 11-04 的另一笔，
-        // 卡上仍显示 11-07 的商户与入账时间，看起来就像「把两天的账搞混了」。
-        // 放在闸门之前，所以「被 2 秒同额闸/取消闸拦掉、本页不弹新卡」的路径也能收掉旧卡。
-        OverlayUi.keepIfSameBill(pageSig)
 
         val db = DbHelper(this)
         try {
@@ -589,7 +606,21 @@ class BillAccessibilityService : AccessibilityService() {
             // 按页面付款时间查重仍能对上成功页那一次；页面无时间的支付现场仍用 90 秒。
             val win = if (pageTs != null) PayApps.MERGE_WINDOW_DETAIL_MS else MERGE_WINDOW
             val prev = db.recentSameAmount(amount, ts, win)
-            if (prev != null) {
+
+            // v2.25：页面带绝对时间时，候选记录还必须与页面时间属于「同一时刻」。
+            // 这一层是防御性的：查重窗口本身已经限制了跨度，但只要窗口常量被调大、
+            // 或者页面时间解析出错（这正是「两天搞混」的成因），就会把另一天的同额账单
+            // 认成「已记录」，用户看到的是一张写着别笔账的卡。
+            // 取舍：宁可多出一条待确认记录（用户可删），也不把两天的账并成一条。
+            val sameMoment = prev == null || pageTs == null ||
+                kotlin.math.abs(prev.ts - pageTs) <= SAME_MOMENT_MS
+            if (prev != null && !sameMoment) {
+                Diag.log(
+                    this,
+                    "$appName ¥$amount → 页面时间 ${fmtTs(pageTs)} 与账本 #${prev.id} 的 ${fmtTs(prev.ts)} 相差过大，按不同的一笔处理"
+                )
+            }
+            if (prev != null && sameMoment) {
                 if (prev.status == 1) {
                     // v2.21：这一笔已经确认入账。
                     //
@@ -618,7 +649,7 @@ class BillAccessibilityService : AccessibilityService() {
                         prev.cat,
                         prev.type == 1,
                         OverlayUi.RecordedInfo(prev.ts, prev.cat, 1),
-                        pageSig
+                        pageTs ?: 0L
                     )
                     return true
                 }
@@ -638,7 +669,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
                     // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
                     // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
-                    showCard(prev.id, amount, merged, cat, income, pageSig)
+                    showCard(prev.id, amount, merged, cat, income, pageTs)
                     return true
                 }
             }
@@ -676,12 +707,17 @@ class BillAccessibilityService : AccessibilityService() {
                 this,
                 "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
-            showCard(id, amount, note, cat, income, pageSig)
+            showCard(id, amount, note, cat, income, pageTs)
             return true
         } finally {
             db.close()
         }
     }
+
+    /** v2.25：诊断日志里打印时间用，null 显示「无」 */
+    private fun fmtTs(ts: Long?): String =
+        if (ts == null || ts <= 0) "无" else
+            java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.CHINA).format(java.util.Date(ts))
 
     /** 合并备注：本次只是兜底名（"支付宝消费"）时，保留上一次识别到的具体商户名 */
     private fun betterNote(oldNote: String, newNote: String): String {
@@ -879,8 +915,8 @@ class BillAccessibilityService : AccessibilityService() {
      * 剥离原因：卡片窗口是 TYPE_APPLICATION_OVERLAY，只需要悬浮窗权限，技术上不依赖无障碍服务。
      * 旧版写在这里，导致无障碍一关（银行 App 要求）两条通道都不弹卡。
      */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, sig: String? = null) {
-        OverlayUi.show(this, id, amount, note, cat, income, null, sig)
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, pageTs: Long? = null) {
+        OverlayUi.show(this, id, amount, note, cat, income, null, pageTs ?: 0L)
     }
 
     override fun onInterrupt() {}

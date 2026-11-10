@@ -944,6 +944,81 @@ object PayApps {
         return max
     }
 
+    /** 「付款时间」类字段标签（v2.25） */
+    private val TIME_LABELS = listOf(
+        "付款时间", "支付时间", "交易时间", "转账时间", "收款时间", "创建时间", "下单时间"
+    )
+
+    /** 只有日期的节点：「2026-11-04」「2026年11月4日」「11月4日」 */
+    private val DATE_ONLY = Regex("^\\s*(?:(20\\d{2})[-/年.])?(\\d{1,2})[-/月.](\\d{1,2})日?\\s*$")
+
+    /** 只有时间的节点：「16:13:24」「16:13」 */
+    private val TIME_ONLY = Regex("^\\s*(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\s*$")
+
+    /**
+     * v2.25：页面上的「这笔钱发生的绝对时间」。
+     *
+     * 旧实现在 `texts.joinToString("|")` 上跑一次 [TIME]，要求日期与时间在**同一条文本**里。
+     * 支付宝有一部分账单页把它拆成三个节点：「付款时间」「2026-11-04」「16:13:24」，
+     * 旧写法匹配不到 → pageTs 为 null → 入账时间退化成 `System.currentTimeMillis()`。
+     * 同一天的两笔同额没问题，但**不同日期的两笔同额账单会都被记成「今天」**，
+     * 而且查重窗口也从「页面时间基准」退化成「当前时间基准」——
+     * 这就是用户反馈「11-04 和 11-07 金额相同、商家不同，它把这两天搞混了」的直接来源。
+     *
+     * 查找顺序：
+     * ① 带「付款/支付/交易时间」标签的节点（标签后 1~2 个节点内找日期与时间，拆开的也能拼）；
+     * ② 单条文本内的「日期 + 时间」；
+     * ③ 任意相邻的「日期节点 + 时间节点」。
+     * 都找不到返回 null —— 支付现场页本来就没有绝对时间，这是正常情况。
+     */
+    fun pageTime(texts: List<String>): Long? {
+        val arr = texts.map { it.trim() }
+
+        // ① 先认「付款时间」这个标签，避免取到页面上的其它日期（账单日、活动日期）
+        for (i in arr.indices) {
+            if (TIME_LABELS.none { arr[i].contains(it) }) continue
+            // 标签与值同节点：「付款时间 2026-11-04 16:13:24」
+            TIME.find(arr[i])?.groupValues?.getOrNull(1)?.let { parseTime(it) }?.let { return it }
+            // 标签后紧跟：日期节点 + 时间节点
+            for (k in i + 1..minOf(i + 2, arr.lastIndex)) {
+                val d = DATE_ONLY.find(arr[k]) ?: continue
+                for (m in k + 1..minOf(k + 2, arr.lastIndex)) {
+                    val t = TIME_ONLY.find(arr[m]) ?: continue
+                    combine(d, t)?.let { return it }
+                }
+                // 日期节点自带时间：「2026-11-04 16:13:24」
+                TIME.find(arr[k])?.groupValues?.getOrNull(1)?.let { parseTime(it) }?.let { return it }
+            }
+        }
+
+        // ② 单条文本内的「日期 + 时间」
+        for (s in arr) {
+            if (s.isEmpty() || s.length > 40) continue
+            TIME.find(s)?.groupValues?.getOrNull(1)?.let { parseTime(it) }?.let { return it }
+        }
+
+        // ③ 相邻的日期节点 + 时间节点（无标签的排版）
+        for (i in arr.indices) {
+            val d = DATE_ONLY.find(arr[i]) ?: continue
+            for (k in i + 1..minOf(i + 2, arr.lastIndex)) {
+                val t = TIME_ONLY.find(arr[k]) ?: continue
+                combine(d, t)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun combine(d: MatchResult, t: MatchResult): Long? {
+        val y = d.groupValues[1]
+        val mo = d.groupValues[2].padStart(2, '0')
+        val da = d.groupValues[3].padStart(2, '0')
+        val hh = t.groupValues[1].padStart(2, '0')
+        val mm = t.groupValues[2]
+        val ss = t.groupValues[3].ifEmpty { "00" }
+        val s = if (y.isEmpty()) "$mo-$da $hh:$mm:$ss" else "$y-$mo-$da $hh:$mm:$ss"
+        return parseTime(s)
+    }
+
     fun hasIncomeSignal(texts: List<String>): Boolean =
         texts.any { t -> INCOME_WORDS.any { w -> t.contains(w) } }
 
@@ -976,8 +1051,34 @@ object PayApps {
         // 最终记账结果写成「-¥15.12 支付宝·添加」。按钮文字永远不是字段值。
         "添加", "编辑", "修改", "删除", "保存", "复制", "粘贴", "分享", "更多",
         "设置", "管理", "查看", "立即", "去支", "去付", "去评", "去看看", "去使用",
-        "联系", "客服", "投诉", "申请", "开票", "开发票", "再来一单"
+        "联系", "客服", "投诉", "申请", "开票", "开发票", "再来一单",
+        // v2.25：字段名自身的后缀。键表用前缀匹配，「商品」会命中标签「商品说明」，
+        // 取出的「说明」不是值；同理「商户」命中「商户名称」时取出「名称」。
+        // 实测（11-04 小米移动账单详情）：商品说明的标签节点被取成值，备注写成「…·说明」。
+        "说明", "名称", "信息", "类型", "方式", "状态"
     )
+
+    /**
+     * v2.25：机器串不是商品名/商户名。
+     *
+     * 实测截图（11-04「小米移动 自动扣款 -15.00」账单详情）：页面的「商品说明」是
+     * `5378a03ec1f0d0cd` 这种十六进制串。它满足 fieldOf 的全部条件（有「商品」标签、长度合法、
+     * 不含金额与时间），于是被当成商品名拼进备注，记成「小米移动·5378a03ec1f0d0cd」。
+     * 这类值对用户毫无意义，且会污染后续的经验归类。
+     *
+     * 三类都按噪声处理：纯十六进制（≥12 位）、纯数字（≥10 位）、
+     * 字母数字混合且 ≥16 位且同时含字母与数字（订单号/设备号形态）。
+     * 刻意不拦「纯字母 ≥16 位」—— STARBUCKSCOFFEE 这类商户名是合法的。
+     */
+    private val HEX_ONLY = Regex("^[0-9a-fA-F]{12,}$")
+    private val DIGITS_ONLY = Regex("^\\d{10,}$")
+    private val MACHINE_MIX = Regex("^(?=.*\\d)(?=.*[a-zA-Z])[0-9a-zA-Z]{16,}$")
+
+    fun isJunkValue(s: String): Boolean {
+        val v = s.trim()
+        if (v.isEmpty()) return true
+        return HEX_ONLY.matches(v) || DIGITS_ONLY.matches(v) || MACHINE_MIX.matches(v)
+    }
 
     /**
      * 取字段值。兼容两类排版：
@@ -994,6 +1095,8 @@ object PayApps {
                 if (hasAmountIn(rest) || TIME.find(rest) != null) continue
                 // v2.13：值里带单号/时间等字样的，是字段名延续（如「商户单号 42000020…」），不是真值
                 if (NOISE_VALUE.any { rest.contains(it) }) continue
+                // v2.25：十六进制/长数字等机器串不是值
+                if (isJunkValue(rest)) continue
                 return rest
             }
             for (i in texts.indices) {
@@ -1002,6 +1105,7 @@ object PayApps {
                 if (next.isEmpty() || next.length > 30) continue
                 if (hasAmountIn(next) || EXPENSE_WORDS.any { next.contains(it) }) continue
                 if (NOISE_VALUE.any { next.contains(it) }) continue
+                if (isJunkValue(next)) continue
                 return next
             }
         }

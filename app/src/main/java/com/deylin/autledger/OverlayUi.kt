@@ -113,17 +113,15 @@ object OverlayUi {
     private var lastRecordedAt = 0L
 
     /**
-     * v2.24：屏幕上这张卡片属于哪一页账单。
+     * v2.24/v2.25：屏幕上这张卡片属于哪一页账单（页面上的付款时间）。
      *
-     * null 表示「这张卡不归页面扫描管」（通知通道发的卡），不会被页面切换收掉。
-     * 非空是页面扫描给的账单指纹（金额 + 页面付款时间）。
+     * 0 表示「不归页面扫描管」—— 通知通道发的卡没有页面身份，不会被页面切换收掉。
      *
-     * 为什么需要它：卡片原来只按「自己 45 秒超时」消失，页面切到另一笔账单时不收。
-     * 实测（v2.23，微信/支付宝账单核对）：11-07 那笔的「已记录」卡还挂着时翻到 11-04 的
-     * 另一笔，卡片仍在屏幕上显示的是 11-07 的商户与入账时间 —— 读起来就是
-     * 「它把两天的账搞混了」。实际并没有记错，是旧卡没跟着页面走。
+     * 为什么需要它：卡片原来只按「自己 45 秒超时」消失。用户翻到另一笔账单时，
+     * 屏幕上仍挂着上一笔的卡片（写着上一笔的商户与入账时间），
+     * 读起来就是「它把两天的账搞混了」。卡片上的内容并没有错，错在它不该还在屏幕上。
      */
-    private var cardSig: String? = null
+    private var cardPageTs = 0L
 
     private var cancelledAmount = -1.0
     private var cancelledAt = 0L
@@ -201,35 +199,40 @@ object OverlayUi {
         } catch (_: Exception) {
         }
         card = null
-        cardSig = null
+        cardPageTs = 0L
     }
 
     /**
-     * v2.24：页面上的这一笔如果已经不是屏幕上那张卡的账单，立刻收掉旧卡。
+     * v2.25：把屏幕上的卡片与「当前这一页」绑定；不是同一页就立刻收掉。
      *
-     * 由无障碍服务在**识别出本页账单身份之后、任何闸门返回之前**调用，
-     * 所以「被 2 秒同额闸拦掉」「被取消抑制拦掉」「识别到已记录」这些不弹新卡的路径
-     * 同样会执行到 —— 这正是旧版残留卡片的场景：本页没有弹新卡，旧卡就一直挂着。
+     * 由无障碍服务在 [attempt] 的**每个闸门之前**调用，所以本页即使被判成历史账单、
+     * 方向不明、读不到金额，卡片也会跟着页面走掉 —— 不会再出现
+     * 「这一页是 A，屏幕上写着 B」的情况。
      *
-     * 用「金额 + 页面付款时间」作指纹而不是整页文本：账单页滚动/重绘/加载
-     * （「更多」「立即领取」这类动态内容）都会改变整页文本，用它做指纹会把
-     * 用户正在看的卡误收掉；而这两项在同一笔账单上恒定、换一笔必然变化。
+     * 只比页面付款时间，不比整页文本：账单页滚动、重绘、动态内容都会改变整页文本，
+     * 用文本做指纹会把用户正在看的卡误收掉；付款时间在同一笔上恒定、换一笔必变。
      */
-    fun keepIfSameBill(sig: String) {
-        val v = card ?: return
-        val cur = cardSig ?: return   // 这张卡由通知通道发出，不归页面扫描管
-        if (cur == sig) return
-        Diag.logCard(v.context, "收掉上一页残留的卡片（旧页 $cur → 本页 $sig）")
+    fun bindPage(pageTs: Long?) {
+        if (pageTs == null || pageTs <= 0L) return   // 支付现场页无绝对时间，不参与
+        val owned = cardPageTs
+        if (owned <= 0L || owned == pageTs) return
+        val v = card ?: run { cardPageTs = 0L; return }
+        Diag.logCard(
+            v.context,
+            "页面已换成另一笔（旧页 ${fmtTs(owned)} → 本页 ${fmtTs(pageTs)}），立即收掉旧卡"
+        )
         handler.removeCallbacks(hideTask)
         removeCard()
     }
+
+    private val fmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA)
+    private fun fmtTs(ts: Long): String = try { fmt.format(java.util.Date(ts)) } catch (_: Exception) { ts.toString() }
 
     /**
      * 呈现一笔账单：先发通知栏提醒（可靠通道），再尝试悬浮卡片。
      *
      * @param recorded 非空表示这一笔已经在账本里，卡片走「已记录」样式，不写库、不重复响铃。
-     * @param sig 页面扫描给出的账单指纹（金额 + 页面付款时间），用于「换页就收掉旧卡」；
-     *            通知通道不传，表示这张卡不跟页面绑定，只按自身超时消失。
+     * @param pageTs 本页账单的付款时间（0 = 无/通知通道），用于「换页就收掉旧卡」。
      * @return true 表示本次已处理（含「命中去重被跳过」）
      */
     fun show(
@@ -240,7 +243,7 @@ object OverlayUi {
         cat: String,
         income: Boolean,
         recorded: RecordedInfo? = null,
-        sig: String? = null
+        pageTs: Long = 0L
     ): Boolean {
         val app = ctx.applicationContext
         val now = System.currentTimeMillis()
@@ -288,7 +291,7 @@ object OverlayUi {
         // 通道二：悬浮卡片。addView 必须在主线程。
         handler.post {
             try {
-                buildCard(app, id, amount, note, cat, income, recorded, sig)
+                buildCard(app, id, amount, note, cat, income, recorded, pageTs)
             } catch (e: Exception) {
                 Diag.logCard(app, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
@@ -304,7 +307,7 @@ object OverlayUi {
         cat: String,
         income: Boolean,
         recorded: RecordedInfo?,
-        sig: String?
+        pageTs: Long
     ) {
         if (!Settings.canDrawOverlays(app)) {
             Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
@@ -454,8 +457,8 @@ object OverlayUi {
         try {
             wm.addView(v, params)
             card = v
-            // v2.24：记住这张卡属于哪一页账单，页面一切换就会被 keepIfSameBill 收掉
-            cardSig = sig
+            // v2.25：记住这张卡属于哪一页（页面付款时间），页面一换就被 bindPage 收掉
+            cardPageTs = if (pageTs > 0L) pageTs else 0L
             Diag.logCard(app, "卡片已 addView（通知同时已发）")
         } catch (e: Exception) {
             Diag.logCard(
