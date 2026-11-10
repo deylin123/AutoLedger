@@ -112,6 +112,19 @@ object OverlayUi {
     private var lastRecordedKey = ""
     private var lastRecordedAt = 0L
 
+    /**
+     * v2.24：屏幕上这张卡片属于哪一页账单。
+     *
+     * null 表示「这张卡不归页面扫描管」（通知通道发的卡），不会被页面切换收掉。
+     * 非空是页面扫描给的账单指纹（金额 + 页面付款时间）。
+     *
+     * 为什么需要它：卡片原来只按「自己 45 秒超时」消失，页面切到另一笔账单时不收。
+     * 实测（v2.23，微信/支付宝账单核对）：11-07 那笔的「已记录」卡还挂着时翻到 11-04 的
+     * 另一笔，卡片仍在屏幕上显示的是 11-07 的商户与入账时间 —— 读起来就是
+     * 「它把两天的账搞混了」。实际并没有记错，是旧卡没跟着页面走。
+     */
+    private var cardSig: String? = null
+
     private var cancelledAmount = -1.0
     private var cancelledAt = 0L
 
@@ -130,8 +143,14 @@ object OverlayUi {
      */
     fun resetDedup() {
         lastCardId = -1L
-        lastRecordedKey = ""
-        lastRecordedAt = 0L
+        // v2.24：**不再清空「已记录」去重键**。
+        //
+        // 实测日志（v2.23，13:27:44 与 13:27:45）：同一笔 #22 ¥1.0 在 1 秒内弹了两张
+        // 「已记录」卡，随后一秒才打出「跳过重复（1447ms 内已提示过同一笔）」。
+        // 中间唯一能清空状态的动作就是本函数 —— 切到另一个已登记 App 再切回来、
+        // 或窗口状态抖动，都会把「已记录」键归零，于是同一笔立刻又能弹一次。
+        // 现在这个键只由它自己的 [RECORDED_DEDUP_MS] 时间窗管理：
+        // 页面静止时不重弹，离开超过 1 分钟再回来看才重新提示，行为是可预期的。
         // v2.22：新窗口 = 新页面，允许对同一笔重新给出提示（用户重新打开账单核对属于新场景）
         handledId = -1L
         handledAt = 0L
@@ -182,12 +201,35 @@ object OverlayUi {
         } catch (_: Exception) {
         }
         card = null
+        cardSig = null
+    }
+
+    /**
+     * v2.24：页面上的这一笔如果已经不是屏幕上那张卡的账单，立刻收掉旧卡。
+     *
+     * 由无障碍服务在**识别出本页账单身份之后、任何闸门返回之前**调用，
+     * 所以「被 2 秒同额闸拦掉」「被取消抑制拦掉」「识别到已记录」这些不弹新卡的路径
+     * 同样会执行到 —— 这正是旧版残留卡片的场景：本页没有弹新卡，旧卡就一直挂着。
+     *
+     * 用「金额 + 页面付款时间」作指纹而不是整页文本：账单页滚动/重绘/加载
+     * （「更多」「立即领取」这类动态内容）都会改变整页文本，用它做指纹会把
+     * 用户正在看的卡误收掉；而这两项在同一笔账单上恒定、换一笔必然变化。
+     */
+    fun keepIfSameBill(sig: String) {
+        val v = card ?: return
+        val cur = cardSig ?: return   // 这张卡由通知通道发出，不归页面扫描管
+        if (cur == sig) return
+        Diag.logCard(v.context, "收掉上一页残留的卡片（旧页 $cur → 本页 $sig）")
+        handler.removeCallbacks(hideTask)
+        removeCard()
     }
 
     /**
      * 呈现一笔账单：先发通知栏提醒（可靠通道），再尝试悬浮卡片。
      *
      * @param recorded 非空表示这一笔已经在账本里，卡片走「已记录」样式，不写库、不重复响铃。
+     * @param sig 页面扫描给出的账单指纹（金额 + 页面付款时间），用于「换页就收掉旧卡」；
+     *            通知通道不传，表示这张卡不跟页面绑定，只按自身超时消失。
      * @return true 表示本次已处理（含「命中去重被跳过」）
      */
     fun show(
@@ -197,7 +239,8 @@ object OverlayUi {
         note: String,
         cat: String,
         income: Boolean,
-        recorded: RecordedInfo? = null
+        recorded: RecordedInfo? = null,
+        sig: String? = null
     ): Boolean {
         val app = ctx.applicationContext
         val now = System.currentTimeMillis()
@@ -245,7 +288,7 @@ object OverlayUi {
         // 通道二：悬浮卡片。addView 必须在主线程。
         handler.post {
             try {
-                buildCard(app, id, amount, note, cat, income, recorded)
+                buildCard(app, id, amount, note, cat, income, recorded, sig)
             } catch (e: Exception) {
                 Diag.logCard(app, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
@@ -260,7 +303,8 @@ object OverlayUi {
         note: String,
         cat: String,
         income: Boolean,
-        recorded: RecordedInfo?
+        recorded: RecordedInfo?,
+        sig: String?
     ) {
         if (!Settings.canDrawOverlays(app)) {
             Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
@@ -358,7 +402,12 @@ object OverlayUi {
                 try {
                     app.startActivity(
                         Intent(app, PendingActivity::class.java)
-                            .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            // v2.24：CLEAR_TOP + SINGLE_TOP，复用已有待确认页而不是再叠一层
+                            .setFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            )
                             .putExtra("focus", id)
                     )
                 } catch (_: Exception) {
@@ -405,6 +454,8 @@ object OverlayUi {
         try {
             wm.addView(v, params)
             card = v
+            // v2.24：记住这张卡属于哪一页账单，页面一切换就会被 keepIfSameBill 收掉
+            cardSig = sig
             Diag.logCard(app, "卡片已 addView（通知同时已发）")
         } catch (e: Exception) {
             Diag.logCard(
@@ -459,7 +510,11 @@ object OverlayUi {
             val pi = PendingIntent.getActivity(
                 app, id.toInt(),
                 Intent(app, PendingActivity::class.java)
-                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .setFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
                     .putExtra("focus", id),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )

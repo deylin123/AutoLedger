@@ -170,13 +170,22 @@ class BillAccessibilityService : AccessibilityService() {
     private var lastAmount = -1.0
     private var lastAmountAt = 0L
 
+    /**
+     * v2.24：上一次「已判定/已入库」的账单指纹（金额 + 页面付款时间）。
+     *
+     * 防抖原来只看「金额 + 2 秒」，是全局状态：在 A 笔（¥15.00）页面上扫过之后
+     * 立刻翻到 B 笔（也是 ¥15.00）的页面，B 会被当作 A 的重扫直接吞掉。
+     * 加上指纹之后，防抖只在「同一页的同一笔」上生效。
+     */
+    private var lastBillSig = ""
+
     private val suspectLogged = HashMap<String, Long>()
     private val skipLogged = HashMap<String, Long>()
     private val labelCache = HashMap<String, String>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.23 凭证页修复版）")
+        Diag.log(this, "无障碍服务已连接（v2.24 卡片跟随页面版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -299,7 +308,14 @@ class BillAccessibilityService : AccessibilityService() {
             }
             if (groups.isEmpty() && registered) {
                 // 微信 H5/小程序常见：这一刻页面还没渲染出可读文本，交给节拍器继续试
-                logSkip("$pkg#nodata", "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试")
+                // v2.24：把当前实际的窗口清单一起打出来。
+                // 旧日志只有「未读到本 App 的窗口文本」一句，无法区分两种情况：
+                //   ① App 已经不在前台（用户切走了）—— 正常，不必处理；
+                //   ② App 就在前台，但窗口内容对无障碍不可见 —— 这才是真的读不到。
+                // 这两种的处置完全不同，日志里必须能直接看出来。
+                val inv = winInventory()
+                logSkip("$pkg#nodata#$inv",
+                    "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试｜当前窗口：$inv")
             }
 
             // v2.17：内容指纹节流 —— 同一屏文字在 [SAME_SIG_SKIP_MS] 内只判一次。
@@ -358,7 +374,15 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             // 门槛不能太高：支付宝付款结果页这类页面往往只有「支付成功」「¥32.50」「完成」两三条文本，
             // 卡在 3 条会整页读不到。
-            if (texts.size < 2) return false
+            if (texts.size < 2) {
+                // v2.24：这条旧版是静默返回 —— 日志里连一行都没有，
+                // 用户看到的就是「页面明明开着，它一声不响」。现在落一条，带现场文本。
+                if (PayApps.of(pkg) != null) {
+                    logSkip("$pkg#tiny#${texts.hashCode()}",
+                        "${appLabel(pkg)} → 跳过：本窗口只读到 ${texts.size} 条文本（WebView/自绘页面没把内容挂进无障碍树时就是这样）｜${texts.joinToString("/").take(120)}")
+                }
+                return false
+            }
             // 排除本应用自己的界面（明细/待确认里的文字）
             if (texts.any { it.contains("自动记账") || it.contains("本月预算") }) return false
 
@@ -546,6 +570,16 @@ class BillAccessibilityService : AccessibilityService() {
         // 8 秒会误杀「几秒内连续发生的两笔同额消费」（连续测试时尤其明显）。
         val now = System.currentTimeMillis()
 
+        // v2.24：给「这一页是哪一笔」一个指纹，卡片靠它跟页面绑定。
+        // 只用金额 + 页面付款时间：账单页滚动、加载、动态内容都不会改变这两项，
+        // 换一笔账单则必然变化。页面没有绝对时间（支付现场页）时退化为「live|金额」。
+        val pageSig = if (pageTs != null) "b|$amount|$pageTs" else "live|$amount"
+        // 屏幕上如果还挂着上一笔的卡片，这里就地收掉。
+        // 实测（v2.23 截图）：11-07 那笔的「已记录」卡还挂着时翻到 11-04 的另一笔，
+        // 卡上仍显示 11-07 的商户与入账时间，看起来就像「把两天的账搞混了」。
+        // 放在闸门之前，所以「被 2 秒同额闸/取消闸拦掉、本页不弹新卡」的路径也能收掉旧卡。
+        OverlayUi.keepIfSameBill(pageSig)
+
         val db = DbHelper(this)
         try {
             // 一笔支付只允许落一条记录。
@@ -567,8 +601,11 @@ class BillAccessibilityService : AccessibilityService() {
                     // 这段刻意放在「2 秒同额闸 / 取消抑制闸」之前：
                     // 用户翻历史账单核对，和「刚记完一笔又被重扫」是两件事，不能被防抖挡掉。
                     // 走这条分支不写库、不发通知提醒，因此不会产生重复记录，也不会反复响铃。
-                    lastAmount = amount
-                    lastAmountAt = now
+                    //
+                    // v2.24：**不再更新 lastAmount / lastAmountAt**。
+                    // 那两项是给「要新入库」的路径防抖用的；在这里写一次，等于让
+                    // 「刚看过的 11-07 那笔 15.00」把「接下来 11-04 那笔 15.00」的入库挡掉 2 秒 ——
+                    // 跨页面共享了这个状态，是实打实的串页污染。
                     Diag.log(
                         this,
                         "$appName ¥$amount → 已在账本 #${prev.id}（${prev.cat}），弹「已记录」提示，不重复记账"
@@ -580,7 +617,8 @@ class BillAccessibilityService : AccessibilityService() {
                         prev.note,
                         prev.cat,
                         prev.type == 1,
-                        OverlayUi.RecordedInfo(prev.ts, prev.cat, 1)
+                        OverlayUi.RecordedInfo(prev.ts, prev.cat, 1),
+                        pageSig
                     )
                     return true
                 }
@@ -591,6 +629,7 @@ class BillAccessibilityService : AccessibilityService() {
                     db.updateRecordFull(prev.id, amount, type, cat, merged, ts, 0)
                     lastAmount = amount
                     lastAmountAt = now
+                    lastBillSig = pageSig
                     Diag.log(
                         this,
                         "$appName ¥$amount（${if (income) "收入" else "支出"}）→ 同一笔已合并到待确认 #${prev.id}（$cat）"
@@ -599,7 +638,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
                     // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
                     // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
-                    showCard(prev.id, amount, merged, cat, income)
+                    showCard(prev.id, amount, merged, cat, income, pageSig)
                     return true
                 }
             }
@@ -608,7 +647,14 @@ class BillAccessibilityService : AccessibilityService() {
             // 下面两道闸只作用于「要新入库」的路径 —— 已入账的核对提示不该被它们挡住（见上）。
             // v2.17：同额闸从 8 秒收紧到 2 秒，同屏重复扫描已由内容指纹节流挡住，
             // 8 秒会误杀「几秒内连续发生的两笔同额消费」（连续测试时尤其明显）。
-            if (amount == lastAmount && now - lastAmountAt < 2000) return false
+            //
+            // v2.24：加「同一页」这个条件。旧版是全局的「金额 + 2 秒」，
+            // 刚在 11-07 那笔 15.00 的页面上扫完，立刻翻到 11-04 的另一笔 15.00，
+            // 会被当成「刚才那一笔的重扫」直接吞掉 —— 两笔不同账单串成同一笔。
+            if (amount == lastAmount && pageSig == lastBillSig && now - lastAmountAt < 2000) {
+                logSkip("$pkg#debounce#$pageSig", "$appName ¥$amount → 跳过：同页同额 ${now - lastAmountAt}ms 内已判定过一次（防抖）")
+                return false
+            }
             // 用户明确取消过的笔：5 分钟内页面再触发扫描也不重复弹/记。
             // 不加这道闸，取消后留在账单详情页随手一划，同笔会重新入库再弹一次。
             if (OverlayUi.isCancelledRecently(amount)) {
@@ -625,11 +671,12 @@ class BillAccessibilityService : AccessibilityService() {
             if (id <= 0) return false
             lastAmount = amount
             lastAmountAt = now
+            lastBillSig = pageSig
             Diag.log(
                 this,
                 "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
-            showCard(id, amount, note, cat, income)
+            showCard(id, amount, note, cat, income, pageSig)
             return true
         } finally {
             db.close()
@@ -705,7 +752,16 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             val root = rootInActiveWindow
             val rp = root?.packageName?.toString()
-            if (root != null && (rp == null || rp == pkg || rp == packageName)) {
+            // v2.24：**本应用自己的窗口必须排除**。
+            //
+            // v2.23 这里写的是 `rp == pkg || rp == packageName`，等于把自家的
+            // 「日常账本 / 抓取诊断 / 导出完成」当成被扫 App 的页面送进闸门链。
+            // 实测日志（v2.23，13:29:20）：
+            //   微信 → 跳过：页面没有账单标题特征｜本页：日常账本 ·↓/2026年11月/±支出/¥854.46/…
+            // 危害有三：① 诊断日志被自家页面刷满，微信真正的现场被挤掉；
+            // ② 自家明细页上就有「支出 ¥159.55」这类金额，一旦某次凑齐标题词就会误记账；
+            // ③ 用户看到的「微信在读我的账本」完全是假象，误导排查方向。
+            if (root != null && rp != packageName && (rp == null || rp == pkg)) {
                 val set = LinkedHashSet<String>()
                 collect(root, set)
                 if (set.isNotEmpty()) {
@@ -736,6 +792,30 @@ class BillAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {
         }
         return out
+    }
+
+    /**
+     * v2.24：把「这一刻系统实际交给我们哪些窗口」写进诊断。
+     *
+     * 微信读不到内容时，必须先分清是「微信不在前台」还是「微信在前台但窗口不可见」，
+     * 否则就会像前几轮一样在代码里反复猜。活动窗口用 * 标出。
+     */
+    private fun winInventory(): String {
+        return try {
+            val ws = windows
+            if (ws == null || ws.isEmpty()) {
+                val rp = rootInActiveWindow?.packageName?.toString()
+                "无窗口列表（活动窗口=${rp ?: "空"}）"
+            } else {
+                ws.mapNotNull { w ->
+                    if (w == null) return@mapNotNull null
+                    val p = try { w.root?.packageName?.toString() } catch (_: Exception) { null }
+                    (if (w.isActive) "*" else "") + (p ?: "(无内容)")
+                }.distinct().joinToString(",").take(150)
+            }
+        } catch (e: Exception) {
+            "窗口列表读取失败(${e.javaClass.simpleName})"
+        }
     }
 
     private fun collect(node: AccessibilityNodeInfo?, out: MutableSet<String>) {
@@ -799,8 +879,8 @@ class BillAccessibilityService : AccessibilityService() {
      * 剥离原因：卡片窗口是 TYPE_APPLICATION_OVERLAY，只需要悬浮窗权限，技术上不依赖无障碍服务。
      * 旧版写在这里，导致无障碍一关（银行 App 要求）两条通道都不弹卡。
      */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean) {
-        OverlayUi.show(this, id, amount, note, cat, income)
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, sig: String? = null) {
+        OverlayUi.show(this, id, amount, note, cat, income, null, sig)
     }
 
     override fun onInterrupt() {}

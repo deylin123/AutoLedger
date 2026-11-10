@@ -106,7 +106,12 @@ class PageDetail(private val act: MainActivity) {
             val t = Ui.tv(c, "有 $pend 笔自动抓取的消费待确认", 13f, Ui.ORANGE_DEEP, true)
             banner.addView(t, Ui.lp(0, Ui.WC, 1f))
             banner.addView(Ui.tv(c, "去确认 ›", 13f, Ui.ORANGE_DEEP))
-            banner.setOnClickListener { act.startActivity(Intent(act, PendingActivity::class.java)) }
+            banner.setOnClickListener {
+                act.startActivity(
+                    Intent(act, PendingActivity::class.java)
+                        .setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                )
+            }
             val bp = Ui.lp(Ui.MP, Ui.WC)
             bp.leftMargin = Ui.dp(c, 14f)
             bp.rightMargin = Ui.dp(c, 14f)

@@ -96,7 +96,10 @@ class PageMine(private val act: MainActivity) {
         val pend = act.db().pendingCount()
         autoCard.addView(
             rowItem("待确认账单", if (pend > 0) "$pend 笔" else "无") {
-                act.startActivity(Intent(act, PendingActivity::class.java))
+                act.startActivity(
+                    Intent(act, PendingActivity::class.java)
+                        .setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                )
             }
         )
         // v2.20：通道定位调整。通知监听是主通道（不依赖无障碍，银行 App 不拦）；

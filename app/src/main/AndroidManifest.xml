@@ -19,9 +19,18 @@
             </intent-filter>
         </activity>
 
+        <!--
+          v2.24：singleTop 修「点「全部确认」后要按很多次返回才回到主界面」。
+          卡片「改分类」和每条通知都是带 FLAG_ACTIVITY_NEW_TASK 起这个页面的；
+          系统按「任务的根 Activity」匹配已有任务，而本 App 任务的根是 MainActivity，
+          永远匹配不上 PendingActivity，于是每点一次就往同一个任务里再叠一个实例。
+          记了几笔就有几层，全部确认后要一层一层按返回。
+          singleTop 让它在栈顶时复用（onNewIntent），配合启动方的 CLEAR_TOP 兜住不在栈顶的情况。
+        -->
         <activity
             android:name=".PendingActivity"
-            android:exported="false" />
+            android:exported="false"
+            android:launchMode="singleTop" />
 
         <service
             android:name=".BillAccessibilityService"

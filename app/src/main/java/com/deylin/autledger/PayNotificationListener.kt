@@ -196,7 +196,11 @@ class PayNotificationListener : NotificationListenerService() {
         val pi = PendingIntent.getActivity(
             this, id.toInt(),
             Intent(this, PendingActivity::class.java)
-                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .setFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
                 .putExtra("focus", id),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )

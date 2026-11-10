@@ -60,6 +60,17 @@ class PendingActivity : Activity() {
         load()
     }
 
+    /**
+     * v2.24：singleTop + CLEAR_TOP 之后，重复点通知/改分类会走这里而不是再叠一个实例。
+     * 必须手动把 focus 换成新那一笔并重载列表，否则页面还停在上一笔上。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        focusId = intent.getLongExtra("focus", 0L)
+        load()
+    }
+
     private fun load() {
         var list: List<Rec> = ArrayList()
         var total = -1
