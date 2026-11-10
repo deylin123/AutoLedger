@@ -1,6 +1,7 @@
 package com.deylin.autledger
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -86,6 +87,17 @@ class BillAccessibilityService : AccessibilityService() {
         private const val SCROLL_THROTTLE = 800L
 
         /**
+         * v2.26：事件自带节点树（event.source）文本缓存的有效期。
+         *
+         * 页面活着的时候事件持续来、缓存持续刷新；超过这个时长没事件，
+         * 说明页面已经静止或用户已切走，缓存里的内容不再可信。
+         */
+        private const val EV_TEXTS_TTL = 6_000L
+
+        /** event.source 采集本身的最短间隔（防窗口加载期事件风暴把主线程走树走满） */
+        private const val EV_CACHE_MIN_GAP = 500L
+
+        /**
          * v2.16：同一笔卡片的去重窗口。
          * 旧逻辑是「同一 id 永不重弹」，用户重新打开同一笔账单时只响通知、不弹卡 ——
          * 观感上就是「有时弹有时不弹」。现在改为：进入新页面允许重弹，但 5 秒内不重复闪。
@@ -162,9 +174,24 @@ class BillAccessibilityService : AccessibilityService() {
     /** 本代次已成功抓取，后续重试不再执行 */
     private var hitToken = -1
 
-    private var lastContentAt = 0L
+    // v2.26：节流改按包名计。原来是全局一个时间戳 —— 桌面/输入法抛一次内容变化，
+    // 就把微信接下来 700ms 内的续期机会全部吃掉，节拍器在关键时刻断粮。
+    private val lastContentAt = HashMap<String, Long>()
     private var lastLadderAt = 0L
-    private var lastScrollAt = 0L
+    private val lastScrollAt = HashMap<String, Long>()
+
+    /**
+     * v2.26：事件自带节点树（event.source）的文本缓存。
+     *
+     * 微信账单详情常在**非活动窗口**里（聊天窗在前、账单窗在后），MIUI 上
+     * `getWindows()` 非活动窗口的 root 经常返回 null（尤其服务被系统重建后
+     * XML flags 不生效时）—— 页面文本靠窗口 API 一条都取不到。
+     * 而事件本身带着 source 节点：事件能送到，那棵树就在事件里。
+     * 这是窗口 API 失效时唯一还活着的取数路径，必须接住。
+     */
+    private var evTexts: ArrayList<String>? = null
+    private var evTextsPkg: String? = null
+    private var evTextsAt = 0L
 
     /** v2.17 节拍器状态：当前轮询的包名与剩余拍数 */
     private var pollPkg: String? = null
@@ -194,7 +221,23 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Diag.log(this, "无障碍服务已连接（v2.25 页面绑定版）")
+        // v2.26：服务被 MIUI 回收重建后，XML 里的 accessibilityFlags 可能不生效
+        // （OEM 已知问题），表现就是「以前能读账单页、突然整页读不到」。
+        // FLAG_RETRIEVE_INTERACTIVE_WINDOWS 不生效时，getWindows() 里**非活动窗口**的
+        // root 一律返回 null —— 而微信账单详情恰恰常挂在非活动窗口（聊天窗在前、
+        // 账单窗在后），于是整页没文本、走不到任何闸门，看起来就是「不弹窗」。
+        // 这里运行时强制补设，两个 flag 都要。
+        try {
+            val si = serviceInfo
+            if (si != null) {
+                si.flags = si.flags or
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                    AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
+                serviceInfo = si
+            }
+        } catch (_: Exception) {
+        }
+        Diag.log(this, "无障碍服务已连接（v2.26 窗口读取加固版）")
     }
 
     // ---------------- 事件分派 ----------------
@@ -207,6 +250,21 @@ class BillAccessibilityService : AccessibilityService() {
         // v2.16/2.17：本阶段停用的平台（淘宝/京东/拼多多等）在入口就返回，
         // 不为它们起节拍器、不做任何读屏，彻底「屏蔽已有逻辑」。
         if (PayApps.isDisabledPkg(pkg)) return
+
+        // v2.26：后台噪声闸。微信收消息、服务通知在**后台**也会抛内容变化/滑动事件，
+        // 它们会把节拍器抢到 mm 上、对着后台空窗口空转 12.6 秒 —— 13:28:08 / 13:29:08
+        // 那两条「mm → 本次未读到本 App 的窗口文本」就是这么来的，期间用户根本不在微信。
+        // 只有「活动窗口**明确**是别的 App」才拦；rootInActiveWindow 读不到（null）时放行，
+        // 宁可多扫一轮，不能把真前台的微信误判成后台。
+        // 只对已登记的支付类 App 判前台（rootInActiveWindow 是一次 binder 查询，
+        // 桌面/输入法事件量大，没必要为它们付这个开销）。
+        val bg = PayApps.of(pkg) != null && isOtherAppForeground(pkg)
+        if (bg && pollPkg == pkg) {
+            // 明确已经切走了：停掉这个包的节拍器，别再对着后台空窗口空转
+            handler.removeCallbacks(pollTick)
+            pollPkg = null
+            pollLeft = 0
+        }
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
@@ -226,11 +284,13 @@ class BillAccessibilityService : AccessibilityService() {
                 // 窗口状态变化（日志里 com.iflytek.inputmethod.miui / com.miui.home 极频繁），
                 // 若把它们算作「换 App」，在支付宝账单页弹一下输入法就会清空去重状态，
                 // 同一笔又能立刻重弹一次 —— 等于白改。
-                if (PayApps.of(pkg) != null && pkg != lastWinPkg) {
+                // v2.26 再加一道：后台来的窗口事件不清（微信后台消息窗弹出也算窗口变化）。
+                if (PayApps.of(pkg) != null && pkg != lastWinPkg && !bg) {
                     lastWinPkg = pkg
                     OverlayUi.resetDedup()
                 }
                 burstToken++
+                cacheEventSource(pkg, event)
                 // 立刻扫一次（post 到主线程队列，不阻塞事件回调——微信加载期窗口事件很密），
                 // 再交给节拍器兜住后续渲染
                 val tok = burstToken
@@ -239,9 +299,11 @@ class BillAccessibilityService : AccessibilityService() {
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (bg) return
                 val now = System.currentTimeMillis()
-                if (now - lastContentAt < CONTENT_THROTTLE) return
-                lastContentAt = now
+                if (now - (lastContentAt[pkg] ?: 0L) < CONTENT_THROTTLE) return
+                lastContentAt[pkg] = now
+                cacheEventSource(pkg, event)
                 // v2.17：不再用 burstToken 作废任务。微信加载期会连续抛窗口状态变化，
                 // 「作废」机制会让扫描永远赶不上渲染完成 —— 这是时有时无的根因。
                 // 改为「有事件就续期节拍器」，扫描节奏与事件时机解耦。
@@ -250,9 +312,11 @@ class BillAccessibilityService : AccessibilityService() {
 
             // 滑动事件：微信 H5/小程序账单页首次渲染常在滑动之后才把金额挂进无障碍树。
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                if (bg) return
                 val now = System.currentTimeMillis()
-                if (now - lastScrollAt < SCROLL_THROTTLE) return
-                lastScrollAt = now
+                if (now - (lastScrollAt[pkg] ?: 0L) < SCROLL_THROTTLE) return
+                lastScrollAt[pkg] = now
+                cacheEventSource(pkg, event)
                 ensurePoll(pkg)
             }
         }
@@ -298,6 +362,70 @@ class BillAccessibilityService : AccessibilityService() {
         }
     }
 
+    // ---------------- v2.26：前台判定 / 事件源取数 ----------------
+
+    /**
+     * 活动窗口**明确**是别的 App（含桌面、自家界面）时返回 true。
+     *
+     * 只在能明确认定时才拦：rootInActiveWindow 读不到（null）一律放行 ——
+     * 微信读不到窗口内容恰恰是本次要修的问题，不能用「读不到」反过来把微信拦掉。
+     * 自家窗口（packageName）也放行：悬浮卡片/自家界面可能是活动窗口时，
+     * 真正的前台 App 往往就在下面一层，拦掉就等于把该修的场景亲手堵死。
+     */
+    private fun isOtherAppForeground(pkg: String): Boolean {
+        val rp = try {
+            rootInActiveWindow?.packageName?.toString()
+        } catch (_: Exception) {
+            null
+        }
+        return rp != null && rp != pkg && rp != packageName
+    }
+
+    /**
+     * v2.26 核心：把事件自带的节点树（event.source）采集进缓存。
+     *
+     * 窗口 API（getWindows / rootInActiveWindow）在 MIUI 上会「事件照发、窗口 root 返回 null」，
+     * 尤其微信账单详情挂在非活动窗口时。事件能送到就说明 source 节点存在 ——
+     * 从 source 往上走到该窗口的根，整页文本都在里面，绕开窗口 API 的限制。
+     *
+     * 必须在事件回调里**同步**采集：事件一出回调，source 节点就可能被回收。
+     */
+    private fun cacheEventSource(pkg: String, event: AccessibilityEvent) {
+        if (PayApps.of(pkg) == null) return   // 只为已登记支付类 App 采集，别家不花这个开销
+        val now = System.currentTimeMillis()
+        if (pkg == evTextsPkg && now - evTextsAt < EV_CACHE_MIN_GAP) return
+        try {
+            val src = event.source ?: return
+            val set = LinkedHashSet<String>()
+            // ① 从 source 沿 parent 走到本窗口的根，拿整页
+            var root = src
+            var p = root.parent
+            var hops = 0
+            while (p != null && hops < 40) {
+                root = p
+                p = root.parent
+                hops++
+            }
+            collect(root, set)
+            // ② 根树太小（WebView 虚拟节点树还没建好）就退回事件子树本身
+            if (set.size < 2) collect(src, set)
+            if (set.isNotEmpty()) {
+                evTexts = ArrayList(set)
+                evTextsPkg = pkg
+                evTextsAt = now
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 取出未过期的事件源文本（[EV_TEXTS_TTL] 内、且属于本包） */
+    private fun takeEventTexts(pkg: String): ArrayList<String>? {
+        val t = evTexts ?: return null
+        if (evTextsPkg != pkg) return null
+        if (System.currentTimeMillis() - evTextsAt > EV_TEXTS_TTL) return null
+        return t
+    }
+
     // ---------------- 扫描 ----------------
 
     /** 一个窗口里读到的同包文本（v2.16）。active = 活动窗口 */
@@ -306,7 +434,30 @@ class BillAccessibilityService : AccessibilityService() {
     private fun runScan(pkg: String, token: Int) {
         try {
             val foreign = LinkedHashSet<String>()
-            val groups = grabGroups(pkg, foreign)
+            val groups = grabGroups(pkg, foreign).toMutableList()
+
+            // v2.26：把事件自带节点树的文本并进判定组。
+            //
+            // 这是本次「微信不弹窗」的核心修复：窗口 API 读不到内容时（13:30 日志
+            // 「mm → 本次未读到本 App 的窗口文本」），事件 source 是唯一还活着的取数路径。
+            // 事件源文本排在最前（active=true）——事件来自哪棵子树，哪棵就是当前真正变化的
+            // 窗口，比 rootInActiveWindow 猜「谁在前」更准。与窗口组文本重复时自动去重。
+            val ev = takeEventTexts(pkg)
+            if (ev != null) {
+                val evSig = ev.joinToString("\u0001")
+                val dup = groups.any { it.texts.joinToString("\u0001") == evSig }
+                if (!dup) {
+                    val saved = groups.isEmpty()
+                    groups.add(0, PageGroup(ArrayList(ev), true))
+                    if (saved) {
+                        // 窗口组本来是空的、全靠事件源救回来 —— 留一行证据，下次排查不用猜
+                        logSkip(
+                            "$pkg#evsrc#${ev.size}",
+                            "${appLabel(pkg)} → 窗口 API 未取到页面文本，改用事件源文本（${ev.size} 条）"
+                        )
+                    }
+                }
+            }
             // v2.19：未登记的 App（桌面/输入法/智能助理/安全服务…）不写这两类日志。
             // 旧版它们在用户测试期间刷了几十条，「最近 40 条」里真正有价值的支付宝/微信记录被整屏挤掉。
             val registered = PayApps.of(pkg) != null
