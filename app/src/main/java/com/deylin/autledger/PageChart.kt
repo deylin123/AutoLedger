@@ -111,8 +111,11 @@ class PageChart(private val act: MainActivity) {
         // ---- 分类排行 ----
         val card2 = Ui.card(c, 14f, 6f)
         val title = Ui.tv(c, if (type == 0) "支出排行" else "收入排行", 13.5f, Ui.TEXT, true)
-        title.setPadding(0, Ui.dp(c, 6f), 0, Ui.dp(c, 8f))
+        title.setPadding(0, Ui.dp(c, 6f), 0, 0)
         card2.addView(title)
+        val hint = Ui.tv(c, "点击类别查看明细", 10.5f, Ui.SUB)
+        hint.setPadding(0, 0, 0, Ui.dp(c, 6f))
+        card2.addView(hint)
         if (slices.isEmpty()) {
             val t = Ui.tv(c, "本月还没有记录", 12.5f, Ui.SUB)
             t.setPadding(0, Ui.dp(c, 14f), 0, Ui.dp(c, 16f))
@@ -180,6 +183,12 @@ class PageChart(private val act: MainActivity) {
         val tp = Ui.lp(Ui.MP, Ui.dp(c, 6f))
         tp.topMargin = Ui.dp(c, 7f)
         col.addView(track, tp)
+        // v2.28：点这一类 → 跳到明细页按该类别筛选
+        col.setOnClickListener {
+            act.filterCat = p.first
+            act.filterType = type
+            act.show(0)
+        }
         return col
     }
 }

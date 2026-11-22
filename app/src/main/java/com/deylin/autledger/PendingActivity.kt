@@ -158,7 +158,14 @@ class PendingActivity : Activity() {
             .setItems(names.toTypedArray()) { _, w ->
                 val cat = cats[w].name
                 helper.updateRecord(r.id, r.amount, cat, r.note, r.ts, r.status)
-                Toast.makeText(this, "已改为：" + cat, Toast.LENGTH_SHORT).show()
+                // v2.28：商户分类记忆 —— 用户为该商户手动改了分类，
+                // 下次识别到同一商户直接默认到这个类别，只需确认
+                if (cat != r.cat && DbHelper.isLearnableMerchant(r.note)) {
+                    helper.rememberMerchantCat(r.note, cat)
+                    Toast.makeText(this, "已改为：$cat（该商户以后默认此分类）", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "已改为：" + cat, Toast.LENGTH_SHORT).show()
+                }
                 load()
             }
             .setNegativeButton("取消", null)

@@ -243,7 +243,8 @@ object OverlayUi {
         cat: String,
         income: Boolean,
         recorded: RecordedInfo? = null,
-        pageTs: Long = 0L
+        pageTs: Long = 0L,
+        remembered: Boolean = false
     ): Boolean {
         val app = ctx.applicationContext
         val now = System.currentTimeMillis()
@@ -291,7 +292,7 @@ object OverlayUi {
         // 通道二：悬浮卡片。addView 必须在主线程。
         handler.post {
             try {
-                buildCard(app, id, amount, note, cat, income, recorded, pageTs)
+                buildCard(app, id, amount, note, cat, income, recorded, pageTs, remembered)
             } catch (e: Exception) {
                 Diag.logCard(app, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
@@ -307,7 +308,8 @@ object OverlayUi {
         cat: String,
         income: Boolean,
         recorded: RecordedInfo?,
-        pageTs: Long
+        pageTs: Long,
+        remembered: Boolean
     ) {
         if (!Settings.canDrawOverlays(app)) {
             Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
@@ -368,7 +370,8 @@ object OverlayUi {
             // ---- 新记录 / 待确认模式：原有行为 ----
             tvHead.text = if (income) "自动识别到收入" else "自动识别到消费"
             tvHead.setTextColor(Ui.SUB)
-            tvCat.text = "分类：" + cat
+            // v2.28：商户记忆命中时明确告诉用户「这是按你的习惯填的，确认即可」
+            tvCat.text = if (remembered) "分类：$cat（按你的习惯，确认即可）" else "分类：" + cat
             tvCat.setTextColor(Ui.SUB)
 
             btnCancel.setOnClickListener {
@@ -419,7 +422,13 @@ object OverlayUi {
             btnOk.setOnClickListener {
                 try {
                     val db = DbHelper(app)
-                    db.updateRecord(id, amount, cat, note, System.currentTimeMillis(), 1)
+                    // v2.28：确认时保留入库时的原始时间，不再用「现在」覆盖。
+                    // 旧版这里写 System.currentTimeMillis() —— 用户事后（哪怕几天后）
+                    // 点确认，这笔账的消费日期就被改写成确认时刻，
+                    // 这就是「记账日期不该以用户记录时间为基准」的确定来源。
+                    // 页面通道入库用页面付款时间、通知通道用通知时间，都保住。
+                    val keepTs = db.get(id)?.ts ?: System.currentTimeMillis()
+                    db.updateRecord(id, amount, cat, note, keepTs, 1)
                     db.close()
                 } catch (e: Exception) {
                     Diag.log(app, "确认记账失败：${e.javaClass.simpleName}")

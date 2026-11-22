@@ -28,6 +28,10 @@ class MainActivity : Activity() {
     var curY: Int = 0
     var curM: Int = 0
 
+    /** v2.28：图表排行点进来的分类筛选状态（null = 不筛选）；点「明细」tab 即清除 */
+    var filterCat: String? = null
+    var filterType: Int = 0
+
     var book: String = "日常账本"
         set(v) {
             field = v
@@ -94,6 +98,11 @@ class MainActivity : Activity() {
                 when (i) {
                     2 -> PageEntry(this).show(null)
                     3 -> show(2)
+                    0 -> {
+                        // 直接点「明细」= 清除图表带来的分类筛选
+                        filterCat = null
+                        show(0)
+                    }
                     else -> show(i)
                 }
             }

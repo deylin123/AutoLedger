@@ -24,10 +24,23 @@ data class Rec(
 data class CatDef(val id: Long, val name: String, val emoji: String, val type: Int)
 
 class DbHelper(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 6) {
+    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 7) {
 
     companion object {
         val COLS = arrayOf("id", "amount", "type", "cat", "note", "ts", "book", "status", "src")
+
+        /**
+         * v2.28：商户名是否值得记忆/匹配。
+         * 自动回落的兜底名（"微信消费""支付宝收入"）不是真商户，不学也不配，
+         * 否则一条记忆会把全部同名兜底账带偏到同一个类别。
+         * 备注形如「商户·商品」时只取商户段做键。
+         */
+        fun isLearnableMerchant(raw: String): Boolean {
+            val m = raw.trim().substringBefore('·').trim()
+            if (m.length < 2 || m.length > 24) return false
+            if (m.endsWith("消费") || m.endsWith("收入")) return false
+            return true
+        }
 
         fun monthStart(y: Int, m: Int): Long {
             val c = Calendar.getInstance()
@@ -45,14 +58,23 @@ class DbHelper(context: Context) :
         seed(db)
     }
 
+    /**
+     * v2.28：改为**增量升级**。
+     *
+     * 旧版 onUpgrade 无条件 DROP 全部表再重建 —— 用户覆盖安装新版后，
+     * 所有记账数据会被直接清空。这个雷不能留：以后新增表/列一律走
+     * 「CREATE TABLE IF NOT EXISTS」补建（makeTables 全部如此），已有数据原样保留。
+     */
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        dropAll(db)
-        makeTables(db)
-        seed(db)
+        if (oldVersion < 7) {
+            // v7：新增商户分类记忆表 merchant_cats；缺哪张补哪张，不动已有数据
+            makeTables(db)
+            seed(db)
+        }
     }
 
     private fun dropAll(db: SQLiteDatabase) {
-        for (t in arrayOf("records", "cats", "books", "budgets")) {
+        for (t in arrayOf("records", "cats", "books", "budgets", "merchant_cats")) {
             db.execSQL("DROP TABLE IF EXISTS $t")
         }
     }
@@ -82,6 +104,13 @@ class DbHelper(context: Context) :
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS budgets(month TEXT NOT NULL,cat TEXT NOT NULL DEFAULT ''," +
                 "amount REAL NOT NULL,PRIMARY KEY(month,cat))"
+        )
+        // v2.28：商户分类记忆表
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS merchant_cats(" +
+                "merchant TEXT PRIMARY KEY," +
+                "cat TEXT NOT NULL," +
+                "updated_at INTEGER NOT NULL DEFAULT 0)"
         )
     }
 
@@ -200,7 +229,7 @@ class DbHelper(context: Context) :
         return null
     }
 
-    fun list(from: Long, to: Long, book: String, type: Int, onlyConfirmed: Boolean): List<Rec> {
+    fun list(from: Long, to: Long, book: String, type: Int, onlyConfirmed: Boolean, cat: String? = null): List<Rec> {
         val sb = StringBuilder("ts>=? AND ts<?")
         val args = arrayListOf(from.toString(), to.toString())
         if (book.isNotEmpty()) {
@@ -210,6 +239,11 @@ class DbHelper(context: Context) :
         if (type >= 0) {
             sb.append(" AND type=?")
             args.add(type.toString())
+        }
+        // v2.28：类别筛选（图表排行点进来用），null = 不过滤
+        if (!cat.isNullOrEmpty()) {
+            sb.append(" AND cat=?")
+            args.add(cat)
         }
         if (onlyConfirmed) sb.append(" AND status=1")
         val out = ArrayList<Rec>()
@@ -298,6 +332,28 @@ class DbHelper(context: Context) :
             "SELECT $cols FROM records WHERE amount=? AND abs(ts-?)<? ORDER BY abs(ts-?) ASC LIMIT 1",
             arrayOf(amount.toString(), ts.toString(), windowMs.toString(), ts.toString())
         ).use { c -> if (c.moveToFirst()) return read(c) }
+        return null
+    }
+
+    // ---------- 商户分类记忆（v2.28） ----------
+
+    /** 记住（或更新）某商户的惯用分类 */
+    fun rememberMerchantCat(merchant: String, cat: String) {
+        if (!isLearnableMerchant(merchant) || cat.isBlank()) return
+        val m = merchant.trim().substringBefore('·').trim()
+        writableDatabase.execSQL(
+            "INSERT OR REPLACE INTO merchant_cats(merchant,cat,updated_at) VALUES(?,?,?)",
+            arrayOf(m, cat, System.currentTimeMillis().toString())
+        )
+    }
+
+    /** 查某商户的惯用分类；没有或不可学习返回 null */
+    fun merchantCat(merchant: String): String? {
+        if (!isLearnableMerchant(merchant)) return null
+        val m = merchant.trim().substringBefore('·').trim()
+        readableDatabase.rawQuery(
+            "SELECT cat FROM merchant_cats WHERE merchant=? LIMIT 1", arrayOf(m)
+        ).use { if (it.moveToFirst()) return it.getString(0) }
         return null
     }
 

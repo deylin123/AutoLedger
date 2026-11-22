@@ -248,14 +248,14 @@ class BillAccessibilityService : AccessibilityService() {
                 }
                 Diag.log(
                     this,
-                    "无障碍服务已连接（v2.27 窗口读取加固版）｜flags=${si.flags} " +
+                    "无障碍服务已连接（v2.28 窗口缓存修复版）｜flags=${si.flags} " +
                         "eventTypes=${si.eventTypes} timeout=${si.notificationTimeout}"
                 )
             } else {
-                Diag.log(this, "无障碍服务已连接（v2.27 窗口读取加固版）｜serviceInfo=null，flags 无法核对")
+                Diag.log(this, "无障碍服务已连接（v2.28 窗口缓存修复版）｜serviceInfo=null，flags 无法核对")
             }
         } catch (e: Exception) {
-            Diag.log(this, "无障碍服务已连接（v2.27 窗口读取加固版）｜flags 核对异常 ${e.javaClass.simpleName}")
+            Diag.log(this, "无障碍服务已连接（v2.28 窗口缓存修复版）｜flags 核对异常 ${e.javaClass.simpleName}")
         }
     }
 
@@ -435,6 +435,22 @@ class BillAccessibilityService : AccessibilityService() {
     private fun cacheEventSource(pkg: String, event: AccessibilityEvent) {
         if (PayApps.of(pkg) == null) return   // 只为已登记支付类 App 采集，别家不花这个开销
         val now = System.currentTimeMillis()
+        // v2.28：窗口切换先丢弃旧缓存。
+        //
+        // v2.27 的「不比旧缓存更薄」规则有结构性缺陷：同一个微信里从聊天页跳进
+        // 账单详情（包名不变、缓存不换主），旧缓存是聊天窗口的几十条文本；
+        // 账单详情的节点树往往比聊天树更薄，新页面文本会被「更薄」规则一直拒绝 ——
+        // 轮询 12.6 秒全程拿聊天文本去判账单，自然一声不响；等缓存 TTL（15 秒）
+        // 过期、用户又恰好划了一下屏幕产生新事件，账单文本才进得来 ——
+        // 这正是「有时候能、有时候不能」的代码级成因（支付宝账单是稳定单 Activity，
+        // 不存在这条聊天→账单的换窗路径，所以一直稳）。
+        // 页面切换必然伴随 TYPE_WINDOW_STATE_CHANGED，在这一刻清缓存最可靠；
+        // 「更薄」规则要防的后台短消息走 CONTENT_CHANGED，不受影响。
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            evTexts = null
+            evTextsPkg = null
+            evTextsAt = 0L
+        }
         val alive = evTextsPkg == pkg && now - evTextsAt <= EV_TEXTS_TTL
         val prevN = if (alive) evTexts?.size ?: 0 else 0
         // v2.27：缓存还没成形时每次事件都采（金额一出现就进缓存）；
@@ -459,7 +475,10 @@ class BillAccessibilityService : AccessibilityService() {
                 // v2.27：只用「不比旧缓存更薄」的一屏覆盖。
                 // v2.26 是无条件覆盖 —— 后台一条短消息事件就能把已经读到的整页账单文本冲掉，
                 // 等节拍器下一拍来取时，缓存里只剩那一句短消息。
-                if (!alive || set.size >= prevN) {
+                // v2.28 补丁：**更薄但带金额**的一屏同样允许覆盖 —— 金额就是账单页的身份证，
+                // 金额一出现就允许进缓存，否则 H5 分段渲染下金额晚出时还是会被更厚的
+                // 旧骨架拦住。后台短消息（更薄且无金额）依旧被挡在门外，不冲掉整页账单。
+                if (!alive || set.size >= prevN || set.any { PayApps.hasAmountIn(it) }) {
                     evTexts = ArrayList(set)
                     evTextsPkg = pkg
                     evTextsAt = now
@@ -820,8 +839,6 @@ class BillAccessibilityService : AccessibilityService() {
         val pageTs = PayApps.pageTime(texts)
         val ts = pageTs ?: System.currentTimeMillis()
 
-        val cat = if (income) Category.incomeOf(merchant, goods, catHint, appName)
-        else Category.of(merchant, goods, catHint, appName)
         val type = if (income) 1 else 0
         val note = if (goods.isNotBlank() && goods != merchant) "$merchant·$goods" else merchant
 
@@ -837,6 +854,15 @@ class BillAccessibilityService : AccessibilityService() {
 
         val db = DbHelper(this)
         try {
+            // v2.28：商户分类记忆。用户为该商户手动改过分类的，直接默认到那个类别，
+            // 卡片上标注「按你的习惯」，仍只需一键确认（也可再改）。
+            val remembered = db.merchantCat(merchant)
+            val cat = remembered
+                ?: if (income) Category.incomeOf(merchant, goods, catHint, appName)
+                else Category.of(merchant, goods, catHint, appName)
+            if (remembered != null) {
+                Diag.log(this, "$appName ¥$amount → 商户「$merchant」按你的历史习惯默认分类「$remembered」，确认即可")
+            }
             // 一笔支付只允许落一条记录。
             // 同一笔可能在「结果页」和「账单详情」各被识别一次（两个页面文字不同、商户名不同），
             // 也可能页面和通知各命中一次 —— 所以按「金额 + 时间窗」收敛，不按商户名比对。
@@ -907,7 +933,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
                     // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
                     // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
-                    showCard(prev.id, amount, merged, cat, income, pageTs)
+                    showCard(prev.id, amount, merged, cat, income, pageTs, remembered)
                     return true
                 }
             }
@@ -945,7 +971,7 @@ class BillAccessibilityService : AccessibilityService() {
                 this,
                 "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
-            showCard(id, amount, note, cat, income, pageTs)
+            showCard(id, amount, note, cat, income, pageTs, remembered)
             return true
         } finally {
             db.close()
@@ -1153,8 +1179,8 @@ class BillAccessibilityService : AccessibilityService() {
      * 剥离原因：卡片窗口是 TYPE_APPLICATION_OVERLAY，只需要悬浮窗权限，技术上不依赖无障碍服务。
      * 旧版写在这里，导致无障碍一关（银行 App 要求）两条通道都不弹卡。
      */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, pageTs: Long? = null) {
-        OverlayUi.show(this, id, amount, note, cat, income, null, pageTs ?: 0L)
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, pageTs: Long? = null, remembered: Boolean = false) {
+        OverlayUi.show(this, id, amount, note, cat, income, null, pageTs ?: 0L, remembered)
     }
 
     override fun onInterrupt() {}

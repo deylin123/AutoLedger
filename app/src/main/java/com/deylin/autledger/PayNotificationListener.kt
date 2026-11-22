@@ -131,13 +131,19 @@ class PayNotificationListener : NotificationListenerService() {
         val merchant = MERCHANT.find(body)?.groupValues?.getOrNull(1)?.trim()
             ?.takeIf { it.isNotBlank() && !PayApps.hasAmountIn(it) }
             ?: (appName + if (income) "收入" else "消费")
-        val cat = if (income) Category.incomeOf(merchant, body, appName)
-        else Category.of(merchant, body, appName)
         val type = if (income) 1 else 0
         val ts = sbn.postTime.takeIf { it > 0 } ?: System.currentTimeMillis()
 
         val db = DbHelper(this)
         try {
+            // v2.28：商户分类记忆，通知通道与页面通道行为一致
+            val remembered = db.merchantCat(merchant)
+            val cat = remembered
+                ?: if (income) Category.incomeOf(merchant, body, appName)
+                else Category.of(merchant, body, appName)
+            if (remembered != null) {
+                Diag.log(this, "$appName ¥$amount → 商户「$merchant」按历史习惯默认分类「$remembered」")
+            }
             // 同一笔可能已被页面通道记下（商户名往往不一致），按「金额 + 90 秒」收敛，不按商户名比对
             val prev = db.recentSameAmount(amount, ts, PayApps.MERGE_WINDOW_MS)
             if (prev != null) {
@@ -167,7 +173,7 @@ class PayNotificationListener : NotificationListenerService() {
             // 关键改动：不再依赖无障碍服务实例是否存在。
             // 旧版委托给 BillAccessibilityService.presentCard，无障碍一关（银行类 App 强制要求）
             // 这条路径就永远失败，用户侧表现就是「记账还在跑，但卡片再也不弹」。
-            OverlayUi.show(this, id, amount, merchant, cat, income)
+            OverlayUi.show(this, id, amount, merchant, cat, income, null, 0L, remembered != null)
         } finally {
             db.close()
         }

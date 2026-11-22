@@ -57,20 +57,42 @@ class PageDetail(private val act: MainActivity) {
         top.addView(next)
         root.addView(top, Ui.lp(Ui.MP, Ui.WC))
 
+        // ---- v2.28：分类筛选（图表排行点进来时非空）----
+        val fCat = act.filterCat
+        val fType = if (fCat != null) act.filterType else -1
+        val recs = if (fCat != null) {
+            db.list(from, to, act.book, fType, true, fCat)
+        } else {
+            emptyList<Rec>()
+        }
+
         // ---- 汇总卡 ----
         val sumCard = Ui.card(c, 8f, 16f)
         val sumRow = Ui.row(c)
-        val exp = db.sum(from, to, act.book, 0)
-        val inc = db.sum(from, to, act.book, 1)
-        sumRow.addView(sumCol("支出", exp, Ui.RED, true), Ui.lp(0, Ui.WC, 1f))
-        sumRow.addView(sumCol("收入", inc, Ui.GREEN, false), Ui.lp(0, Ui.WC, 1f))
-        sumRow.addView(sumCol("结余", inc - exp, Ui.TEXT, false), Ui.lp(0, Ui.WC, 1f))
+        // 筛选模式下汇总只算该类别；非筛选时用整月汇总
+        val exp: Double
+        val inc: Double
+        if (fCat != null) {
+            var e = 0.0
+            var g = 0.0
+            for (r in recs) {
+                if (r.type == 0) e += r.amount else g += r.amount
+            }
+            exp = e
+            inc = g
+        } else {
+            exp = db.sum(from, to, act.book, 0)
+            inc = db.sum(from, to, act.book, 1)
+        }
+        sumRow.addView(sumCol(if (fCat == null) "支出" else "本类支出", exp, Ui.RED, true), Ui.lp(0, Ui.WC, 1f))
+        sumRow.addView(sumCol(if (fCat == null) "收入" else "本类收入", inc, Ui.GREEN, false), Ui.lp(0, Ui.WC, 1f))
+        if (fCat == null) sumRow.addView(sumCol("结余", inc - exp, Ui.TEXT, false), Ui.lp(0, Ui.WC, 1f))
         sumCard.addView(sumRow)
 
         // 预算进度
         val month = String.format(Locale.CHINA, "%04d-%02d", y, m + 1)
         val budget = db.budget(month)
-        if (budget > 0.0) {
+        if (budget > 0.0 && fCat == null) {
             val bar = LinearLayout(c)
             bar.orientation = LinearLayout.HORIZONTAL
             bar.setBackground(Ui.round(c, 0xFFF3EDE4.toInt(), 5f))
@@ -96,6 +118,30 @@ class PageDetail(private val act: MainActivity) {
         scp.leftMargin = Ui.dp(c, 14f)
         scp.rightMargin = Ui.dp(c, 14f)
         root.addView(sumCard, scp)
+
+        // ---- v2.28：分类筛选横幅（点 ✕ 或切月份/账本外的操作即取消）----
+        if (fCat != null) {
+            val banner = Ui.row(c)
+            banner.setBackground(Ui.round(c, Ui.ORANGE_LIGHT, 12f))
+            Ui.pad(banner, 14, 11, 14, 11)
+            val t = Ui.tv(
+                c,
+                act.db().emojiOf(fCat) + " " + fCat + " · " +
+                    (if (fType == 1) "收入" else "支出") + "明细 " + recs.size + " 笔",
+                13f, Ui.ORANGE_DEEP, true
+            )
+            banner.addView(t, Ui.lp(0, Ui.WC, 1f))
+            banner.addView(Ui.tv(c, "取消筛选 ✕", 13f, Ui.ORANGE_DEEP))
+            banner.setOnClickListener {
+                act.filterCat = null
+                act.refresh()
+            }
+            val bp2 = Ui.lp(Ui.MP, Ui.WC)
+            bp2.leftMargin = Ui.dp(c, 14f)
+            bp2.rightMargin = Ui.dp(c, 14f)
+            bp2.topMargin = Ui.dp(c, 10f)
+            root.addView(banner, bp2)
+        }
 
         // ---- 待确认横幅 ----
         val pend = db.pendingCount()
@@ -125,8 +171,8 @@ class PageDetail(private val act: MainActivity) {
         val list = Ui.col(c)
         Ui.pad(list, 14, 10, 14, 24)
 
-        val recs = db.list(from, to, act.book, -1, true)
-        if (recs.isEmpty()) {
+        val recsAll = if (fCat != null) recs else db.list(from, to, act.book, -1, true)
+        if (recsAll.isEmpty()) {
             val empty = Ui.col(c)
             empty.gravity = Gravity.CENTER
             val p = Ui.lp(Ui.MP, Ui.WC)
@@ -142,13 +188,13 @@ class PageDetail(private val act: MainActivity) {
         } else {
             val dayExp = HashMap<String, Double>()
             val dayInc = HashMap<String, Double>()
-            for (r in recs) {
+            for (r in recsAll) {
                 val k = dayKey(r.ts)
                 if (r.type == 0) dayExp[k] = (dayExp[k] ?: 0.0) + r.amount
                 else dayInc[k] = (dayInc[k] ?: 0.0) + r.amount
             }
             var lastKey = ""
-            for (r in recs) {
+            for (r in recsAll) {
                 val k = dayKey(r.ts)
                 if (k != lastKey) {
                     lastKey = k
