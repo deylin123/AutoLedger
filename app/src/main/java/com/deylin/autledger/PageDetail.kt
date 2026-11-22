@@ -1,6 +1,7 @@
 package com.deylin.autledger
 
 import android.app.AlertDialog
+import android.app.DatePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.view.Gravity
@@ -118,6 +119,21 @@ class PageDetail(private val act: MainActivity) {
         scp.leftMargin = Ui.dp(c, 14f)
         scp.rightMargin = Ui.dp(c, 14f)
         root.addView(sumCard, scp)
+
+        // ---- v2.29：批量改消费日期 ----
+        // 旧版把 ts 覆写成「确认时刻」，且没备份原始消费时间，程序无法凭空还原；
+        // 但完全不用删除重录：点单笔可改日期，这里一次改一批。
+        val redateRow = Ui.row(c)
+        redateRow.setBackground(Ui.round(c, Ui.ORANGE_LIGHT, 12f))
+        Ui.pad(redateRow, 14, 10, 14, 10)
+        redateRow.addView(Ui.tv(c, "🗓 批量改消费日期", 13f, Ui.ORANGE_DEEP, true), Ui.lp(0, Ui.WC, 1f))
+        redateRow.addView(Ui.tv(c, "不用删除重录 ›", 12f, Ui.ORANGE_DEEP))
+        redateRow.setOnClickListener { batchRedate(from, to) }
+        val rdp = Ui.lp(Ui.MP, Ui.WC)
+        rdp.leftMargin = Ui.dp(c, 14f)
+        rdp.rightMargin = Ui.dp(c, 14f)
+        rdp.topMargin = Ui.dp(c, 10f)
+        root.addView(redateRow, rdp)
 
         // ---- v2.28：分类筛选横幅（点 ✕ 或切月份/账本外的操作即取消）----
         if (fCat != null) {
@@ -282,6 +298,7 @@ class PageDetail(private val act: MainActivity) {
         row.addView(Ui.tv(c, "$sign¥" + Ui.money(r.amount), 15.5f, color, true))
 
         row.layoutParams = lp
+        // 点开可改金额/分类/备注/**消费日期** —— 历史记录日期错了不必删除重录
         row.setOnClickListener { PageEntry(act).show(r) }
         row.setOnLongClickListener {
             AlertDialog.Builder(act)
@@ -296,6 +313,58 @@ class PageDetail(private val act: MainActivity) {
             true
         }
         return row
+    }
+
+    /**
+     * v2.29：批量把本月的记录改到某个消费日期。
+     * 保留每笔原来的时:分:秒，只改年月日，避免全部挤到 00:00。
+     */
+    private fun batchRedate(from: Long, to: Long) {
+        val db = act.db()
+        val recs = if (act.filterCat != null) {
+            db.list(from, to, act.book, act.filterType, true, act.filterCat)
+        } else {
+            db.list(from, to, act.book, -1, true)
+        }
+        if (recs.isEmpty()) {
+            AlertDialog.Builder(act)
+                .setTitle("本月没有记录")
+                .setMessage("有记录后，可在这里一次性把多笔改到同一消费日期。")
+                .setPositiveButton("知道了", null).show()
+            return
+        }
+        val fmt = SimpleDateFormat("M月d日 HH:mm", Locale.CHINA)
+        val labels = recs.map { r ->
+            fmt.format(Date(r.ts)) + "  " + (if (r.type == 0) "-" else "+") + "¥" +
+                Ui.money(r.amount) + "  " + r.cat +
+                (if (r.note.isNotBlank()) "  " + r.note.take(10) else "")
+        }.toTypedArray()
+        val picked = BooleanArray(recs.size)
+        AlertDialog.Builder(act)
+            .setTitle("选要改日期的记录（可多选）")
+            .setMultiChoiceItems(labels, picked) { _, w, on -> picked[w] = on }
+            .setPositiveButton("下一步") { _, _ ->
+                val ids = ArrayList<Long>()
+                for (i in picked.indices) if (picked[i]) ids.add(recs[i].id)
+                if (ids.isEmpty()) {
+                    android.widget.Toast.makeText(act, "没有选中任何记录", android.widget.Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val cal = Calendar.getInstance()
+                DatePickerDialog(act, { _, y, m, d ->
+                    val t = Calendar.getInstance()
+                    t.clear()
+                    t.set(y, m, d, 12, 0, 0)
+                    val n = db.redateRecords(ids, t.timeInMillis)
+                    android.widget.Toast.makeText(
+                        act, "已把 $n 笔的消费日期改为 ${y}年${m + 1}月${d}日（原时分秒保留）",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                    act.refresh()
+                }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun pickBook() {

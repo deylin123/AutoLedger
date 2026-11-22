@@ -87,6 +87,22 @@ class PageMine(private val act: MainActivity) {
         // ---- 分类 ----
         val catCard = card("分类")
         catCard.addView(rowItem("分类管理", "增删自定义分类") { manageCats() })
+        catCard.addView(rowItem("商户分类记忆", "${act.db().merchantCatCount()} 条 · 点此清空") {
+            AlertDialog.Builder(act)
+                .setTitle("清除商户分类记忆")
+                .setMessage(
+                    "清空后，所有商户重新按关键词自动分类，不再套用你之前调整过的类别。\n\n" +
+                    "账单记录本身一条都不会删除。\n\n" +
+                    "同一商户连续两次调整到某类别后，才会重新记住。"
+                )
+                .setPositiveButton("全部清空") { _, _ ->
+                    act.db().clearMerchantCats()
+                    Toast.makeText(act, "商户分类记忆已清空", Toast.LENGTH_SHORT).show()
+                    act.refresh()
+                }
+                .setNegativeButton("取消", null)
+                .show()
+        })
         val ccp = Ui.lp(Ui.MP, Ui.WC)
         ccp.topMargin = Ui.dp(c, 10f)
         body.addView(catCard, ccp)

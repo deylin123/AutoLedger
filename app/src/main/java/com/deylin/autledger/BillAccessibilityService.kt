@@ -202,6 +202,15 @@ class BillAccessibilityService : AccessibilityService() {
     private var evTexts: ArrayList<String>? = null
     private var evTextsPkg: String? = null
     private var evTextsAt = 0L
+    /**
+     * v2.29：缓存这一屏的「页面身份」——它解析出的付款时间。
+     * 换到另一笔账单时付款时间必然改变，用它判定换页比用 WINDOW_STATE_CHANGED 可靠得多：
+     * 微信账单详情页加载完之后仍在不断抛窗口事件（输入法/Toast/子窗口），
+     * 但页面没换，付款时间是稳定的。
+     */
+    private var evPageTs: Long? = null
+    /** 缓存这一屏是否已经带金额（账单页身份证），骨架屏不许覆盖带金额的屏 */
+    private var evHasAmount = false
 
     /** v2.17 节拍器状态：当前轮询的包名与剩余拍数 */
     private var pollPkg: String? = null
@@ -248,14 +257,14 @@ class BillAccessibilityService : AccessibilityService() {
                 }
                 Diag.log(
                     this,
-                    "无障碍服务已连接（v2.28 窗口缓存修复版）｜flags=${si.flags} " +
+                    "无障碍服务已连接（v2.29 页面身份版）｜flags=${si.flags} " +
                         "eventTypes=${si.eventTypes} timeout=${si.notificationTimeout}"
                 )
             } else {
-                Diag.log(this, "无障碍服务已连接（v2.28 窗口缓存修复版）｜serviceInfo=null，flags 无法核对")
+                Diag.log(this, "无障碍服务已连接（v2.29 页面身份版）｜serviceInfo=null，flags 无法核对")
             }
         } catch (e: Exception) {
-            Diag.log(this, "无障碍服务已连接（v2.28 窗口缓存修复版）｜flags 核对异常 ${e.javaClass.simpleName}")
+            Diag.log(this, "无障碍服务已连接（v2.29 页面身份版）｜flags 核对异常 ${e.javaClass.simpleName}")
         }
     }
 
@@ -446,11 +455,17 @@ class BillAccessibilityService : AccessibilityService() {
         // 不存在这条聊天→账单的换窗路径，所以一直稳）。
         // 页面切换必然伴随 TYPE_WINDOW_STATE_CHANGED，在这一刻清缓存最可靠；
         // 「更薄」规则要防的后台短消息走 CONTENT_CHANGED，不受影响。
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            evTexts = null
-            evTextsPkg = null
-            evTextsAt = 0L
-        }
+        // v2.29：**不再**按事件类型清空缓存。
+        // v2.28 的这条规则是「7 次只弹 2 次」的直接元凶：微信账单详情页渲染完成后
+        // 仍持续抛 WINDOW_STATE_CHANGED（输入法、Toast、子窗口、分帧重绘都算），
+        // 每一次都把刚采到的带金额整页文本清空，再用当前事件的骨架子树重填 ——
+        // 节拍器来取数时拿到的永远是骨架，闸门必然拦下，一声不响。
+        // 能否弹，全看「采集到金额的那一刻到节拍器取数之间」恰好没抛窗口事件的运气。
+        // 支付宝是稳定单 Activity，不这么连续抛窗口事件，所以一直丝滑。
+        //
+        // 换页改由「页面身份」判定：本屏解析出付款时间且与缓存不同 → 确实换了一笔，
+        // 才允许清空。同一页内的窗口抖动一律不清。
+        val setTs = evPageTs
         val alive = evTextsPkg == pkg && now - evTextsAt <= EV_TEXTS_TTL
         val prevN = if (alive) evTexts?.size ?: 0 else 0
         // v2.27：缓存还没成形时每次事件都采（金额一出现就进缓存）；
@@ -472,16 +487,24 @@ class BillAccessibilityService : AccessibilityService() {
             // ② 根树太小（WebView 虚拟节点树还没建好）就退回事件子树本身
             if (set.size < 2) collect(src, set)
             if (set.isNotEmpty()) {
-                // v2.27：只用「不比旧缓存更薄」的一屏覆盖。
-                // v2.26 是无条件覆盖 —— 后台一条短消息事件就能把已经读到的整页账单文本冲掉，
-                // 等节拍器下一拍来取时，缓存里只剩那一句短消息。
-                // v2.28 补丁：**更薄但带金额**的一屏同样允许覆盖 —— 金额就是账单页的身份证，
-                // 金额一出现就允许进缓存，否则 H5 分段渲染下金额晚出时还是会被更厚的
-                // 旧骨架拦住。后台短消息（更薄且无金额）依旧被挡在门外，不冲掉整页账单。
-                if (!alive || set.size >= prevN || set.any { PayApps.hasAmountIn(it) }) {
+                val newTs = PayApps.pageTime(ArrayList(set))
+                val newHasAmount = set.any { PayApps.hasAmountIn(it) }
+                // 明确的换页信号：新旧两屏都能解析出付款时间且不同 → 换到了另一笔账单
+                val pageChanged = newTs != null && setTs != null && newTs != setTs
+                // 缓存已带金额，本屏却不带金额 → 是加载期的骨架/子窗口，绝不覆盖
+                val wouldEraseBill = alive && evHasAmount && !newHasAmount && !pageChanged
+                val allow = !alive || pageChanged ||
+                    (!wouldEraseBill && (set.size >= prevN || newHasAmount))
+                if (allow) {
                     evTexts = ArrayList(set)
                     evTextsPkg = pkg
                     evTextsAt = now
+                    // !alive（缓存过期/换 App）时不沿用旧页时间，避免跨笔串味
+                    evPageTs = if (!alive) newTs else (newTs ?: setTs)
+                    evHasAmount = newHasAmount
+                    if (pageChanged) {
+                        logSkip("$pkg#newpage", "${appLabel(pkg)} → 检测到换到另一笔账单（付款时间变化），事件源缓存已按新页重建")
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -557,7 +580,7 @@ class BillAccessibilityService : AccessibilityService() {
                 logSkip(
                     beatKey,
                     "${appLabel(pkg)} → 扫描心跳｜活动窗口=${rootPkg ?: "null"}｜窗口清单：$inv｜" +
-                        "窗口组=${groups.size} 事件源=${ev?.size ?: 0} 共 ${allTexts.size} 条文本｜" +
+                        "窗口组=${groups.size} 事件源=${ev?.size ?: 0}(带金额=${evHasAmount}) 共 ${allTexts.size} 条文本｜" +
                         "本页：$brief"
                 )
             }
@@ -685,6 +708,24 @@ class BillAccessibilityService : AccessibilityService() {
             if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return false
 
             val name = app?.name ?: appLabel(pkg)
+
+            // v2.29：确定性放行。
+            // 钱包类 App（支付宝/微信/QQ）的页面若同时具备「账单标题 + 绝对付款时间 +
+            // 账单结构字段」，它就是某一笔账单的详情页 —— 首页/信息流/列表/会话/门户
+            // 不可能同时凑齐这三项。这类页面不该再被那些为防首页误记而设的形态闸拦掉，
+            // 也不该被「10 分钟新鲜度」拦掉（用户明确要求打开历史支付记录也能弹窗）。
+            // 微信详情页的付款时间常被拆成多个节点，导致形态闸误判，是本条要根治的误杀。
+            val isWallet = app != null && (pkg == "com.eg.android.AlipayGphone" ||
+                pkg == "com.tencent.mm" || pkg == "com.tencent.mobileqq")
+            val pageTsSure = PayApps.pageTime(texts)
+            // 仍保留两道硬闸：必须是「已扣款」页面、不能是一屏多笔的列表。
+            // 否则放行会把收银台/账单流水列表也放进来，等于拆掉了防误记的底线。
+            val sureBill = isWallet && pageTsSure != null && PayApps.hasBillStructure(texts) &&
+                PayApps.payState(texts) == PayApps.STATE_PAID && !PayApps.looksLikeList(texts)
+            if (sureBill) {
+                logSkip("$pkg#surebill", "$name → 确定性单笔账单（标题+付款时间+账单字段），跳过形态闸直接判定")
+                return scan(pkg, texts, app)
+            }
 
             // 闸门一·补四（v2.18）：首页 / 信息流 / 消息卡片页。
             //
@@ -856,7 +897,7 @@ class BillAccessibilityService : AccessibilityService() {
         try {
             // v2.28：商户分类记忆。用户为该商户手动改过分类的，直接默认到那个类别，
             // 卡片上标注「按你的习惯」，仍只需一键确认（也可再改）。
-            val remembered = db.merchantCat(merchant)
+            val remembered = db.merchantCat(merchant, type)
             val cat = remembered
                 ?: if (income) Category.incomeOf(merchant, goods, catHint, appName)
                 else Category.of(merchant, goods, catHint, appName)

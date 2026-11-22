@@ -293,7 +293,7 @@ class PageEntry(private val act: MainActivity) {
             act.db().updateRecord(e.id, v, cat, note, ts, 1)
             // v2.28：编辑时改了分类的自动抓取记录，同样计入商户分类记忆
             if (cat != e.cat && e.src != "手工") {
-                act.db().rememberMerchantCat(e.note, cat)
+                act.db().rememberMerchantCat(e.note, cat, e.type)
             }
         }
         closePanel()

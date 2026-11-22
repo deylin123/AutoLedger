@@ -24,7 +24,7 @@ data class Rec(
 data class CatDef(val id: Long, val name: String, val emoji: String, val type: Int)
 
 class DbHelper(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 7) {
+    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 8) {
 
     companion object {
         val COLS = arrayOf("id", "amount", "type", "cat", "note", "ts", "book", "status", "src")
@@ -35,10 +35,34 @@ class DbHelper(context: Context) :
          * 否则一条记忆会把全部同名兜底账带偏到同一个类别。
          * 备注形如「商户·商品」时只取商户段做键。
          */
+        /**
+         * v2.29：平台/渠道通用名黑名单。
+         * 这些词在微信/支付宝账单里几乎每笔都一样（「微信支付」「财付通」「零钱」…），
+         * 拿它们当商户 key，一条误改就会把全部账单带到同一个类别 —— 这正是
+         * 「两笔不同消费都自动识别成彩票」的成因。
+         */
+        private val GENERIC_MERCHANT_EXACT = listOf(
+            "微信支付", "微信", "财付通", "零钱", "零钱通", "余额", "余额宝", "银行卡",
+            "支付宝", "支付", "付款", "收款", "转账", "红包", "退款", "消费", "收入",
+            "二维码", "扫码", "扫一扫", "收付款", "账单", "交易", "订单", "商户", "商家",
+            "未知", "其它", "其他", "暂无", "无", "待确认", "自动记账", "收款方", "付款方"
+        )
+        /** 这些词是渠道/动作名，只要商户名里含就说明不是具体商户（"XX支付平台"之类） */
+        private val GENERIC_MERCHANT_CONTAINS = listOf(
+            "微信支付", "财付通", "支付宝", "零钱通", "扫二维码", "扫码付款",
+            "收付款", "账单详情", "交易记录", "支付方式", "付款方式"
+        )
+
+        /** 商户名是否值得记忆/匹配：必须是具体商户，不能是渠道名、兜底名或机器串 */
         fun isLearnableMerchant(raw: String): Boolean {
             val m = raw.trim().substringBefore('·').trim()
             if (m.length < 2 || m.length > 24) return false
             if (m.endsWith("消费") || m.endsWith("收入")) return false
+            if (GENERIC_MERCHANT_EXACT.any { m == it }) return false
+            if (GENERIC_MERCHANT_CONTAINS.any { m.contains(it) }) return false
+            if (m.all { !it.isLetterOrDigit() }) return false
+            if (m.all { it.isDigit() }) return false
+            if (m.length >= 12 && m.all { it.isLetterOrDigit() }) return false
             return true
         }
 
@@ -71,10 +95,26 @@ class DbHelper(context: Context) :
             makeTables(db)
             seed(db)
         }
+        if (oldVersion < 8) {
+            // v2.29：v7 的记忆表把「微信支付」这类渠道通用名当商户，
+            // 一条误改就把全部账单带成同一类别（用户实测两笔都变「彩票」）。
+            // 升级时**只清空 merchant_cats**（这是可重建的偏好数据，不是账单），
+            // records 一条都不动。旧表结构缺 type 列，一并重建。
+            db.execSQL("DROP TABLE IF EXISTS merchant_cats")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS merchant_cats(" +
+                    "merchant TEXT NOT NULL," +
+                    "type INTEGER NOT NULL DEFAULT 0," +
+                    "cat TEXT NOT NULL," +
+                    "hits INTEGER NOT NULL DEFAULT 1," +
+                    "updated_at INTEGER NOT NULL DEFAULT 0," +
+                    "PRIMARY KEY(merchant,type))"
+            )
+        }
     }
 
     private fun dropAll(db: SQLiteDatabase) {
-        for (t in arrayOf("records", "cats", "books", "budgets", "merchant_cats")) {
+        for (t in arrayOf("records", "cats", "books", "budgets", "merchant_cats", "merchant_memory")) {
             db.execSQL("DROP TABLE IF EXISTS $t")
         }
     }
@@ -105,12 +145,15 @@ class DbHelper(context: Context) :
             "CREATE TABLE IF NOT EXISTS budgets(month TEXT NOT NULL,cat TEXT NOT NULL DEFAULT ''," +
                 "amount REAL NOT NULL,PRIMARY KEY(month,cat))"
         )
-        // v2.28：商户分类记忆表
+        // v2.29：商户分类记忆表。key = 商户 + 收支方向；hits 记「累计调整到该类别的次数」
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS merchant_cats(" +
-                "merchant TEXT PRIMARY KEY," +
+                "merchant TEXT NOT NULL," +
+                "type INTEGER NOT NULL DEFAULT 0," +
                 "cat TEXT NOT NULL," +
-                "updated_at INTEGER NOT NULL DEFAULT 0)"
+                "hits INTEGER NOT NULL DEFAULT 1," +
+                "updated_at INTEGER NOT NULL DEFAULT 0," +
+                "PRIMARY KEY(merchant,type))"
         )
     }
 
@@ -337,24 +380,102 @@ class DbHelper(context: Context) :
 
     // ---------- 商户分类记忆（v2.28） ----------
 
-    /** 记住（或更新）某商户的惯用分类 */
-    fun rememberMerchantCat(merchant: String, cat: String) {
+    /**
+     * v2.29：记住（或累计）某商户的惯用分类。
+     * 用户原话是「某个商户**多次调整**它的类别」才该记忆 —— 改一次就永久记住太激进，
+     * 一次误触（比如分类列表里「彩票」排第 6 位）就会污染全部同渠道账单。
+     * 这里累计 hits，达到 2 次才真正作为默认值生效（见 [merchantCat]）。
+     * 换了类别则重新计数，避免旧的误触一直压着新习惯。
+     */
+    fun rememberMerchantCat(merchant: String, cat: String, type: Int) {
         if (!isLearnableMerchant(merchant) || cat.isBlank()) return
         val m = merchant.trim().substringBefore('·').trim()
-        writableDatabase.execSQL(
-            "INSERT OR REPLACE INTO merchant_cats(merchant,cat,updated_at) VALUES(?,?,?)",
-            arrayOf(m, cat, System.currentTimeMillis().toString())
+        val db = writableDatabase
+        var old: String? = null
+        var hits = 0
+        db.rawQuery(
+            "SELECT cat,hits FROM merchant_cats WHERE merchant=? AND type=?",
+            arrayOf(m, type.toString())
+        ).use { if (it.moveToFirst()) { old = it.getString(0); hits = it.getInt(1) } }
+        val n = if (old == cat) hits + 1 else 1
+        db.execSQL(
+            "INSERT OR REPLACE INTO merchant_cats(merchant,type,cat,hits,updated_at) VALUES(?,?,?,?,?)",
+            arrayOf(m, type.toString(), cat, n.toString(), System.currentTimeMillis().toString())
         )
     }
 
-    /** 查某商户的惯用分类；没有或不可学习返回 null */
-    fun merchantCat(merchant: String): String? {
+    /**
+     * 查某商户的惯用分类。必须同时满足：
+     * ① 商户名可学习；② 收支方向一致；③ 累计 ≥2 次调整（防单次误触）；
+     * ④ 该分类仍然存在（用户删过分类就不能再套用）。任一不满足返回 null。
+     */
+    fun merchantCat(merchant: String, type: Int): String? {
         if (!isLearnableMerchant(merchant)) return null
         val m = merchant.trim().substringBefore('·').trim()
+        var cat: String? = null
         readableDatabase.rawQuery(
-            "SELECT cat FROM merchant_cats WHERE merchant=? LIMIT 1", arrayOf(m)
-        ).use { if (it.moveToFirst()) return it.getString(0) }
-        return null
+            "SELECT cat,hits FROM merchant_cats WHERE merchant=? AND type=? LIMIT 1",
+            arrayOf(m, type.toString())
+        ).use { if (it.moveToFirst() && it.getInt(1) >= 2) cat = it.getString(0) }
+        val c = cat ?: return null
+        // 分类已被删除 → 记忆失效，顺手清掉
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM cats WHERE name=? AND type=? LIMIT 1", arrayOf(c, type.toString())
+        ).use { if (!it.moveToFirst()) {
+            writableDatabase.execSQL(
+                "DELETE FROM merchant_cats WHERE merchant=? AND type=?", arrayOf(m, type.toString())
+            )
+            return null
+        } }
+        return c
+    }
+
+    /** v2.29：清除全部商户分类记忆（「我的」页入口）。账单记录一条不动。 */
+    fun clearMerchantCats() {
+        writableDatabase.execSQL("DELETE FROM merchant_cats")
+    }
+
+    /** 已生效（hits>=2）的记忆条数，用于「我的」页显示 */
+    fun merchantCatCount(): Int {
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM merchant_cats WHERE hits>=2", null).use {
+            if (it.moveToFirst()) return it.getInt(0)
+        }
+        return 0
+    }
+
+    /**
+     * v2.29：批量把若干笔记录改到指定消费日期（保留原来的时:分:秒）。
+     * 旧版「悬浮卡确认」把 ts 覆写成确认时刻，且没有备份原始消费时间，
+     * 程序无法凭空还原 —— 但用户完全不必删除重录，用这个接口一次改一批即可。
+     */
+    fun redateRecords(ids: List<Long>, dayTs: Long): Int {
+        if (ids.isEmpty()) return 0
+        val target = Calendar.getInstance()
+        target.timeInMillis = dayTs
+        val db = writableDatabase
+        var n = 0
+        db.beginTransaction()
+        try {
+            for (id in ids) {
+                var old = 0L
+                db.rawQuery("SELECT ts FROM records WHERE id=?", arrayOf(id.toString())).use {
+                    if (it.moveToFirst()) old = it.getLong(0)
+                }
+                if (old <= 0L) continue
+                val c = Calendar.getInstance()
+                c.timeInMillis = old
+                c.set(Calendar.YEAR, target.get(Calendar.YEAR))
+                c.set(Calendar.MONTH, target.get(Calendar.MONTH))
+                c.set(Calendar.DAY_OF_MONTH, target.get(Calendar.DAY_OF_MONTH))
+                db.execSQL("UPDATE records SET ts=? WHERE id=?",
+                    arrayOf(c.timeInMillis.toString(), id.toString()))
+                n++
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return n
     }
 
     // ---------- 预算 ----------

@@ -161,8 +161,8 @@ class PendingActivity : Activity() {
                 // v2.28：商户分类记忆 —— 用户为该商户手动改了分类，
                 // 下次识别到同一商户直接默认到这个类别，只需确认
                 if (cat != r.cat && DbHelper.isLearnableMerchant(r.note)) {
-                    helper.rememberMerchantCat(r.note, cat)
-                    Toast.makeText(this, "已改为：$cat（该商户以后默认此分类）", Toast.LENGTH_SHORT).show()
+                    helper.rememberMerchantCat(r.note, cat, r.type)
+                    Toast.makeText(this, "已改为：$cat（同一商户再调整一次将记住）", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(this, "已改为：" + cat, Toast.LENGTH_SHORT).show()
                 }

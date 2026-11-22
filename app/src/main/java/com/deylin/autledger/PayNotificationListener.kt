@@ -137,7 +137,7 @@ class PayNotificationListener : NotificationListenerService() {
         val db = DbHelper(this)
         try {
             // v2.28：商户分类记忆，通知通道与页面通道行为一致
-            val remembered = db.merchantCat(merchant)
+            val remembered = db.merchantCat(merchant, type)
             val cat = remembered
                 ?: if (income) Category.incomeOf(merchant, body, appName)
                 else Category.of(merchant, body, appName)
