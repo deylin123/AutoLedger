@@ -32,6 +32,12 @@
             android:exported="false"
             android:launchMode="singleTop" />
 
+        <!-- v2.30：备注输入页。从悬浮卡片用 NEW_TASK 启动；singleTop 避免重复点备注叠栈 -->
+        <activity
+            android:name=".RemarkActivity"
+            android:exported="false"
+            android:launchMode="singleTop" />
+
         <service
             android:name=".BillAccessibilityService"
             android:exported="false"

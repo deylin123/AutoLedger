@@ -17,17 +17,18 @@ data class Rec(
     var ts: Long = 0L,
     var book: String = "日常账本",
     var status: Int = 1,            // 0 待确认, 1 已确认
-    var src: String = "手工"
+    var src: String = "手工",
+    var remark: String = ""         // v2.30：用户手写备注，与 note（自动识别商户/商品）分离
 )
 
 /** 分类定义 */
 data class CatDef(val id: Long, val name: String, val emoji: String, val type: Int)
 
 class DbHelper(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 8) {
+    SQLiteOpenHelper(context.applicationContext, "autoledger.db", null, 9) {
 
     companion object {
-        val COLS = arrayOf("id", "amount", "type", "cat", "note", "ts", "book", "status", "src")
+        val COLS = arrayOf("id", "amount", "type", "cat", "note", "ts", "book", "status", "src", "remark")
 
         /**
          * v2.28：商户名是否值得记忆/匹配。
@@ -111,6 +112,24 @@ class DbHelper(context: Context) :
                     "PRIMARY KEY(merchant,type))"
             )
         }
+        if (oldVersion < 9) {
+            // v2.30：新增独立「用户备注」列 remark。
+            // 只 ADD COLUMN，不 DROP、不重建 —— 历史记录一条不动（v2.28 的教训）。
+            // 为什么不能复用 note：note 是自动识别的商户/商品名，同时是商户分类记忆 key
+            // 与查重 key；用户手写备注塞进去会污染分类记忆（上一轮刚修的「彩票串类」会复发）。
+            if (!hasColumn(db, "records", "remark")) {
+                db.execSQL("ALTER TABLE records ADD COLUMN remark TEXT NOT NULL DEFAULT ''")
+            }
+        }
+    }
+
+    /** v2.30：安全加列 —— 防止 oldVersion 标记不准时重复 ADD COLUMN 直接崩溃 */
+    private fun hasColumn(db: SQLiteDatabase, table: String, col: String): Boolean {
+        db.rawQuery("PRAGMA table_info(" + table + ")", null).use { c ->
+            val idx = c.getColumnIndex("name")
+            while (c.moveToNext()) if (idx >= 0 && c.getString(idx) == col) return true
+        }
+        return false
     }
 
     private fun dropAll(db: SQLiteDatabase) {
@@ -130,7 +149,8 @@ class DbHelper(context: Context) :
                 "ts INTEGER NOT NULL," +
                 "book TEXT NOT NULL DEFAULT '日常账本'," +
                 "status INTEGER NOT NULL DEFAULT 1," +
-                "src TEXT NOT NULL DEFAULT '手工')"
+                "src TEXT NOT NULL DEFAULT '手工'," +
+                "remark TEXT NOT NULL DEFAULT '')"
         )
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS cats(" +
@@ -238,6 +258,7 @@ class DbHelper(context: Context) :
         cv.put("book", r.book)
         cv.put("status", r.status)
         cv.put("src", r.src)
+        cv.put("remark", r.remark)
         return writableDatabase.insert("records", null, cv)
     }
 
@@ -263,6 +284,26 @@ class DbHelper(context: Context) :
 
     fun delRecord(id: Long) {
         writableDatabase.execSQL("DELETE FROM records WHERE id=?", arrayOf(id))
+    }
+
+    /**
+     * v2.30：单独写「用户备注」，不碰 note / cat / ts / status。
+     * 由悬浮卡片备注栏、备注输入页、待确认页、编辑页共用。
+     * 与 updateRecord/updateRecordFull 的关键区别：那两个按字段覆盖整行，
+     * 若用户先写备注再确认就会被冲掉 —— 故它们的 SQL 刻意不含 remark 列，天然保留。
+     */
+    fun setRemark(id: Long, text: String) {
+        writableDatabase.execSQL(
+            "UPDATE records SET remark=? WHERE id=?",
+            arrayOf(text.trim(), id.toString())
+        )
+    }
+
+    fun remarkOf(id: Long): String {
+        readableDatabase.rawQuery("SELECT remark FROM records WHERE id=?", arrayOf(id.toString())).use {
+            if (it.moveToFirst()) return it.getString(0) ?: ""
+        }
+        return ""
     }
 
     fun get(id: Long): Rec? {
@@ -504,6 +545,7 @@ class DbHelper(context: Context) :
         ts = c.getLong(5),
         book = c.getString(6) ?: "日常账本",
         status = c.getInt(7),
-        src = c.getString(8) ?: "手工"
+        src = c.getString(8) ?: "手工",
+        remark = if (c.columnCount > 9) (c.getString(9) ?: "") else ""
     )
 }

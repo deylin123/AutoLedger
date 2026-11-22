@@ -282,6 +282,11 @@ class PageDetail(private val act: MainActivity) {
         mid.addView(Ui.tv(c, name, 14.5f, Ui.TEXT))
         val sub = StringBuilder()
         if (r.note.isNotBlank()) sub.append(r.note)
+        // v2.30：用户备注单独显示，不与识别内容/来源混在一起
+        if (r.remark.isNotBlank()) {
+            if (sub.isNotEmpty()) sub.append(" · ")
+            sub.append("备注：").append(r.remark)
+        }
         if (r.src != "手工") {
             if (sub.isNotEmpty()) sub.append(" · ")
             sub.append(r.src)

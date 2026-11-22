@@ -6,7 +6,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.View
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -130,7 +132,10 @@ class PendingActivity : Activity() {
 
     private fun bind(v: View, r: Rec) {
         val note = if (r.note.isBlank()) r.cat else r.note
-        v.findViewById<TextView>(R.id.tvNote).text = note
+        val tvNote = v.findViewById<TextView>(R.id.tvNote)
+        tvNote.text = note + (if (r.remark.isNotBlank()) "  ✎" + r.remark else "")
+        // v2.30：点标题直接写/改备注（本页是普通 Activity，弹对话框即可，不必跳页）
+        tvNote.setOnClickListener { askRemark(r) }
         v.findViewById<TextView>(R.id.tvAmount).apply {
             text = (if (r.type == 0) "-¥" else "+¥") + Ui.money(r.amount)
             setTextColor(if (r.type == 0) Ui.TEXT else Ui.GREEN)
@@ -146,6 +151,27 @@ class PendingActivity : Activity() {
         }
         v.findViewById<View>(R.id.btnCat).setOnClickListener { pickCat(r) }
         v.findViewById<View>(R.id.btnOk).setOnClickListener { confirmOne(r) }
+    }
+
+    /** v2.30：待确认页写/改备注，存独立 remark 列 */
+    private fun askRemark(r: Rec) {
+        val et = EditText(this)
+        et.setText(r.remark)
+        et.setHint("例如：和同事午餐")
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        et.maxLines = 4
+        AlertDialog.Builder(this)
+            .setTitle("备注 · " + (if (r.note.isBlank()) r.cat else r.note))
+            .setView(et)
+            .setPositiveButton("保存") { _, _ ->
+                val text = et.text.toString().trim()
+                helper.setRemark(r.id, text)
+                OverlayUi.refreshRemark(applicationContext, r.id, text)
+                Toast.makeText(this, if (text.isBlank()) "备注已清空" else "备注已保存", Toast.LENGTH_SHORT).show()
+                load()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 只改分类，仍留在待确认 */

@@ -83,6 +83,24 @@
         </LinearLayout>
     </LinearLayout>
 
+    <!-- v2.30：可编辑备注栏。悬浮窗 FLAG_NOT_FOCUSABLE 下 EditText 拿不到焦点、弹不出软键盘，
+         故这里只呈现文案，点击启动独立 RemarkActivity 输入，按记录 id 直接写库。 -->
+    <TextView
+        android:id="@+id/tvRemark"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:background="@drawable/bg_remark"
+        android:ellipsize="end"
+        android:maxLines="2"
+        android:paddingLeft="12dp"
+        android:paddingTop="9dp"
+        android:paddingRight="12dp"
+        android:paddingBottom="9dp"
+        android:text="✎ 添加备注"
+        android:textColor="#B0B0B0"
+        android:textSize="12.5sp" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

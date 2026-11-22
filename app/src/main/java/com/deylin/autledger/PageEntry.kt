@@ -27,7 +27,8 @@ class PageEntry(private val act: MainActivity) {
     private var amt = ""
     private var cat = "餐饮"
     private var ts = System.currentTimeMillis()
-    private var note = ""
+    private var note = ""          // 自动识别的商户/商品（只读，不编辑 —— 它是分类记忆/查重 key）
+    private var remark = ""        // v2.30：用户手写备注
     private var editing: Rec? = null
 
     private lateinit var tvAmount: TextView
@@ -44,12 +45,14 @@ class PageEntry(private val act: MainActivity) {
             cat = rec.cat
             ts = rec.ts
             note = rec.note
+            remark = rec.remark
             amt = plain(rec.amount)
         } else {
             type = 0
             cat = "餐饮"
             ts = System.currentTimeMillis()
             note = ""
+            remark = ""
             amt = ""
         }
 
@@ -139,10 +142,10 @@ class PageEntry(private val act: MainActivity) {
         tvDate.setPadding(Ui.dp(c, 12f), Ui.dp(c, 9f), Ui.dp(c, 12f), Ui.dp(c, 9f))
         tvDate.setOnClickListener { pickDate() }
         meta.addView(tvDate)
-        tvNote = Ui.tv(c, if (note.isBlank()) "＋ 备注" else note, 12.5f, if (note.isBlank()) Ui.SUB else Ui.TEXT)
+        tvNote = Ui.tv(c, if (remark.isBlank()) "＋ 备注" else remark, 12.5f, if (remark.isBlank()) Ui.SUB else Ui.TEXT)
         tvNote.setBackground(Ui.round(c, Ui.CARD, 14f))
         tvNote.setPadding(Ui.dp(c, 12f), Ui.dp(c, 9f), Ui.dp(c, 12f), Ui.dp(c, 9f))
-        tvNote.setOnClickListener { askNote() }
+        tvNote.setOnClickListener { askRemark() }
         val np = Ui.lp(0, Ui.WC, 1f)
         np.leftMargin = Ui.dp(c, 8f)
         meta.addView(tvNote, np)
@@ -258,18 +261,20 @@ class PageEntry(private val act: MainActivity) {
         ).show()
     }
 
-    private fun askNote() {
+    /** v2.30：备注写独立 remark 列，不再改动 note（识别内容/分类记忆 key） */
+    private fun askRemark() {
         val et = EditText(c)
-        et.setText(note)
-        et.setHint("例如：和同事午餐")
-        et.inputType = InputType.TYPE_CLASS_TEXT
+        et.setText(remark)
+        et.setHint("例如：和同事午餐、出差垫付")
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        et.maxLines = 4
         AlertDialog.Builder(act)
             .setTitle("备注")
             .setView(et)
             .setPositiveButton("确定") { _, _ ->
-                note = et.text.toString().trim()
-                tvNote.text = if (note.isBlank()) "＋ 备注" else note
-                tvNote.setTextColor(if (note.isBlank()) Ui.SUB else Ui.TEXT)
+                remark = et.text.toString().trim()
+                tvNote.text = if (remark.isBlank()) "＋ 备注" else remark
+                tvNote.setTextColor(if (remark.isBlank()) Ui.SUB else Ui.TEXT)
             }
             .setNegativeButton("取消", null)
             .show()
@@ -282,18 +287,22 @@ class PageEntry(private val act: MainActivity) {
             return
         }
         val e = editing
+        val db = act.db()
         if (e == null) {
-            act.db().addRecord(
+            db.addRecord(
                 Rec(
-                    amount = v, type = type, cat = cat, note = note,
-                    ts = ts, book = act.book, status = 1, src = "手工"
+                    amount = v, type = type, cat = cat, note = "",
+                    ts = ts, book = act.book, status = 1, src = "手工",
+                    remark = remark
                 )
             )
         } else {
-            act.db().updateRecord(e.id, v, cat, note, ts, 1)
+            // v2.30：note 保持识别内容原样（分类记忆/查重 key），备注单独写 remark 列
+            db.updateRecord(e.id, v, cat, e.note, ts, 1)
+            db.setRemark(e.id, remark)
             // v2.28：编辑时改了分类的自动抓取记录，同样计入商户分类记忆
             if (cat != e.cat && e.src != "手工") {
-                act.db().rememberMerchantCat(e.note, cat, e.type)
+                db.rememberMerchantCat(e.note, cat, e.type)
             }
         }
         closePanel()

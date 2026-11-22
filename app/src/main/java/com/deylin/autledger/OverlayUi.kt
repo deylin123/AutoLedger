@@ -123,6 +123,9 @@ object OverlayUi {
      */
     private var cardPageTs = 0L
 
+    /** v2.30：当前卡片对应的记录 id，备注保存后据此实时刷新卡片文案 */
+    private var cardRecId = -1L
+
     private var cancelledAmount = -1.0
     private var cancelledAt = 0L
 
@@ -200,6 +203,7 @@ object OverlayUi {
         }
         card = null
         cardPageTs = 0L
+        cardRecId = -1L
     }
 
     /**
@@ -324,6 +328,7 @@ object OverlayUi {
         val tvNote = v.findViewById<View>(R.id.tvNote) as TextView
         val tvCat = v.findViewById<View>(R.id.tvCat) as TextView
         val tvIcon = v.findViewById<View>(R.id.tvIcon) as TextView
+        val tvRemark = v.findViewById<View>(R.id.tvRemark) as TextView
         val btnCancel = v.findViewById<View>(R.id.btnCancel) as TextView
         val btnLater = v.findViewById<View>(R.id.btnLater) as TextView
         val btnCat = v.findViewById<View>(R.id.btnCat) as TextView
@@ -333,6 +338,32 @@ object OverlayUi {
         tvAmount.setTextColor(if (income) Ui.GREEN else Ui.TEXT)
         tvNote.text = note
         tvIcon.text = emojiOf(app, cat)
+
+        // v2.30：可编辑备注栏。备注存独立 remark 列，与 note（识别内容/商户分类记忆 key）分离。
+        // 悬浮窗是 FLAG_NOT_FOCUSABLE，内嵌 EditText 在 MIUI/HyperOS 上拿不到焦点、弹不出软键盘，
+        // 故这里只呈现 + 点击启动独立输入页（与「改分类」跳 PendingActivity 同一条已验证路径）。
+        // 新记录 / 已记录两种模式都能写：历史已入账的笔也可以补备注。
+        val savedRemark = try {
+            val rdb = DbHelper(app)
+            val s = rdb.remarkOf(id)
+            rdb.close()
+            s
+        } catch (_: Exception) { "" }
+        paintRemark(tvRemark, savedRemark)
+        tvRemark.setOnClickListener {
+            try {
+                app.startActivity(
+                    Intent(app, RemarkActivity::class.java)
+                        .setFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        )
+                        .putExtra("recId", id)
+                )
+            } catch (_: Exception) {
+            }
+        }
 
         if (recorded != null) {
             // ---- 已记录模式：一眼看出「这笔已经在账本里」，不给重复入账的入口 ----
@@ -466,6 +497,7 @@ object OverlayUi {
         try {
             wm.addView(v, params)
             card = v
+            cardRecId = id
             // v2.25：记住这张卡属于哪一页（页面付款时间），页面一换就被 bindPage 收掉
             cardPageTs = if (pageTs > 0L) pageTs else 0L
             Diag.logCard(app, "卡片已 addView（通知同时已发）")
@@ -486,6 +518,26 @@ object OverlayUi {
             )
         }, 500)
         handler.postDelayed(hideTask, CARD_AUTO_HIDE_MS)
+    }
+
+    /** v2.30：备注栏文案（有备注显示内容，无备注显示引导） */
+    private fun paintRemark(tv: TextView, remark: String) {
+        tv.text = if (remark.isBlank()) "✎ 添加备注" else "✎ 备注：" + remark
+        tv.setTextColor(if (remark.isBlank()) 0xFFB0B0B0.toInt() else Ui.TEXT)
+    }
+
+    /**
+     * v2.30：备注输入页 / 待确认页保存备注后，若这张卡还在屏幕上且是同一笔，实时刷新文案。
+     * 用 cardRecId 而不是 lastCardId：后者在「已记录」模式下不会被设置。
+     */
+    fun refreshRemark(app: Context, id: Long, text: String) {
+        Diag.logCard(app, "备注已保存 #$id → ${if (text.isBlank()) "(空)" else text.take(40)}")
+        handler.post {
+            if (id <= 0L || id != cardRecId) return@post
+            val v = card ?: return@post
+            val tv = v.findViewById<View>(R.id.tvRemark) as? TextView ?: return@post
+            paintRemark(tv, text)
+        }
     }
 
     private fun emojiOf(app: Context, cat: String): String {
