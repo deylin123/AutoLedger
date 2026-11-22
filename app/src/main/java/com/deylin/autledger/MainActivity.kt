@@ -32,6 +32,16 @@ class MainActivity : Activity() {
     var filterCat: String? = null
     var filterType: Int = 0
 
+    /**
+     * v2.31：明细页流水列表的滚动位置。
+     *
+     * refresh() 会把整个明细页拆掉重建，新建的 ScrollView 默认 scrollY=0；
+     * 流水按日期倒序排列，顶部就是最新一天。于是「改完 11 月 18 日那笔 → 保存」
+     * 会跳回 11 月 22 日，用户得重新往下翻。这里把用户实际停的位置记下来，
+     * 重建后滚回去。
+     */
+    var detailScrollY: Int = 0
+
     var book: String = "日常账本"
         set(v) {
             field = v
@@ -101,6 +111,7 @@ class MainActivity : Activity() {
                     0 -> {
                         // 直接点「明细」= 清除图表带来的分类筛选
                         filterCat = null
+                        detailScrollY = 0
                         show(0)
                     }
                     else -> show(i)
@@ -128,7 +139,14 @@ class MainActivity : Activity() {
         }
     }
 
-    fun refresh() {
+    /**
+     * v2.31：区分两种刷新。
+     * @param keepScroll true  = 数据变更后的原地刷新（编辑/改分类/写备注/删除/批量改日期），
+     *                           保留用户当前浏览位置；
+     *                   false = 视图条件变化（切月份/账本/筛选/tab），从顶部开始。
+     */
+    fun refresh(keepScroll: Boolean = false) {
+        if (!keepScroll) detailScrollY = 0
         show(tab)
     }
 

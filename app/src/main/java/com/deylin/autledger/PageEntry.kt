@@ -306,11 +306,12 @@ class PageEntry(private val act: MainActivity) {
             }
         }
         closePanel()
-        act.refresh()
     }
 
     private fun closePanel() {
         act.host.removeAllViews()
-        act.refresh()
+        // v2.31：原地刷新，保留明细页浏览位置（不跳回最新一天）。
+        // v2.30 之前这里刷新一次、save() 里又刷新一次，重复重建且都丢滚动位置。
+        act.refresh(true)
     }
 }

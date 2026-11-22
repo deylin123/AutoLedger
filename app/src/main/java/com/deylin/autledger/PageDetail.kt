@@ -222,6 +222,27 @@ class PageDetail(private val act: MainActivity) {
         sv.addView(list)
         root.addView(sv, Ui.lp(Ui.MP, 0, 1f))
 
+        // ---- v2.31：保存 / 恢复流水列表的滚动位置 ----
+        // MainActivity.refresh() 会整页重建，新建 ScrollView 一定回到顶部（最新一天）。
+        // 记录用户实际滚到的位置；必须等列表布局完成、内容高度确定后再滚回去，
+        // 否则 scrollTo 会被 clamp 到 0，视觉上仍然跳回最新一天。
+        sv.setOnScrollChangeListener(
+            View.OnScrollChangeListener { _, _, _, _, _ -> act.detailScrollY = sv.scrollY }
+        )
+        sv.addOnLayoutChangeListener(
+            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val target = act.detailScrollY
+                if (target > 0 && sv.scrollY != target) sv.scrollTo(0, target)
+            }
+        )
+        sv.post {
+            val target = act.detailScrollY
+            if (target > 0) sv.scrollTo(0, target)
+            // scrollTo 会同步触发上面的滚动监听；若此刻布局尚未完成会被 clamp 到 0，
+            // 这里把目标写回，保证后续 layout 回调仍能恢复到用户原来停的位置。
+            act.detailScrollY = target
+        }
+
         return root
     }
 
@@ -311,7 +332,7 @@ class PageDetail(private val act: MainActivity) {
                 .setMessage("${r.cat}  ¥${Ui.money(r.amount)}")
                 .setPositiveButton("删除") { _, _ ->
                     act.db().delRecord(r.id)
-                    act.refresh()
+                    act.refresh(true)   // v2.31：删完仍停在原来的位置
                 }
                 .setNegativeButton("取消", null)
                 .show()
@@ -365,7 +386,7 @@ class PageDetail(private val act: MainActivity) {
                         act, "已把 $n 笔的消费日期改为 ${y}年${m + 1}月${d}日（原时分秒保留）",
                         android.widget.Toast.LENGTH_LONG
                     ).show()
-                    act.refresh()
+                    act.refresh(true)   // v2.31：批量改完日期仍停在原来的位置
                 }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show()
             }
             .setNegativeButton("取消", null)

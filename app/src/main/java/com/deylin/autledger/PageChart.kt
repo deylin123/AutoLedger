@@ -187,6 +187,7 @@ class PageChart(private val act: MainActivity) {
         col.setOnClickListener {
             act.filterCat = p.first
             act.filterType = type
+            act.detailScrollY = 0   // v2.31：筛选后列表变短，从顶部开始
             act.show(0)
         }
         return col
