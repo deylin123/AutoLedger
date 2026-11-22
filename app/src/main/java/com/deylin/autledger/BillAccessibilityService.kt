@@ -933,7 +933,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
                     // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
                     // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
-                    showCard(prev.id, amount, merged, cat, income, pageTs, remembered)
+                    showCard(prev.id, amount, merged, cat, income, pageTs, remembered != null)
                     return true
                 }
             }
@@ -971,7 +971,7 @@ class BillAccessibilityService : AccessibilityService() {
                 this,
                 "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
-            showCard(id, amount, note, cat, income, pageTs, remembered)
+            showCard(id, amount, note, cat, income, pageTs, remembered != null)
             return true
         } finally {
             db.close()
