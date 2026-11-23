@@ -202,6 +202,11 @@ class BillAccessibilityService : AccessibilityService() {
 
     /** OCR 目标页形态闸：必须同时有金额与明确的结算形态，绝不吞普通页 */
     private fun isOcrTargetPage(texts: List<String>): Boolean {
+        // v2.36 纵深防御：OCR 结果直接进 scan()，绕过了 attempt 的全部闸门，
+        // 因此商品在售页判据必须在这里独立生效。语义上二者互斥
+        // （商品页不会有「资金已存入零钱 + 转账时间」），加这一条不改变既有行为，
+        // 只为避免将来放宽 OCR 门槛时重新撕开一个口子。
+        if (PayApps.isOnSaleProductPage(texts)) return false
         val amount = PayApps.findAmount(texts) ?: return false
         val recv = texts.any { it.contains("资金已存入零钱") } &&
             texts.any { it.contains("转账时间") }
