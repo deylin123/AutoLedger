@@ -624,7 +624,15 @@ object PayApps {
     fun isTransferReceivedPage(texts: List<String>): Boolean {
         val hasTransfer = texts.any { it.contains("转账时间") }
         val hasReceive = texts.any { it.contains("收款时间") }
-        val recvTitle = texts.any { TRANSFER_RECV_TITLE.matches(it.trim()) }
+        // v2.35：排除第一人称标题。「你已收款 / 我已收款」是**我收到别人的钱**（收入），
+        // 不是「对方已收款」（我转出去的支出）。OCR 走 SENT/RECV 页时，
+        // 「你已收款，资金已存入零钱」常被拆行成独立的「你已收款」——
+        // 若仍按 v2.32 的「XX已收款 = 对方收款」判，会把收入记成支出。
+        // 真正的 v2.32 场景是带对方昵称的「AA感悟已收款」，不含你/我，不受影响。
+        val recvTitle = texts.any {
+            val t = it.trim()
+            TRANSFER_RECV_TITLE.matches(t) && !t.contains("你") && !t.contains("我")
+        }
         return hasTransfer && hasReceive && recvTitle
     }
 

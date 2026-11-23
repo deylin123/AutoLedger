@@ -178,6 +178,40 @@ class BillAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
 
+    // ---------------- v2.35：微信自绘结果页截屏 OCR ----------------
+
+    /**
+     * OCR 结果回调：把识别出的文本行送进现有 scan()，复用查重/入库/弹卡全链路。
+     * 只处理两类明确的目标结算页（收款成功 / 付款现场），避免对普通聊天页误记。
+     */
+    private val ocrTextsCallback: (List<String>) -> Unit = { lines ->
+        try {
+            val texts = ArrayList(lines)
+            if (isOcrTargetPage(texts)) {
+                Diag.log(this, "OCR 命中目标结算页，送入现有识别链路（${lines.size} 行）")
+                // 复用已验证的 scan()：金额/方向/商户/查重/入库/弹卡全部走原链路。
+                // pkg 固定微信，app 取微信登记项。
+                scan("com.tencent.mm", texts, PayApps.of("com.tencent.mm"))
+            } else {
+                Diag.log(this, "OCR 结果未命中目标结算页形态，忽略（${lines.size} 行）")
+            }
+        } catch (e: Exception) {
+            Diag.log(this, "OCR 回调异常：${e.javaClass.simpleName}")
+        }
+    }
+
+    /** OCR 目标页形态闸：必须同时有金额与明确的结算形态，绝不吞普通页 */
+    private fun isOcrTargetPage(texts: List<String>): Boolean {
+        val amount = PayApps.findAmount(texts) ?: return false
+        val recv = texts.any { it.contains("资金已存入零钱") } &&
+            texts.any { it.contains("转账时间") }
+        val sent = PayApps.isTransferSentPage(texts) &&
+            texts.any { it.contains("支付成功") }
+        if (!recv && !sent) return false
+        Diag.log(this, "OCR 目标页判定：金额 ¥${amount.value}｜${if (recv) "收款成功页" else "付款现场页"}")
+        return true
+    }
+
     /** burst 代次：新的页面切换会自增，旧代次的定时任务自动作废 */
     private var burstToken = 0
 
@@ -599,6 +633,16 @@ class BillAccessibilityService : AccessibilityService() {
                 val inv = winInventory()
                 logSkip("$pkg#nodata#$inv",
                     "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试｜当前窗口：$inv")
+            }
+
+            // v2.35：微信自绘结果页兜底 —— 无障碍通道几乎读不到字（<2 条）时，
+            // 用静默截屏 + OCR 取数。放在指纹节流之前：这类页每帧都读到同样的「正在加载」，
+            // 若放到节流之后会被当成同一屏直接 return，永远走不到 OCR。
+            // 严格限定：仅微信前台（活动窗口为微信或读不到）+ 文本<2 条；节流与形态闸在 OcrCapture/回调内。
+            if (pkg == "com.tencent.mm" && allTexts.size < 2 &&
+                (rootPkg == null || rootPkg == "com.tencent.mm")) {
+                logSkip("$pkg#ocrTrig", "微信自绘页特征（仅 ${allTexts.size} 条文本），请求截屏 OCR")
+                OcrCapture.request(this, handler, pkg, sig, ocrTextsCallback)
             }
 
             // v2.17：内容指纹节流 —— 同一屏文字在 [SAME_SIG_SKIP_MS] 内只判一次。

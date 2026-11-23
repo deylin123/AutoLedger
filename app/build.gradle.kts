@@ -46,8 +46,8 @@ android {
         applicationId = "com.deylin.autledger"
         minSdk = 26
         targetSdk = 34
-        versionCode = 40
-        versionName = "2.34"
+        versionCode = 41
+        versionName = "2.35"
     }
 
     compileOptions {
@@ -58,4 +58,10 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // v2.35：微信自绘结果页（收款/付款现场）文字不进无障碍树，改用截屏 OCR 取数。
+    // bundled 中文模型随包静态链接，离线可用（不依赖 Google Play 服务动态下载）。
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 }
