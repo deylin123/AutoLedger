@@ -910,14 +910,27 @@ class BillAccessibilityService : AccessibilityService() {
             // v2.13：页面带付款时间（账单详情）时用 30 分钟窗 —— 详情页是事后打开的，
             // 按页面付款时间查重仍能对上成功页那一次；页面无时间的支付现场仍用 90 秒。
             val win = if (pageTs != null) PayApps.MERGE_WINDOW_DETAIL_MS else MERGE_WINDOW
-            val prev = db.recentSameAmount(amount, ts, win)
+            val strictPrev = db.recentSameAmount(amount, ts, win)
+            // v2.34：详情页兜底 —— 严窗(20秒)没命中、但页面带真实付款时间时，
+            // 查「同额 + 同收支类型 + 同一天 + ts >= 页面付款时间」的最早一条。
+            // 专门修「昨天支付现场页记的账(ts=识别时刻)，今天打开账单详情(pageTs=付款时刻)
+            // 相差几小时被判成两笔」的重复入库；判据自带跨天/连续同额防护（见 DbHelper 注释）。
+            // 只在详情页(pageTs!=null)启用：支付现场页无绝对时间，不能走这条兜底。
+            // 用 val 组合而非 var+let，避免 lambda 捕获可变局部变量导致 Kotlin smart cast 失效。
+            val fallbackPrev = if (strictPrev == null && pageTs != null)
+                db.firstSameAmountAfter(amount, type, pageTs) else null
+            val prev = strictPrev ?: fallbackPrev
+            val viaFallback = strictPrev == null && fallbackPrev != null
+            if (viaFallback && prev != null && pageTs != null) {
+                Diag.log(this, "$appName ¥$amount → 账单详情兜底命中账本 #${prev.id}（同额同日，识别时刻 ${fmtTs(prev.ts)} ≥ 付款时刻 ${fmtTs(pageTs)}），按同一笔处理")
+            }
 
             // v2.25：页面带绝对时间时，候选记录还必须与页面时间属于「同一时刻」。
             // 这一层是防御性的：查重窗口本身已经限制了跨度，但只要窗口常量被调大、
             // 或者页面时间解析出错（这正是「两天搞混」的成因），就会把另一天的同额账单
             // 认成「已记录」，用户看到的是一张写着别笔账的卡。
             // 取舍：宁可多出一条待确认记录（用户可删），也不把两天的账并成一条。
-            val sameMoment = prev == null || pageTs == null ||
+            val sameMoment = prev == null || pageTs == null || viaFallback ||
                 kotlin.math.abs(prev.ts - pageTs) <= SAME_MOMENT_MS
             if (prev != null && !sameMoment) {
                 Diag.log(

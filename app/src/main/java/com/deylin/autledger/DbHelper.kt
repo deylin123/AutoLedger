@@ -398,8 +398,12 @@ class DbHelper(context: Context) :
      * 用 [existsSimilar] 比不中，会入库两条。窗口取 20 秒。
      */
     fun existsAmountWithin(amount: Double, ts: Long, windowMs: Long): Boolean {
+        // v2.34：CAST 必须加。rawQuery 的 selectionArgs 全是 String，
+        // 旧写法 abs(ts-?)<? 中左边是表达式（无列 affinity，SQLite 判为 integer），
+        // 右边是 TEXT '20000' —— SQLite 类型序 INTEGER < TEXT 恒为真，
+        // 导致时间窗从未生效：任意相隔几小时的同额记录都被当成同一笔候选。
         readableDatabase.rawQuery(
-            "SELECT 1 FROM records WHERE amount=? AND abs(ts-?)<? LIMIT 1",
+            "SELECT 1 FROM records WHERE amount=? AND abs(ts-?)<CAST(? AS INTEGER) LIMIT 1",
             arrayOf(amount.toString(), ts.toString(), windowMs.toString())
         ).use { return it.moveToFirst() }
     }
@@ -412,9 +416,45 @@ class DbHelper(context: Context) :
      */
     fun recentSameAmount(amount: Double, ts: Long, windowMs: Long): Rec? {
         val cols = COLS.joinToString(",")
+        // v2.34：同样必须 CAST(? AS INTEGER)，否则窗口形同虚设（详见 existsAmountWithin 注释）。
         readableDatabase.rawQuery(
-            "SELECT $cols FROM records WHERE amount=? AND abs(ts-?)<? ORDER BY abs(ts-?) ASC LIMIT 1",
+            "SELECT $cols FROM records WHERE amount=? AND abs(ts-?)<CAST(? AS INTEGER) ORDER BY abs(ts-?) ASC LIMIT 1",
             arrayOf(amount.toString(), ts.toString(), windowMs.toString(), ts.toString())
+        ).use { c -> if (c.moveToFirst()) return read(c) }
+        return null
+    }
+
+    /**
+     * v2.34：账单详情页的兜底查重 —— 解决「昨天支付现场页记的账，今天打开账单详情又记一遍」。
+     *
+     * 为什么 recentSameAmount 的严格窗口不够：
+     *  昨天支付现场页没有绝对时间，入库 ts = 识别时刻（如 14:26）；
+     *  今天账单详情的 pageTs = 真实付款时间（如 12:04）。两者相差几小时，
+     *  20 秒严窗必然落空，于是同一笔被当成新账入库（用户实测 ¥28 重复）。
+     *
+     * 判据（四条同时满足，缺一不可）：
+     *  ① amount / type 完全相同 —— 同额收入不并支出；
+     *  ② ts >= fromTs（fromTs 传页面付款时间）—— 识别时刻不可能早于真实付款时刻；
+     *  ③ ts 落在 fromTs 所在的那一天 —— 挡住 v2.25「4号/7号同额串单」；
+     *  ④ ORDER BY ts ASC 取最早一条 —— 付款后第一次识别才是这笔本身，
+     *     后续同日同额的其它消费不会被这一笔吞掉（v2.17「连续同额只弹2笔」的老坑）。
+     *
+     * 注意：这里 ts>=? / ts<? 是「列引用 vs 参数」，列有 INTEGER affinity，String 参数会被
+     * 自动转成数字，不需要 CAST（已用 sqlite3 实证）；踩坑的只有 abs(ts-?) 这种表达式。
+     */
+    fun firstSameAmountAfter(amount: Double, type: Int, fromTs: Long): Rec? {
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = fromTs
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        val dayStart = cal.timeInMillis
+        val nextDayStart = dayStart + 24L * 60 * 60 * 1000
+        val cols = COLS.joinToString(",")
+        readableDatabase.rawQuery(
+            "SELECT $cols FROM records WHERE amount=? AND type=? AND ts>=? AND ts<? ORDER BY ts ASC LIMIT 1",
+            arrayOf(amount.toString(), type.toString(), fromTs.toString(), nextDayStart.toString())
         ).use { c -> if (c.moveToFirst()) return read(c) }
         return null
     }
