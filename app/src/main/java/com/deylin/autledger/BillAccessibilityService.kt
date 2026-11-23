@@ -617,6 +617,18 @@ class BillAccessibilityService : AccessibilityService() {
                         "窗口组=${groups.size} 事件源=${ev?.size ?: 0}(带金额=${evHasAmount}) 共 ${allTexts.size} 条文本｜" +
                         "本页：$brief"
                 )
+
+                // v2.35：微信自绘结果页兜底 —— 无障碍通道几乎读不到字（<2 条）时，
+                // 用静默截屏 + OCR 取数。放在指纹节流之前：这类页每帧都读到同样的「正在加载」，
+                // 若放到节流之后会被当成同一屏直接 return，永远走不到 OCR。
+                // 严格限定：仅微信前台（活动窗口为微信或读不到）+ 文本<2 条；节流与形态闸在 OcrCapture/回调内。
+                // 放在本块内部：allTexts/rootPkg 在此作用域可见（函数指纹节流在块外才定义）。
+                if (pkg == "com.tencent.mm" && allTexts.size < 2 &&
+                    (rootPkg == null || rootPkg == "com.tencent.mm")) {
+                    logSkip("$pkg#ocrTrig", "微信自绘页特征（仅 ${allTexts.size} 条文本），请求截屏 OCR")
+                    val ocrSig = allTexts.joinToString("\u0001")
+                    OcrCapture.request(this, handler, pkg, ocrSig, ocrTextsCallback)
+                }
             }
             if (foreign.isNotEmpty() && registered) {
                 // 排查「读到别家文字」用，同一组合 60 秒只记一次
@@ -633,16 +645,6 @@ class BillAccessibilityService : AccessibilityService() {
                 val inv = winInventory()
                 logSkip("$pkg#nodata#$inv",
                     "${appLabel(pkg)} → 本次未读到本 App 的窗口文本（可能仍在渲染），稍后重试｜当前窗口：$inv")
-            }
-
-            // v2.35：微信自绘结果页兜底 —— 无障碍通道几乎读不到字（<2 条）时，
-            // 用静默截屏 + OCR 取数。放在指纹节流之前：这类页每帧都读到同样的「正在加载」，
-            // 若放到节流之后会被当成同一屏直接 return，永远走不到 OCR。
-            // 严格限定：仅微信前台（活动窗口为微信或读不到）+ 文本<2 条；节流与形态闸在 OcrCapture/回调内。
-            if (pkg == "com.tencent.mm" && allTexts.size < 2 &&
-                (rootPkg == null || rootPkg == "com.tencent.mm")) {
-                logSkip("$pkg#ocrTrig", "微信自绘页特征（仅 ${allTexts.size} 条文本），请求截屏 OCR")
-                OcrCapture.request(this, handler, pkg, sig, ocrTextsCallback)
             }
 
             // v2.17：内容指纹节流 —— 同一屏文字在 [SAME_SIG_SKIP_MS] 内只判一次。
