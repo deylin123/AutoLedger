@@ -530,7 +530,12 @@ object PayApps {
         // v2.7 补充：简版/大字版账单页常用这些字段名，缺了会被判成「看不出支付痕迹」；
         // 「转账详情」是微信转账详情页自身的标题，漏了会导致收款页被判为无支付证据
         "创建时间", "完成时间", "商户订单号", "交易状态", "当前状态", "订单时间",
-        "转账详情"
+        "转账详情",
+        // v2.32：微信「转账已收款」详情页的时间字段是「转账时间 / 收款时间」，
+        // 不是「付款时间」。缺了这两条，hasBillStructure 与 payState 都凑不齐，
+        // 页面在「无支付证据 / #notitle」两道闸被静默拦下 —— 底部「账单详情」
+        // 入口若是自绘按钮、文字没进无障碍树时尤其明显。它们本就是账单结构字段。
+        "转账时间", "收款时间"
     )
 
     /**
@@ -598,6 +603,29 @@ object PayApps {
     private val OUT_EVIDENCE = listOf(
         "朋友已收款", "对方已收款", "转账给", "转给", "付款给", "已转账"
     )
+
+    /**
+     * v2.32：微信「转账已收款」详情页（我转出去的钱，对方已收款）——这是支出。
+     *
+     * 页面形态：抬头「<昵称>已收款」+「¥15.00」+「转账时间」+「收款时间」+ 底部「账单详情」。
+     * 字面「已收款」命中 [INCOME_DECISIVE]，而 [OUT_EVIDENCE] 只列了
+     * 「朋友已收款 / 对方已收款」这类固定文案，剔除不掉带昵称前缀的「AA感悟已收款」，
+     * 于是整页被判成收入；同时正文没有任何微信标题词，底部入口若是自绘按钮，
+     * hasTitle 还会直接失败 → #notitle 一声不响。
+     *
+     * 判据取「转账时间 + 收款时间同时存在 + 抬头是 XX已收款」三项交集：
+     * 这是微信单笔转账详情页独有的字段组合，首页 / 聊天 / 营销页凑不齐。
+     * 刻意不单看「已收款」——那会把真正的收款入账页也判成支出。
+     */
+    private val TRANSFER_RECV_TITLE = Regex("^.{1,20}已收款$")
+
+    fun isTransferReceivedPage(texts: List<String>): Boolean {
+        val hasTransfer = texts.any { it.contains("转账时间") }
+        val hasReceive = texts.any { it.contains("收款时间") }
+        val recvTitle = texts.any { TRANSFER_RECV_TITLE.matches(it.trim()) }
+        return hasTransfer && hasReceive && recvTitle
+    }
+
     /** 一般收入词（弱），需与支出词比较后再定方向 */
     private val INCOME_WEAK = listOf(
         "收入", "收款", "入账", "到账", "退款", "退回", "转入", "收益"
@@ -664,6 +692,10 @@ object PayApps {
         // 放在决定性收入词之前：微信/支付宝账单详情里可能出现「已到账」等字样，
         // 但金额自身的「-47.52」才是这笔钱真实方向的直接证据。
         if (amt != null && amt.signed) return if (amt.expense) DIR_EXPENSE else DIR_INCOME
+        // v2.32：微信「转账已收款」详情页 —— 我转出去的钱，对方已收款，属支出。
+        // 必须放在决定性收入词之前：「XX已收款」会命中 INCOME_DECISIVE 的「已收款」，
+        // 且 OUT_EVIDENCE 的固定文案剔除不掉昵称前缀，旧逻辑必然判成收入。
+        if (isTransferReceivedPage(clean)) return DIR_EXPENSE
         // v2.11：微信转出转账详情页写「朋友已收款」——字面是收款，实际钱出去了。
         // 且「朋友已收款」包含决定性收入词「已收款」的子串，必须先把它从文本里剔除再匹配，
         // 否则转出页会被判成收入。
@@ -708,6 +740,11 @@ object PayApps {
 
     fun hasTitle(texts: List<String>, app: App?): Boolean {
         if (isExcluded(texts, app)) return false
+        // v2.32：微信「转账已收款」详情页正文没有标题词，唯一能命中的是底部
+        // 「账单详情」入口；若该入口是自绘按钮、文字没进无障碍树，整页会在
+        // #notitle 被静默拦下。用页面形态（转账时间+收款时间+XX已收款）直接认定。
+        // 限定微信包名，不影响其它 App 与微信已验证的账单详情页链路。
+        if (app?.pkg == "com.tencent.mm" && isTransferReceivedPage(texts)) return true
         val words = app?.titleWords ?: COMMON_TITLE_WORDS
         // v2.15：广告话术里的钱包词不算标题证据。
         // 「免押租手机，自动扣款成功继续租用」这类营销行命中词表后，
