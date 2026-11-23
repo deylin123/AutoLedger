@@ -750,6 +750,18 @@ class BillAccessibilityService : AccessibilityService() {
                 }
                 return false
             }
+            // v2.36：在售商品页硬闸。
+            //
+            // 用户 2026-11-23 实测：微信里打开一个美食团购小程序（¥68 / 原价¥272 / 2.5折 /
+            // 已售1375 / 仅剩97 / 立即购买），被整页记成「-¥68.00 人气值 48223·相册」。
+            // 标题闸、首页闸、列表闸、消息流闸、门户闸全部漏过 —— 因为它们都在判断
+            // 「这是不是首页/列表/会话」，而这张页面本质是**一件正在卖的商品**。
+            // 放在标题闸之后：本页已被判定「像账单页」，这里再按商品形态否掉，
+            // 不影响任何未命中标题的页面，也不改动已验证的识别核心。
+            if (PayApps.isOnSaleProductPage(texts)) {
+                logSkip("$pkg#onsale", "${app?.name ?: appLabel(pkg)} → 跳过：商品在售详情页（购买按钮/销量/折扣/核销形态），不是已完成的账单｜本页：${sampleOf(texts)}")
+                return false
+            }
             // 未注册的 App：必须有方向佐证才敢认定，避免"订单详情"浏览页误抓
             if (app == null && !PayApps.hasExpenseSignal(texts) && !PayApps.hasIncomeSignal(texts)) return false
 
