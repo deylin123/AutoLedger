@@ -571,7 +571,9 @@ object PayApps {
      */
     fun payState(texts: List<String>): Int {
         // v2.15：广告行里的「支付成功」不算已扣款证据（同 hasTitle 的理由）
-        val hasPaid = PAID_WORDS.any { w -> texts.any { isEvidenceLine(it) && it.contains(w) } }
+        val hasPaid = PAID_WORDS.any { w -> texts.any { isEvidenceLine(it) && it.contains(w) } } ||
+            // v2.33：「待<对方>确认收款」现场页即便"支付成功"没进树，也算已扣款
+            isTransferSentPage(texts)
         if (hasPaid) return STATE_PAID
         val hasUnsettled = UNSETTLED_WORDS.any { w -> texts.any { it.contains(w) } }
         if (hasUnsettled) return STATE_UNPAID
@@ -625,6 +627,33 @@ object PayApps {
         val recvTitle = texts.any { TRANSFER_RECV_TITLE.matches(it.trim()) }
         return hasTransfer && hasReceive && recvTitle
     }
+
+    /**
+     * v2.33：微信「支付成功 + 待<对方>确认收款」付款现场页 —— 主动转钱给对方、等待对方收款。
+     *
+     * 页面形态（用户 2026-11-23 转账截图）：
+     *   支付成功 / 待创盛工作号确认收款 / ¥ 0.10 / 完成
+     * 这是转账场景「第一时间」该弹窗的页面，与 [isTransferReceivedPage] 的事后详情页不同：
+     *  · 现场页：支付成功 + 待<对方>确认收款（钱刚付出、等对方收）；
+     *  · 详情页：XX已收款 + 转账时间 + 收款时间（对方已收、事后核对）。
+     *
+     * 为何必须单列判据：
+     *  「待创盛工作号确认收款」命中 [INCOME_WEAK] 的"收款"，一旦页面上的"支付成功"
+     *  （微信自绘/渲染时机可能没进无障碍树）缺席，方向就会被判成【收入】，把刚付出去的钱
+     *  记成收款；同时 hasTitle 只认 titleWords，缺了"支付成功"整页在 #notitle 被静默拦下。
+     *
+     * 判据取「待<对方>确认收款」整句（对方昵称 1~20 字）：
+     *  · 明确排除含"你"/"我"的句式 ——「待你确认收款」是别人转给我、等我确认，属收入；
+     *  · 只认等待第三方收款的句式 —— 那是我的钱出去了，属支出。
+     *  · hasTitle / payState / direction 三处统一接入，"支付成功"进不进树都能稳定识别。
+     */
+    private val WAIT_CONFIRM_RECV = Regex("^待.{1,20}确认收款$")
+
+    fun isTransferSentPage(texts: List<String>): Boolean =
+        texts.any { t ->
+            val s = t.trim()
+            WAIT_CONFIRM_RECV.matches(s) && !s.contains("你") && !s.contains("我")
+        }
 
     /** 一般收入词（弱），需与支出词比较后再定方向 */
     private val INCOME_WEAK = listOf(
@@ -696,6 +725,10 @@ object PayApps {
         // 必须放在决定性收入词之前：「XX已收款」会命中 INCOME_DECISIVE 的「已收款」，
         // 且 OUT_EVIDENCE 的固定文案剔除不掉昵称前缀，旧逻辑必然判成收入。
         if (isTransferReceivedPage(clean)) return DIR_EXPENSE
+        // v2.33：微信「支付成功 + 待<对方>确认收款」付款现场页 —— 我主动转钱给对方，属支出。
+        // 必须放在决定性收入词之前：「待XX确认收款」命中 INCOME_WEAK 的"收款"，
+        // 且"支付成功"缺席时 exp=0，旧逻辑必然判成收入。
+        if (isTransferSentPage(clean)) return DIR_EXPENSE
         // v2.11：微信转出转账详情页写「朋友已收款」——字面是收款，实际钱出去了。
         // 且「朋友已收款」包含决定性收入词「已收款」的子串，必须先把它从文本里剔除再匹配，
         // 否则转出页会被判成收入。
@@ -744,7 +777,8 @@ object PayApps {
         // 「账单详情」入口；若该入口是自绘按钮、文字没进无障碍树，整页会在
         // #notitle 被静默拦下。用页面形态（转账时间+收款时间+XX已收款）直接认定。
         // 限定微信包名，不影响其它 App 与微信已验证的账单详情页链路。
-        if (app?.pkg == "com.tencent.mm" && isTransferReceivedPage(texts)) return true
+        if (app?.pkg == "com.tencent.mm" &&
+            (isTransferReceivedPage(texts) || isTransferSentPage(texts))) return true
         val words = app?.titleWords ?: COMMON_TITLE_WORDS
         // v2.15：广告话术里的钱包词不算标题证据。
         // 「免押租手机，自动扣款成功继续租用」这类营销行命中词表后，
