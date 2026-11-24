@@ -142,6 +142,30 @@ class BillAccessibilityService : AccessibilityService() {
          */
         private const val SAME_MOMENT_MS = 5 * 60_000L
 
+        /**
+         * v2.38：待确认记录（status=0）的合并窗口。
+         *
+         * 现场页（转账结果页 / 支付成功页）没有绝对付款时间，只能按识别时刻查重，
+         * 而严格窗口是 90 秒。用户转账后返回聊天、几分钟后再点开同一页，
+         * 就会再记一条待确认（真机日志：14:04 与 14:11 各一条 ¥0.1）。
+         *
+         * 10 分钟 + 仅待确认 + 同商户：已经入账的记录不走这条路，
+         * 所以不会把两笔真实的同额消费并成一条。
+         */
+        private const val PENDING_MERGE_WINDOW = 10 * 60_000L
+
+        /**
+         * v2.38：「微信支付」标题的有效期。
+         *
+         * 微信收付款页在无障碍树里只剩一个窗口标题「微信支付」，这是空白页里唯一可靠的信号 ——
+         * 真机日志中两次成功命中（14:04:08 / 14:11:13）都是由它触发。
+         * 反过来，0 条文本的时机绝大多数是切屏、桌面、聊天列表渲染中，
+         * 那 4 次 blank0 截屏全部识别成了聊天页与桌面，纯耗电。
+         * 因此：只有在 60 秒内见过「微信支付」，0 条文本才允许触发一次截屏。
+         */
+        private var lastPayHintAt = 0L
+        private const val PAY_HINT_TTL_MS = 60_000L
+
         /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
         private val FIELD_NOISE = listOf(
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
@@ -268,7 +292,16 @@ class BillAccessibilityService : AccessibilityService() {
         if (rootPkg != null && rootPkg != pkg) return null
         if (PayApps.isOnSaleProductPage(allTexts)) return null
         if (PayApps.hasBillStructure(allTexts)) return null
-        if (allTexts.size < 2) return "blank${allTexts.size}"
+        if (allTexts.size < 2) {
+            // v2.38：拆开两种情况，别再把「切屏途中」当成支付页。
+            //  ① 唯一那条文本含「支付」—— 微信收付款页的窗口标题，直接触发（两次成功都靠它）；
+            //  ② 完全读不到字 —— 只有刚刚还在「微信支付」页（60 秒内）才截一次，
+            //     否则就是桌面/切换动画，截了也是白耗电（真机日志里 4 次 blank0 全是这种）。
+            val only = allTexts.firstOrNull()?.trim() ?: ""
+            if (only.contains("支付")) return "paytitle"
+            val recent = System.currentTimeMillis() - lastPayHintAt <= PAY_HINT_TTL_MS
+            return if (recent) "blank${allTexts.size}" else null
+        }
         if (PayApps.looksLikeTransferSettlement(allTexts)) return "transfer"
         if (PayApps.findAmount(allTexts) != null) return "amount"
         return null
@@ -715,6 +748,9 @@ class BillAccessibilityService : AccessibilityService() {
                 // v2.37：触发条件从「文本 < 2 条」改为 shouldTryOcr —— 群里转账时
                 // 群聊窗口的文本会把 allTexts 撑到几十条，旧条件永远不成立。
                 // 放在本块内部：allTexts/rootPkg 在此作用域可见（函数指纹节流在块外才定义）。
+                // v2.38：记下最近一次看到「微信支付」窗口标题的时刻。
+                // 它是空白页里唯一能区分「支付页在自绘」与「切屏到桌面」的信号。
+                if (allTexts.any { it.contains("微信支付") }) lastPayHintAt = System.currentTimeMillis()
                 val ocrWhy = shouldTryOcr(pkg, allTexts, rootPkg)
                 if (ocrWhy != null) {
                     logSkip(
@@ -1075,8 +1111,20 @@ class BillAccessibilityService : AccessibilityService() {
             // 用 val 组合而非 var+let，避免 lambda 捕获可变局部变量导致 Kotlin smart cast 失效。
             val fallbackPrev = if (strictPrev == null && pageTs != null)
                 db.firstSameAmountAfter(amount, type, pageTs) else null
-            val prev = strictPrev ?: fallbackPrev
+            // v2.38：现场页（无绝对付款时间）的待确认合并。
+            // 严格窗口只有 90 秒，用户转账后过几分钟再点开同一页就会重复新建一条待确认。
+            // 只查 status=0 + 同商户（见 DbHelper.pendingSameAmount 注释）。
+            val pendingPrev = if (strictPrev == null && fallbackPrev == null && pageTs == null)
+                db.pendingSameAmount(amount, type, merchant, ts, PENDING_MERGE_WINDOW) else null
+            val prev = strictPrev ?: fallbackPrev ?: pendingPrev
             val viaFallback = strictPrev == null && fallbackPrev != null
+            if (pendingPrev != null) {
+                Diag.log(
+                    this,
+                    "$appName ¥$amount → 待确认 #${pendingPrev.id}（${pendingPrev.note}）在 " +
+                        "${PENDING_MERGE_WINDOW / 60_000} 分钟内，按同一笔合并，不重复新建"
+                )
+            }
             if (viaFallback && prev != null && pageTs != null) {
                 Diag.log(this, "$appName ¥$amount → 账单详情兜底命中账本 #${prev.id}（同额同日，识别时刻 ${fmtTs(prev.ts)} ≥ 付款时刻 ${fmtTs(pageTs)}），按同一笔处理")
             }

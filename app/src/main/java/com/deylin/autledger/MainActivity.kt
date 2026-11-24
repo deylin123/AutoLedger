@@ -159,6 +159,12 @@ class MainActivity : Activity() {
     // ---------- 自动弹窗就绪检查 ----------
 
     fun accOn(): Boolean {
+        // v2.38：双信号。
+        // 真机日志（2026-11-24）证明 MIUI 上 `enabled_accessibility_services` 读不到本应用包名，
+        // 而服务其实一直在跑（日志里既有「无障碍服务已连接」，又有每两分钟的「服务在线」心跳），
+        // 于是权限条长期误报「无障碍未开」，用户被引去反复开关无障碍 —— 排查方向直接跑偏。
+        // 服务实例存在是比系统设置串更硬的事实：实例只在 onServiceConnected 时登记、onDestroy 时清除。
+        if (BillAccessibilityService.current() != null) return true
         val s = try {
             Settings.Secure.getString(contentResolver, "enabled_accessibility_services")
         } catch (_: Exception) {
@@ -182,26 +188,52 @@ class MainActivity : Activity() {
         warnBar.removeAllViews()
         val miss = missingPerms()
         val ocrNeed = ocrNeedPermission()
-        if (miss.isEmpty() && !ocrNeed) {
+        // v2.38：悬浮卡片是否被系统拦下，按「实际建窗结果」判断。
+        // 真机日志（2026-11-24）里 Activity 查 canDrawOverlays 与 OverlayUi 建窗的结论相反，
+        // 结果就是权限条一句话都不说，而卡片一次都没出现过。
+        val cardBad = cardBlocked() && miss.none { it.startsWith("悬浮窗") }
+        if (miss.isEmpty() && !ocrNeed && !cardBad) {
             warnBar.visibility = View.GONE
             return
         }
         warnBar.visibility = View.VISIBLE
         warnBar.setBackgroundColor(Ui.ORANGE_LIGHT)
-        val msg = if (miss.isNotEmpty())
+        val lines = ArrayList<String>()
+        if (miss.isNotEmpty()) lines.add(
             "自动弹窗还差 ${miss.size} 项权限未开，缺任意一项都不会在别的App上面弹窗：" +
                 miss.joinToString("、")
-        else
+        )
+        if (cardBad) lines.add(
+            "悬浮卡片被系统拦住了（通知仍可确认记账）：点此开启「显示在其他应用上层 / 后台弹出界面」"
+        )
+        if (lines.isEmpty()) {
             // v2.37：截屏是「微信转账结果页」这条补充通道的前提，不影响其它 App 的弹窗，
             // 所以单独提示，不混进上面那句「缺一项都不弹」里，避免吓人。
-            "微信转账结果页的识别还需要「屏幕截取」授权（只需一次），点此测试"
-        val t = Ui.tv(this, msg, 11.5f, Ui.ORANGE_DEEP)
-        t.setPadding(Ui.dp(this, 14f), Ui.dp(this, 9f), Ui.dp(this, 14f), Ui.dp(this, 4f))
-        warnBar.addView(t, Ui.lp(Ui.MP, Ui.WC))
+            lines.add("微信转账结果页的识别还需要「屏幕截取」授权（只需一次），点此测试")
+        }
+        for ((i, s) in lines.withIndex()) {
+            val t = Ui.tv(this, s, 11.5f, Ui.ORANGE_DEEP)
+            t.setPadding(
+                Ui.dp(this, 14f),
+                Ui.dp(this, if (i == 0) 9f else 2f),
+                Ui.dp(this, 14f),
+                Ui.dp(this, 3f)
+            )
+            warnBar.addView(t, Ui.lp(Ui.MP, Ui.WC))
+        }
         val t2 = Ui.tv(this, "点此逐项开启 →", 11.5f, Ui.ORANGE_DEEP, true)
-        t2.setPadding(Ui.dp(this, 14f), 0, Ui.dp(this, 14f), Ui.dp(this, 10f))
+        t2.setPadding(Ui.dp(this, 14f), Ui.dp(this, 2f), Ui.dp(this, 14f), Ui.dp(this, 10f))
         warnBar.addView(t2, Ui.lp(Ui.MP, Ui.WC))
         warnBar.setOnClickListener { showPermDialog() }
+    }
+
+    /** v2.38：卡片通道的真实结局（ok / no_perm / addview:Xxx / zero），由 OverlayUi 落盘 */
+    fun cardState(): String =
+        getSharedPreferences("cfg", MODE_PRIVATE).getString("card_state", "") ?: ""
+
+    fun cardBlocked(): Boolean {
+        val s = cardState()
+        return s == "no_perm" || s.startsWith("addview:") || s == "zero"
     }
 
     /**
@@ -253,6 +285,9 @@ class MainActivity : Activity() {
 
     fun showPermDialog() {
         val items = ArrayList(missingPerms())
+        // v2.38：权限查询说「已开」但实际建不出窗时，仍然要能从这里跳去开权限
+        if (cardBlocked() && items.none { it.startsWith("悬浮窗") })
+            items.add("悬浮窗（悬浮卡片被系统拦住）")
         // v2.37：屏幕截取单独列一项，只影响微信转账结果页这条补充通道
         if (ocrNeedPermission()) items.add("屏幕截取（微信转账结果页识别）")
         if (items.isEmpty()) return

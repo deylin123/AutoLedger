@@ -316,6 +316,10 @@ object OverlayUi {
         remembered: Boolean
     ) {
         if (!Settings.canDrawOverlays(app)) {
+            // v2.38：把卡片通道的真实结局落盘，主界面权限条据此提示。
+            // 不能只靠 Settings.canDrawOverlays 在 Activity 里再查一次 —— 真机日志里两者结论不一致
+            // （Activity 查得到权限、这里建不了窗），用户因此以为「权限都开了还是不弹」。
+            markCardState(app, "no_perm")
             Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
             return
         }
@@ -500,8 +504,10 @@ object OverlayUi {
             cardRecId = id
             // v2.25：记住这张卡属于哪一页（页面付款时间），页面一换就被 bindPage 收掉
             cardPageTs = if (pageTs > 0L) pageTs else 0L
+            markCardState(app, "ok")
             Diag.logCard(app, "卡片已 addView（通知同时已发）")
         } catch (e: Exception) {
+            markCardState(app, "addview:" + e.javaClass.simpleName)
             Diag.logCard(
                 app,
                 "addView 失败（${e.javaClass.simpleName}），通知已发。小米/红米请确认「后台弹出界面」权限"
@@ -510,6 +516,10 @@ object OverlayUi {
         }
         // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
         v.postDelayed({
+            // v2.38：addView 没抛异常但宽为 0，是 MIUI「后台弹出界面」被拒的典型表现 ——
+            // 代码以为成功了，用户什么都没看到。这种情况单独落一个 zero 状态，
+            // 权限条才能提示到点子上（否则用户会以为识别没工作）。
+            if (v.width == 0) markCardState(app, "zero")
             Diag.logCard(
                 app,
                 "卡片尺寸 " + v.width + "x" + v.height +
@@ -518,6 +528,23 @@ object OverlayUi {
             )
         }, 500)
         handler.postDelayed(hideTask, CARD_AUTO_HIDE_MS)
+    }
+
+    /**
+     * v2.38：卡片通道的结局落盘。
+     *
+     * 取值：ok / no_perm / addview:<异常名> / zero（addView 成功但宽为 0，MIUI 典型表现）。
+     * 主界面权限条读这个值提示用户，而不是自己再调一次 Settings.canDrawOverlays ——
+     * 真机日志证明两者结论可以不一致，判据必须用「实际建窗结果」而不是「权限查询结果」。
+     */
+    private fun markCardState(app: Context, v: String) {
+        try {
+            app.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
+                .putString("card_state", v)
+                .putLong("card_state_at", System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {
+        }
     }
 
     /** v2.30：备注栏文案（有备注显示内容，无备注显示引导） */

@@ -459,8 +459,46 @@ class DbHelper(context: Context) :
         return null
     }
 
-    // ---------- 商户分类记忆（v2.28） ----------
+    /**
+     * v2.38：待确认记录的合并查询。
+     *
+     * 真机事故（2026-11-24 日志，小米 17 Ultra）：
+     *   14:04:08 转账结果页 OCR 记下 #150 ¥0.1「创盛工作号」待确认；
+     *   用户 7 分钟后回到同一页，14:11:13 又识别一次 ——
+     *   现场页没有绝对付款时间，严格窗口只有 90 秒，于是新建 #151。
+     *   同一笔钱在待确认列表里出现两条。
+     *
+     * 为什么放宽到 10 分钟是安全的：只认 status=0（尚未入账）+ 同商户。
+     * 用户一旦确认入账（status=1），这条路径立刻失效，不会把两笔真实的同额消费并掉；
+     * 同一天的限制由调用方窗口保证，不跨日合并。
+     */
+    fun pendingSameAmount(amount: Double, type: Int, note: String, ts: Long, windowMs: Long): Rec? {
+        val cols = COLS.joinToString(",")
+        readableDatabase.rawQuery(
+            "SELECT $cols FROM records WHERE amount=? AND type=? AND status=0 " +
+                "AND abs(ts-?)<CAST(? AS INTEGER) ORDER BY abs(ts-?) ASC",
+            arrayOf(
+                amount.toString(), type.toString(),
+                ts.toString(), windowMs.toString(), ts.toString()
+            )
+        ).use { c ->
+            while (c.moveToNext()) {
+                val r = read(c)
+                if (sameMerchant(r.note, note)) return r
+            }
+        }
+        return null
+    }
 
+    /** 卡片备注形如「商户·商品」，只比商户段；任一方为空（识别不全）时放行，交给金额与时间窗兜住 */
+    private fun sameMerchant(a: String, b: String): Boolean {
+        val x = a.substringBefore('·').trim()
+        val y = b.substringBefore('·').trim()
+        if (x.isEmpty() || y.isEmpty()) return true
+        return x == y
+    }
+
+    // ---------- 商户分类记忆（v2.28） ----------
     /**
      * v2.29：记住（或累计）某商户的惯用分类。
      * 用户原话是「某个商户**多次调整**它的类别」才该记忆 —— 改一次就永久记住太激进，
