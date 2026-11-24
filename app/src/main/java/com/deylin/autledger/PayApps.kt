@@ -573,7 +573,9 @@ object PayApps {
         // v2.15：广告行里的「支付成功」不算已扣款证据（同 hasTitle 的理由）
         val hasPaid = PAID_WORDS.any { w -> texts.any { isEvidenceLine(it) && it.contains(w) } } ||
             // v2.33：「待<对方>确认收款」现场页即便"支付成功"没进树，也算已扣款
-            isTransferSentPage(texts)
+            // v2.37：OCR 拆行形态同样算（isTransferSentPage 内含拼接兜底）；
+            //        「转账成功/已转账 + 转账对象」结果页也一并算已扣款
+            isTransferSentPage(texts) || isTransferPaidResultPage(texts)
         if (hasPaid) return STATE_PAID
         val hasUnsettled = UNSETTLED_WORDS.any { w -> texts.any { it.contains(w) } }
         if (hasUnsettled) return STATE_UNPAID
@@ -603,7 +605,10 @@ object PayApps {
      * 不加这道守卫会被 INCOME_DECISIVE 判成收入。
      */
     private val OUT_EVIDENCE = listOf(
-        "朋友已收款", "对方已收款", "转账给", "转给", "付款给", "已转账"
+        "朋友已收款", "对方已收款", "转账给", "转给", "付款给", "已转账",
+        // v2.37：「转账成功」只可能是自己转出去（收款页写的是「收款成功」），
+        // 缺了它，只有「转账成功 + 收款方」的结果页方向判不明，OCR 通道会白读一屏字。
+        "转账成功"
     )
 
     /**
@@ -657,11 +662,145 @@ object PayApps {
      */
     private val WAIT_CONFIRM_RECV = Regex("^待.{1,20}确认收款$")
 
-    fun isTransferSentPage(texts: List<String>): Boolean =
-        texts.any { t ->
-            val s = t.trim()
-            WAIT_CONFIRM_RECV.matches(s) && !s.contains("你") && !s.contains("我")
+    /**
+     * v2.37：**OCR 拆行兜底**。
+     *
+     * 截屏 OCR 是逐行返回的，微信这一行「待创盛工作号确认收款」在 OCR 结果里
+     * 常常是两行（「待创盛工作号」/「确认收款」）—— 整行正则 [WAIT_CONFIRM_RECV]
+     * 必然失配，于是 OCR 明明读到了字，却在形态闸/方向判定里被当成"不是转账页"。
+     * 这就是「加了 OCR 还是不弹」的头号原因：通道通了，判据没通。
+     *
+     * 这里把整页拼成一条串再找「待…确认收款」，用 `[^\s，。,.!！?？:：]{0,20}?`
+     * 限制在同一个短语内，不跨标点、不跨空格，避免把两段无关文字拼成一句话。
+     */
+    private val WAIT_CONFIRM_RECV_LOOSE = Regex("待[^\\s，。,.!！?？:：]{0,20}?确认收款")
+
+    private val WHITESPACE = Regex("\\s+")
+
+    fun isTransferSentPage(texts: List<String>): Boolean {
+        // ① 正常形态：无障碍通道里整行就是「待<对方>确认收款」
+        if (texts.any { t ->
+                val s = t.trim()
+                WAIT_CONFIRM_RECV.matches(s) && !s.contains("你") && !s.contains("我")
+            }) return true
+        // ② v2.37：OCR 拆行兜底
+        // 拼接时去掉所有空白：OCR 常在中文词之间插空格（「待 创盛工作号 确认收款」），
+        // 留着空白会让下面的 {0,20} 在半路断掉。
+        val joined = texts.joinToString("").replace(WHITESPACE, "")
+        if (joined.isEmpty()) return false
+        var from = 0
+        while (from < joined.length) {
+            val m = WAIT_CONFIRM_RECV_LOOSE.find(joined, from) ?: return false
+            // 「待你确认收款 / 待我确认收款」是别人转给我、等我确认 —— 属收入。
+            // 昵称里带「你/我」极罕见，误判成支出（把收入记成支出）比漏记代价更大，宁严不宽。
+            if (!m.value.contains("你") && !m.value.contains("我")) return true
+            from = m.range.last + 1
         }
+        return false
+    }
+
+    /**
+     * v2.37：付款已完成的转账结果页（OCR 通道用）。
+     *
+     * 微信转账有两种结果页文案：
+     *  · 「支付成功 + 待<对方>确认收款」→ 由 [isTransferSentPage] 负责；
+     *  · 「转账成功 / 已转账 + 转账给XX / 收款方」→ 本函数负责。
+     * 后者若不在方向判定里显式接管，「转账成功」+「收款方」这一屏会因
+     * EXPENSE_STRONG 一条都不命中而判成 DIR_UNKNOWN，scan() 直接 return。
+     */
+    fun isTransferPaidResultPage(texts: List<String>): Boolean {
+        // v2.37 重要：必须是**整行等于**结果页标题，不能是 contains。
+        // 聊天里别人说「转账成功了」，contains 会把它当成结果页 —— 那一屏就要被 OCR 记账。
+        val done = texts.any { t -> TRANSFER_RESULT_TITLES.any { w -> isTitleLine(t, w) } }
+        if (!done) return false
+        val target = texts.any { t ->
+            t.contains("转账给") || t.contains("转给") || t.contains("收款方") ||
+                t.contains("收款人") || t.contains("转账金额") || t.contains("转账说明")
+        }
+        if (target) return true
+        // v2.37：微信转账结果页常常只有「转账成功 / ¥500.00 / 完成」三四行，
+        // 没有「转账给」这类字段。用「文本极少 + 有金额」兜住这个形态：
+        // 聊天页会有一大堆消息行，且极少同时出现结果页标题与货币符号金额。
+        return texts.size <= 8 && findAmount(texts) != null
+    }
+
+    /** 转账结果页可能出现的标题（必须整行命中，见 [isTransferPaidResultPage]） */
+    private val TRANSFER_RESULT_TITLES = listOf(
+        "转账成功", "转账已发出", "转账已完成", "已转账", "转账已收款",
+        "对方已收款", "朋友已收款"
+        // 刻意不含「收款成功」：那是**我收到钱**的标题，放进这里会把收入判成支出
+    )
+
+    /** 整行是否等于某个标题词（容忍 OCR 带上的句末标点） */
+    private fun isTitleLine(line: String, word: String): Boolean {
+        val s = line.trim().trimEnd('。', '，', '！', '!', '.', ',', '：', ':')
+        return s == word
+    }
+
+    /**
+     * v2.37：转账页的收款人 —— 从「待XX确认收款」「转账给XX」「XX已收款」里抽出来做备注。
+     *
+     * 不抽的话，[goodsNear] 会把「待创盛工作号确认收款」整句当成商户名写进账本，
+     * 用户看到的是「待创盛工作号确认收款」这种不像人话的备注。
+     */
+    fun transferTarget(texts: List<String>): String? {
+        val pats = listOf(
+            Regex("待(.{1,20}?)确认收款"),
+            Regex("转账给\\s*(.{1,20})"),
+            Regex("转给\\s*(.{1,20})"),
+            Regex("^(.{1,20})已收款$")
+        )
+        val joined = texts.joinToString("")
+        val sources = ArrayList<String>(texts.size + 1)
+        sources.addAll(texts)
+        if (joined.isNotEmpty()) sources.add(joined)
+        for (t in sources) {
+            val s = t.trim()
+            if (s.isEmpty()) continue
+            for (p in pats) {
+                val m = p.find(s) ?: continue
+                val name = m.groupValues[1].trim().trim('：', ':', '，', ',', ' ')
+                if (name.isEmpty() || name.length > 20) continue
+                if (name.contains("确认") || name.contains("转账") || name.contains("收款")) continue
+                // 「你已收款 / 对方已收款 / 朋友已收款」抽出来的是代词不是收款人
+                if (name == "你" || name == "我" || name == "他" || name == "她" ||
+                    name == "对方" || name == "朋友" || name == "本人" || name == "自己"
+                ) continue
+                if (NOISE_VALUE.any { name.contains(it) }) continue
+                if (isJunkValue(name)) continue
+                return name
+            }
+        }
+        return null
+    }
+
+    /**
+     * v2.37：结算现场页的低成本特征词。
+     *
+     * 只用于「这一屏值不值得截一次屏做 OCR」，**不做最终判定**（最终判定在
+     * isTransferSentPage / isTransferPaidResultPage / isTransferReceivedPage）。
+     * 微信转账页文字不进无障碍树，多数时候这一屏只读到「正在加载」，
+     * 所以这个特征只是"文字碰巧读到了一点"时的一条补充线索。
+     */
+    fun looksLikeTransferSettlement(texts: List<String>): Boolean {
+        if (texts.isEmpty()) return false
+        for (t in texts) {
+            // 结果页标题必须整行命中：「林百万: 转账成功了」是聊天，不是结果页
+            if (TRANSFER_RESULT_TITLES.any { w -> isTitleLine(t, w) }) return true
+            if (TRANSFER_SETTLE_HINTS.any { t.contains(it) }) return true
+        }
+        return false
+    }
+
+    /**
+     * 可以在句子中间出现的结算语汇（「等待对方确认收款」「转账给XX」）。
+     * 结果页标题不放在这里 —— 那些必须整行命中，见 [looksLikeTransferSettlement]。
+     */
+    private val TRANSFER_SETTLE_HINTS = listOf(
+        "确认收款", "待收款", "待对方", "等待对方", "等待确认",
+        "资金已存入零钱", "已存入零钱", "转账时间",
+        "AA收款", "群收款", "发起收款", "收款方", "转账给", "转给"
+    )
 
     /** 一般收入词（弱），需与支出词比较后再定方向 */
     private val INCOME_WEAK = listOf(
@@ -737,6 +876,10 @@ object PayApps {
         // 必须放在决定性收入词之前：「待XX确认收款」命中 INCOME_WEAK 的"收款"，
         // 且"支付成功"缺席时 exp=0，旧逻辑必然判成收入。
         if (isTransferSentPage(clean)) return DIR_EXPENSE
+        // v2.37：转账结果页「转账成功 / 已转账 + 转账给XX / 收款方」也是支出。
+        // 必须同样放在决定性收入词之前：「对方已收款 / 朋友已收款」含 INCOME_DECISIVE 的
+        // 「已收款」，且 OUT_EVIDENCE 只做整词剔除，剔不掉带昵称前缀的句式。
+        if (isTransferPaidResultPage(clean)) return DIR_EXPENSE
         // v2.11：微信转出转账详情页写「朋友已收款」——字面是收款，实际钱出去了。
         // 且「朋友已收款」包含决定性收入词「已收款」的子串，必须先把它从文本里剔除再匹配，
         // 否则转出页会被判成收入。

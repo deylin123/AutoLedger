@@ -71,21 +71,27 @@ object OcrCapture {
         handler: Handler,
         pkg: String,
         fingerprint: String,
-        onTexts: (List<String>) -> Unit
+        onTexts: (List<String>) -> Unit,
+        force: Boolean = false,
+        probe: Boolean = false
     ) {
         if (pkg != TARGET_PKG) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Diag.log(svc, "OCR 降级：系统 ${Build.VERSION.SDK_INT} < 30，不支持无障碍截屏，沿用页面通道")
+            markState(svc, "unsupported")
             return
         }
         val now = System.currentTimeMillis()
-        if (now - lastOcrAt < OCR_MIN_INTERVAL_MS) return
-        if (inFlight) return
-        if (fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
-            now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3) return
-        synchronized(this) {
-            if (inFlight) return
+        if (!force) {
             if (now - lastOcrAt < OCR_MIN_INTERVAL_MS) return
+            if (inFlight) return
+            if (fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
+                now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3) return
+        }
+        synchronized(this) {
+            // force（用户手动测试）只跳过时间节流与同页抑制，不跳过并发保护
+            if (inFlight) return
+            if (!force && now - lastOcrAt < OCR_MIN_INTERVAL_MS) return
             inFlight = true
             lastOcrAt = now
             if (fingerprint.isNotEmpty()) lastFingerprint = fingerprint
@@ -104,6 +110,8 @@ object OcrCapture {
                 exec,
                 object : AccessibilityService.TakeScreenshotCallback {
                     override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        // v2.37：截到图就说明「截取屏幕内容」权限已授予 —— 落成用户可见状态
+                        markState(svc, "ok")
                         var bitmap: Bitmap? = null
                         try {
                             val hw = result.hardwareBuffer ?: run {
@@ -158,7 +166,17 @@ object OcrCapture {
                     }
 
                     override fun onFailure(errorCode: Int) {
-                        Diag.log(svc, "OCR 截屏失败 code=$errorCode")
+                        val why = errText(errorCode)
+                        markState(svc, "fail:$errorCode")
+                        Diag.log(
+                            svc,
+                            "OCR 截屏失败 code=$errorCode（$why）" +
+                                if (errorCode == 1 || errorCode == 2)
+                                    " —— 常见原因是系统未授予「截取屏幕内容」，" +
+                                        "请回本 App 主界面点「测试屏幕截取」并允许授权"
+                                else ""
+                        )
+                        if (probe) toast(svc, "屏幕截取失败：$why")
                         release()
                     }
                 }
@@ -171,6 +189,37 @@ object OcrCapture {
 
     private fun release() {
         inFlight = false
+    }
+
+    /**
+     * v2.37：截屏通道的状态（ok / fail:code / unsupported）落进 cfg，
+     * 主界面据此在权限条里提示「屏幕截取未授权」，避免整条链路黑盒。
+     */
+    private fun markState(ctx: Context, v: String) {
+        try {
+            ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
+                .putString("ocr_state", v)
+                .putLong("ocr_state_at", System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun errText(code: Int): String = when (code) {
+        1 -> "内部错误"
+        2 -> "无障碍服务无权截屏"
+        3 -> "两次截屏间隔过短"
+        4 -> "显示无效"
+        else -> "未知错误"
+    }
+
+    private fun toast(ctx: Context, s: String) {
+        try {
+            Handler(ctx.mainLooper).post {
+                android.widget.Toast.makeText(ctx, s, android.widget.Toast.LENGTH_LONG).show()
+            }
+        } catch (_: Exception) {
+        }
     }
 
     /** 等比缩小到最长边 <= maxDim，返回同对象（未缩小）或新 Bitmap */

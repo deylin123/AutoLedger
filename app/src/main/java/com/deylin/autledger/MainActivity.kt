@@ -181,18 +181,21 @@ class MainActivity : Activity() {
         if (!this::warnBar.isInitialized) return
         warnBar.removeAllViews()
         val miss = missingPerms()
-        if (miss.isEmpty()) {
+        val ocrNeed = ocrNeedPermission()
+        if (miss.isEmpty() && !ocrNeed) {
             warnBar.visibility = View.GONE
             return
         }
         warnBar.visibility = View.VISIBLE
         warnBar.setBackgroundColor(Ui.ORANGE_LIGHT)
-        val t = Ui.tv(
-            this,
+        val msg = if (miss.isNotEmpty())
             "自动弹窗还差 ${miss.size} 项权限未开，缺任意一项都不会在别的App上面弹窗：" +
-                miss.joinToString("、"),
-            11.5f, Ui.ORANGE_DEEP
-        )
+                miss.joinToString("、")
+        else
+            // v2.37：截屏是「微信转账结果页」这条补充通道的前提，不影响其它 App 的弹窗，
+            // 所以单独提示，不混进上面那句「缺一项都不弹」里，避免吓人。
+            "微信转账结果页的识别还需要「屏幕截取」授权（只需一次），点此测试"
+        val t = Ui.tv(this, msg, 11.5f, Ui.ORANGE_DEEP)
         t.setPadding(Ui.dp(this, 14f), Ui.dp(this, 9f), Ui.dp(this, 14f), Ui.dp(this, 4f))
         warnBar.addView(t, Ui.lp(Ui.MP, Ui.WC))
         val t2 = Ui.tv(this, "点此逐项开启 →", 11.5f, Ui.ORANGE_DEEP, true)
@@ -201,16 +204,66 @@ class MainActivity : Activity() {
         warnBar.setOnClickListener { showPermDialog() }
     }
 
+    /**
+     * v2.37：截屏 OCR 通道状态。
+     * ok=已就绪；fail:code=系统拒绝了截屏；unsupported=系统版本不支持；空=从未跑过。
+     */
+    fun ocrState(): String =
+        getSharedPreferences("cfg", MODE_PRIVATE).getString("ocr_state", "") ?: ""
+
+    /** 微信转账结果页识别是否还缺截屏授权（不影响其它 App 的弹窗识别） */
+    fun ocrNeedPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < 30) return false
+        val s = ocrState()
+        return s != "ok" && s != "unsupported"
+    }
+
+    /**
+     * v2.37：测试屏幕截取。
+     *
+     * 微信转账结果页是微信自绘的，文字不进无障碍树，只能截屏 + OCR 才能第一时间记账。
+     * 而 takeScreenshot 首次必须由用户点系统授权框 —— 之前这个环节完全黑盒，
+     * 用户只看到「转账还是不弹」。现在把它做成一个用户能自己点、能自己看结果的按钮。
+     */
+    fun probeOcr() {
+        val svc = BillAccessibilityService.current()
+        if (svc == null) {
+            AlertDialog.Builder(this)
+                .setTitle("请先开启无障碍")
+                .setMessage(
+                    "屏幕截取依赖无障碍服务，现在无障碍还没连上。\n\n" +
+                        "请先开启「无障碍（账单页识别）」，回到这里再点一次「屏幕截取」测试。"
+                )
+                .setPositiveButton("去开启") { _, _ -> openAccessibility() }
+                .setNegativeButton("知道了", null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("测试屏幕截取")
+            .setMessage(
+                "微信转账的结果页是微信自己绘制的，文字读不进系统，只能截屏识别文字来记账。\n\n" +
+                    "点「开始测试」后系统会弹一次「允许截取屏幕内容」，请点允许。\n" +
+                    "本 App 只对微信截屏，其它 App 一律不截。"
+            )
+            .setPositiveButton("开始测试") { _, _ -> svc.probeScreenshot() }
+            .setNegativeButton("稍后", null)
+            .show()
+    }
+
     fun showPermDialog() {
-        val miss = missingPerms()
-        if (miss.isEmpty()) return
+        val items = ArrayList(missingPerms())
+        // v2.37：屏幕截取单独列一项，只影响微信转账结果页这条补充通道
+        if (ocrNeedPermission()) items.add("屏幕截取（微信转账结果页识别）")
+        if (items.isEmpty()) return
         AlertDialog.Builder(this)
             .setTitle("开启自动弹窗所需权限")
-            .setItems(miss.toTypedArray()) { _, w ->
-                val m = miss[w]
+            .setItems(items.toTypedArray()) { _, w ->
+                val m = items[w]
                 when {
                     m.startsWith("无障碍") -> openAccessibility()
                     m.startsWith("悬浮窗") -> openOverlay()
+                    m.startsWith("屏幕截取") -> probeOcr()
                     else -> if (Build.VERSION.SDK_INT >= 33) {
                         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
                     }

@@ -14,6 +14,7 @@ import android.view.View
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * 账单页抓取。
@@ -174,6 +175,20 @@ class BillAccessibilityService : AccessibilityService() {
         // v2.20：live / presentCard 已移除。
         // 通知通道不再依赖「无障碍服务实例是否存在」，而是直接调用 OverlayUi.show()，
         // 这样无障碍关闭时通知通道依然能弹卡。
+
+        /**
+         * v2.37：当前服务实例。
+         *
+         * `takeScreenshot` **只能由 AccessibilityService 自己发起**，Activity 拿不到这个能力。
+         * 但用户需要能在主界面自己确认「截屏这条路到底通不通」—— 否则每次转账不弹
+         * 都只能靠导出日志猜，这正是 v2.35/v2.36 两版反复卡住的原因。
+         * 服务被系统回收后必须置空，否则主界面会对着一个死实例调方法。
+         */
+        @Volatile
+        var inst: BillAccessibilityService? = null
+
+        /** 供主界面安全取用（可能为 null：无障碍未开启 / 服务尚未连上） */
+        fun current(): BillAccessibilityService? = inst
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -200,7 +215,16 @@ class BillAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** OCR 目标页形态闸：必须同时有金额与明确的结算形态，绝不吞普通页 */
+    /**
+     * OCR 目标页形态闸：必须同时有金额与明确的结算形态，绝不吞普通页。
+     *
+     * v2.37 关键修正：这里原来要求「待XX确认收款」**且**页面里含「支付成功」四个字，
+     * 而微信这一屏的自绘文案只有「支付成功」或只有「待XX确认收款」，两者经常不同时出现；
+     * 更致命的是 OCR 逐行返回，「待创盛工作号确认收款」会被切成两行，
+     * 整行正则 [PayApps.WAIT_CONFIRM_RECV] 必然失配 —— 通道通了、判据没通，
+     * 于是「加了 OCR 还是不弹」。现在判据改由 PayApps 三个语义函数统一裁决，
+     * 拆行兜底在 PayApps.isTransferSentPage 内部完成。
+     */
     private fun isOcrTargetPage(texts: List<String>): Boolean {
         // v2.36 纵深防御：OCR 结果直接进 scan()，绕过了 attempt 的全部闸门，
         // 因此商品在售页判据必须在这里独立生效。语义上二者互斥
@@ -208,13 +232,73 @@ class BillAccessibilityService : AccessibilityService() {
         // 只为避免将来放宽 OCR 门槛时重新撕开一个口子。
         if (PayApps.isOnSaleProductPage(texts)) return false
         val amount = PayApps.findAmount(texts) ?: return false
-        val recv = texts.any { it.contains("资金已存入零钱") } &&
-            texts.any { it.contains("转账时间") }
-        val sent = PayApps.isTransferSentPage(texts) &&
-            texts.any { it.contains("支付成功") }
+        // ① 收款成功页（别人转给我）：资金已存入零钱 + 转账/收款时间
+        val recv = texts.any { it.contains("资金已存入零钱") || it.contains("已存入零钱") } &&
+            texts.any { it.contains("转账时间") || it.contains("收款时间") }
+        // ② 付款现场页：待<对方>确认收款（含 OCR 拆行形态）
+        // ③ 转账结果页：转账成功 / 已转账 + 转账对象
+        val sent = PayApps.isTransferSentPage(texts) || PayApps.isTransferPaidResultPage(texts)
         if (!recv && !sent) return false
-        Diag.log(this, "OCR 目标页判定：金额 ¥${amount.value}｜${if (recv) "收款成功页" else "付款现场页"}")
+        Diag.log(
+            this,
+            "OCR 目标页判定：金额 ¥${amount.value}｜" +
+                (if (recv) "收款成功页" else "付款/转账结果页") +
+                "｜原文：${texts.take(20).joinToString("/").take(220)}"
+        )
         return true
+    }
+
+    /**
+     * v2.37：这一屏值不值得截一次屏做 OCR。返回触发原因（null = 不触发）。
+     *
+     * 旧条件是 `allTexts.size < 2` —— 群里转账时微信单 Activity 多窗口，
+     * 群聊窗口的文本会一起被 grabGroups 收进 allTexts，条数轻松几十条，
+     * 于是「文字读不到的转账页」永远等不到 OCR。这是第二个死结。
+     *
+     * 现在按「这一屏有没有能力被无障碍读懂」判断，而不是按文本条数：
+     *  · 已有账单结构（付款时间/交易单号…）→ 无障碍够用，不截屏（省电、也不打扰）；
+     *  · 读不到字（<2 条）→ 典型自绘页，必须 OCR；
+     *  · 命中转账结算语汇 → 极可能正是转账页的残影，OCR 补全；
+     *  · 有货币符号金额但没有账单结构 → 结算现场页的常见形态。
+     * 真实的节流与同页抑制在 OcrCapture 内（4 秒 / 同指纹 12 秒），不会被刷屏。
+     */
+    private fun shouldTryOcr(pkg: String, allTexts: List<String>, rootPkg: String?): String? {
+        if (pkg != "com.tencent.mm") return null
+        // 活动窗口必须是微信；读不到活动窗口时放行（fail-open，与前台判定同一原则）
+        if (rootPkg != null && rootPkg != pkg) return null
+        if (PayApps.isOnSaleProductPage(allTexts)) return null
+        if (PayApps.hasBillStructure(allTexts)) return null
+        if (allTexts.size < 2) return "blank${allTexts.size}"
+        if (PayApps.looksLikeTransferSettlement(allTexts)) return "transfer"
+        if (PayApps.findAmount(allTexts) != null) return "amount"
+        return null
+    }
+
+    /**
+     * v2.37：主动试一次截屏 —— 把「截屏权限」从黑盒变成用户能自己验证的一件事。
+     *
+     * 首次调用 takeScreenshot 时系统会弹一次「允许截取屏幕内容」；用户点了拒绝之后，
+     * 后续每次都会失败，而界面上毫无提示 —— v2.35/v2.36 就卡在这里，用户看到的现象
+     * 只有「转账还是不弹」，日志里也只有一行 code。
+     */
+    fun probeScreenshot() {
+        Diag.log(this, "截屏探针：开始（若系统弹出授权，请点「允许」）")
+        toast("正在测试屏幕截取…")
+        OcrCapture.request(
+            this, handler, "com.tencent.mm", "probe#${System.currentTimeMillis()}",
+            { lines ->
+                Diag.log(this, "截屏探针成功：识别 ${lines.size} 行，屏幕截取权限已就绪")
+                toast("屏幕截取已就绪：转账结果页可以自动识别了")
+            },
+            force = true, probe = true
+        )
+    }
+
+    private fun toast(s: String) {
+        try {
+            Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+        } catch (_: Exception) {
+        }
     }
 
     /** burst 代次：新的页面切换会自增，旧代次的定时任务自动作废 */
@@ -279,6 +363,8 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // v2.37：登记实例，供主界面「测试屏幕截取」使用
+        inst = this
         // v2.27：不再无条件 setServiceInfo。
         // v2.26 每次连接都整体写回 serviceInfo；这个 setter 会替换系统里的整份服务配置，
         // 若某 ROM 的 getter 副本字段不全，等于把 eventTypes 清成 0 —— 服务从此收不到
@@ -623,15 +709,19 @@ class BillAccessibilityService : AccessibilityService() {
                         "本页：$brief"
                 )
 
-                // v2.35：微信自绘结果页兜底 —— 无障碍通道几乎读不到字（<2 条）时，
-                // 用静默截屏 + OCR 取数。放在指纹节流之前：这类页每帧都读到同样的「正在加载」，
+                // v2.35：微信自绘结果页兜底 —— 无障碍通道读不到字时，用静默截屏 + OCR 取数。
+                // 放在指纹节流之前：这类页每帧都读到同样的「正在加载」，
                 // 若放到节流之后会被当成同一屏直接 return，永远走不到 OCR。
-                // 严格限定：仅微信前台（活动窗口为微信或读不到）+ 文本<2 条；节流与形态闸在 OcrCapture/回调内。
+                // v2.37：触发条件从「文本 < 2 条」改为 shouldTryOcr —— 群里转账时
+                // 群聊窗口的文本会把 allTexts 撑到几十条，旧条件永远不成立。
                 // 放在本块内部：allTexts/rootPkg 在此作用域可见（函数指纹节流在块外才定义）。
-                if (pkg == "com.tencent.mm" && allTexts.size < 2 &&
-                    (rootPkg == null || rootPkg == "com.tencent.mm")) {
-                    logSkip("$pkg#ocrTrig", "微信自绘页特征（仅 ${allTexts.size} 条文本），请求截屏 OCR")
-                    val ocrSig = allTexts.joinToString("\u0001")
+                val ocrWhy = shouldTryOcr(pkg, allTexts, rootPkg)
+                if (ocrWhy != null) {
+                    logSkip(
+                        "$pkg#ocrTrig#$ocrWhy",
+                        "微信结算页候选（触发=${ocrWhy}，共 ${allTexts.size} 条文本），请求截屏 OCR"
+                    )
+                    val ocrSig = "$ocrWhy#" + allTexts.joinToString("\u0001")
                     OcrCapture.request(this, handler, pkg, ocrSig, ocrTextsCallback)
                 }
             }
@@ -932,6 +1022,9 @@ class BillAccessibilityService : AccessibilityService() {
         // 首页消息卡片被记成「蚂蚁保」就是这么来的。
         val merchant = PayApps.fieldOf(texts, PayApps.MERCHANT_KEYS)
             ?: PayApps.merchantInLine(texts.getOrNull(amt.idx) ?: "")
+            // v2.37：转账页没有「收款方」字段，收款人写在「待XX确认收款 / 转账给XX」里。
+            // 不单独抽出来，goodsNear 会把整句提示写成备注。
+            ?: PayApps.transferTarget(texts)
             ?: goodsNear(texts, amt.idx, appName, income)
         val goods = PayApps.fieldOf(texts, PayApps.GOODS_KEYS) ?: ""
         val catHint = PayApps.fieldOf(texts, PayApps.CAT_KEYS) ?: ""
@@ -1308,6 +1401,8 @@ class BillAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         // 服务销毁只收掉自己触发的卡片；OverlayUi 由进程持有，通知通道仍可继续使用
+        // v2.37：清掉实例引用，避免主界面拿到已销毁的服务去试截屏
+        if (inst === this) inst = null
         super.onDestroy()
     }
 }
