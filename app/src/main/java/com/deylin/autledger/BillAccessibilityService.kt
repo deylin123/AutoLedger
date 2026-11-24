@@ -758,7 +758,14 @@ class BillAccessibilityService : AccessibilityService() {
                         "微信结算页候选（触发=${ocrWhy}，共 ${allTexts.size} 条文本），请求截屏 OCR"
                     )
                     val ocrSig = "$ocrWhy#" + allTexts.joinToString("\u0001")
-                    OcrCapture.request(this, handler, pkg, ocrSig, ocrTextsCallback)
+                    // v2.39：paytitle = 「微信支付」标题页。真机日志证明转账输入页与结果页
+                    // 的无障碍文本完全相同（都只剩这一个窗口标题），同指纹抑制会把结果页
+                    // 整段盖住（抑制 12 秒 ≈ 节拍器 12.6 秒），必须等用户手动截屏才解除。
+                    // 这类页改为不参与同指纹抑制、按 2.5 秒重试，其余形态维持原节流不变。
+                    OcrCapture.request(
+                        this, handler, pkg, ocrSig, ocrTextsCallback,
+                        payTitle = ocrWhy == "paytitle"
+                    )
                 }
             }
             if (foreign.isNotEmpty() && registered) {

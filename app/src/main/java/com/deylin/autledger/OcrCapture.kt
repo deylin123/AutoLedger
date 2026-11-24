@@ -42,6 +42,35 @@ object OcrCapture {
     /** 强节流：两次截屏 OCR 的最小间隔，避免持续截屏耗电并压住重复触发 */
     private const val OCR_MIN_INTERVAL_MS = 4000L
 
+    /**
+     * v2.39：「微信支付」标题页的最小间隔。
+     *
+     * 真机日志（2026-11-24 17:23）证明：转账**输入页**与**结果页**的无障碍文本完全相同，
+     * 都只剩窗口标题「微信支付」1 条（页面内容全部自绘，不进树）。
+     * 于是两页算出同一个指纹，被「同指纹 12 秒内不再截屏」整段盖住，
+     * 而页面节拍器总长只有 12.6 秒 —— 结果页的整个重试窗口被抑制吃掉，
+     * 必须等用户手动截屏（产生 com.miui.screenshot 窗口事件）才解除。
+     * 所以这一类页面不能参与同指纹抑制，改用更短间隔重试。
+     */
+    private const val PAYTITLE_MIN_INTERVAL_MS = 2500L
+
+    /**
+     * 连续快速重试的上限与冷却。
+     *
+     * 转账输入页停留（输金额、选人）会持续消耗重试次数，所以上限要够宽：
+     * 20 次配合下面的退避，约可覆盖 80 秒的自绘页停留；用尽后冷却 30 秒，
+     * 避免用户长期停在支付类自绘页时反复截屏耗电。
+     */
+    private const val PAYTITLE_MAX_RUN = 20
+    private const val PAYTITLE_COOLDOWN_MS = 30_000L
+
+    /**
+     * 退避：前 [PAYTITLE_FAST_RUN] 次按 2.5 秒快试（覆盖「点转账 → 结果页」这段几秒钟），
+     * 之后拉长到 5 秒。这样输入页停留时不至于一直高频截屏，结果页出现最多也只差 5 秒。
+     */
+    private const val PAYTITLE_FAST_RUN = 6
+    private const val PAYTITLE_SLOW_INTERVAL_MS = 5000L
+
     private val exec = Executors.newSingleThreadExecutor { r ->
         Thread(r, "autoledger-ocr").apply { isDaemon = true }
     }
@@ -58,6 +87,12 @@ object OcrCapture {
     @Volatile
     private var inFlight = false
 
+    /** v2.39：paytitle 连续快速截屏计数与冷却截止时刻 */
+    @Volatile
+    private var payRun = 0
+    @Volatile
+    private var payCoolUntil = 0L
+
     /**
      * 请求一次截屏 OCR。
      * @param svc 无障碍服务（用于 takeScreenshot 与日志上下文）
@@ -65,6 +100,8 @@ object OcrCapture {
      * @param pkg 当前页面包名，非微信直接忽略
      * @param fingerprint 本页指纹，相同指纹在节流窗内不重复 OCR
      * @param onTexts OCR 成功回调：识别出的文本行（主线程执行）
+     * @param payTitle v2.39：本页是「微信支付」标题页（内容全自绘，无障碍只剩窗口标题）。
+     *                 这类页指纹无法区分输入页/结果页，故不参与同指纹抑制，改用更短间隔重试。
      */
     fun request(
         svc: AccessibilityService,
@@ -73,7 +110,8 @@ object OcrCapture {
         fingerprint: String,
         onTexts: (List<String>) -> Unit,
         force: Boolean = false,
-        probe: Boolean = false
+        probe: Boolean = false,
+        payTitle: Boolean = false
     ) {
         if (pkg != TARGET_PKG) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
@@ -82,19 +120,49 @@ object OcrCapture {
             return
         }
         val now = System.currentTimeMillis()
+        // v2.39：paytitle 走独立节流 —— 它不参与同指纹抑制，否则结果页会被输入页的指纹盖住 12 秒
+        val minGap = if (payTitle) payTitleGap() else OCR_MIN_INTERVAL_MS
         if (!force) {
-            if (now - lastOcrAt < OCR_MIN_INTERVAL_MS) return
+            if (payTitle) {
+                if (now < payCoolUntil) return
+            } else if (fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
+                now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3
+            ) {
+                return
+            }
+            if (now - lastOcrAt < minGap) return
             if (inFlight) return
-            if (fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
-                now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3) return
         }
         synchronized(this) {
             // force（用户手动测试）只跳过时间节流与同页抑制，不跳过并发保护
             if (inFlight) return
-            if (!force && now - lastOcrAt < OCR_MIN_INTERVAL_MS) return
+            if (!force) {
+                if (payTitle && now < payCoolUntil) return
+                val g = if (payTitle) payTitleGap() else OCR_MIN_INTERVAL_MS
+                if (now - lastOcrAt < g) return
+                if (!payTitle && fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
+                    now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3
+                ) {
+                    return
+                }
+            }
             inFlight = true
             lastOcrAt = now
             if (fingerprint.isNotEmpty()) lastFingerprint = fingerprint
+            if (payTitle) {
+                payRun++
+                if (payRun >= PAYTITLE_MAX_RUN) {
+                    payCoolUntil = now + PAYTITLE_COOLDOWN_MS
+                    payRun = 0
+                    Diag.log(
+                        svc,
+                        "OCR 连续 ${PAYTITLE_MAX_RUN} 次截屏仍未命中，冷却 30 秒（防自绘页长期停留时反复截屏）"
+                    )
+                }
+            } else {
+                // 页面形态变了（不再是支付标题页），计数归零，后续若再进入也可正常重试
+                payRun = 0
+            }
         }
 
         try {
@@ -190,6 +258,10 @@ object OcrCapture {
     private fun release() {
         inFlight = false
     }
+
+    /** v2.39：paytitle 的当前重试间隔（前 6 次快试，之后退避到 5 秒） */
+    private fun payTitleGap(): Long =
+        if (payRun >= PAYTITLE_FAST_RUN) PAYTITLE_SLOW_INTERVAL_MS else PAYTITLE_MIN_INTERVAL_MS
 
     /**
      * v2.37：截屏通道的状态（ok / fail:code / unsupported）落进 cfg，
