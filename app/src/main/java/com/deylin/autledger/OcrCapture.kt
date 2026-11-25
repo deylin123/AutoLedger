@@ -52,24 +52,28 @@ object OcrCapture {
      * 必须等用户手动截屏（产生 com.miui.screenshot 窗口事件）才解除。
      * 所以这一类页面不能参与同指纹抑制，改用更短间隔重试。
      */
-    private const val PAYTITLE_MIN_INTERVAL_MS = 2500L
+    private const val PAYTITLE_MIN_INTERVAL_MS = 1200L
 
     /**
      * 连续快速重试的上限与冷却。
      *
-     * 转账输入页停留（输金额、选人）会持续消耗重试次数，所以上限要够宽：
-     * 20 次配合下面的退避，约可覆盖 80 秒的自绘页停留；用尽后冷却 30 秒，
-     * 避免用户长期停在支付类自绘页时反复截屏耗电。
+     * v2.44 修正：原来「20 次用尽 → 冷却 30 秒」是**结果页不弹的直接原因**。
+     * 转账输入页（输金额、选人、输密码）是同一个「微信支付」标题页，会持续消耗次数：
+     * 用户在那页停留 40~50 秒，20 次预算刚好在**结果页出现的前一刻**用完，
+     * 于是结果页整段落在 30 秒冷却里 —— 一次都不截，用户只能等点掉结果页
+     * 回聊天页后被 amount 支路补截（这就是「点确定后才弹」）。
+     * 现在预算放宽到 60 次（≈72 秒），冷却缩到 6 秒，宁可多截几次也不漏结果页。
      */
-    private const val PAYTITLE_MAX_RUN = 20
-    private const val PAYTITLE_COOLDOWN_MS = 30_000L
+    private const val PAYTITLE_MAX_RUN = 60
+    private const val PAYTITLE_COOLDOWN_MS = 6_000L
 
     /**
-     * 退避：前 [PAYTITLE_FAST_RUN] 次按 2.5 秒快试（覆盖「点转账 → 结果页」这段几秒钟），
-     * 之后拉长到 5 秒。这样输入页停留时不至于一直高频截屏，结果页出现最多也只差 5 秒。
+     * 退避：前 [PAYTITLE_FAST_RUN] 次按 1.2 秒快试（覆盖「点转账 → 结果页」这段几秒钟），
+     * 之后拉长到 2.5 秒。结果页通常只停留 2~5 秒（用户看到就点确定），
+     * 2.5 秒的间隔只够试一两次，来不及就要等下一拍，必须更密。
      */
-    private const val PAYTITLE_FAST_RUN = 6
-    private const val PAYTITLE_SLOW_INTERVAL_MS = 5000L
+    private const val PAYTITLE_FAST_RUN = 15
+    private const val PAYTITLE_SLOW_INTERVAL_MS = 2500L
 
     private val exec = Executors.newSingleThreadExecutor { r ->
         Thread(r, "autoledger-ocr").apply { isDaemon = true }
@@ -100,8 +104,12 @@ object OcrCapture {
      * @param pkg 当前页面包名，非微信直接忽略
      * @param fingerprint 本页指纹，相同指纹在节流窗内不重复 OCR
      * @param onTexts OCR 成功回调：识别出的文本行（主线程执行）
-     * @param payTitle v2.39：本页是「微信支付」标题页（内容全自绘，无障碍只剩窗口标题）。
-     *                 这类页指纹无法区分输入页/结果页，故不参与同指纹抑制，改用更短间隔重试。
+     * @param payTitle 「结算页候选」档。v2.39 用于微信「微信支付」标题页（内容全自绘，
+     *                 无障碍只剩窗口标题），v2.44 起支付宝结算页也走这一档。
+     *                 这类页指纹无法区分「输入页/结果页」，故不参与同指纹抑制，改用更短间隔重试。
+     * @param newPage v2.44：本拍是从「非支付标题页」刚切进支付标题页的那一刻。
+     *                结果页一出现就立刻截一张，不等 1.2 秒间隔，也不用管冷却 ——
+     *                用户看到结果页往往两三秒内就点「确定」走人，这几百毫秒决定弹不弹。
      */
     fun request(
         svc: AccessibilityService,
@@ -111,15 +119,19 @@ object OcrCapture {
         onTexts: (List<String>) -> Unit,
         force: Boolean = false,
         probe: Boolean = false,
-        payTitle: Boolean = false
+        payTitle: Boolean = false,
+        newPage: Boolean = false
     ) {
-        if (pkg != TARGET_PKG) return
+        if (pkg !in TARGET_PKGS) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Diag.log(svc, "OCR 降级：系统 ${Build.VERSION.SDK_INT} < 30，不支持无障碍截屏，沿用页面通道")
             markState(svc, "unsupported")
             return
         }
         val now = System.currentTimeMillis()
+        // v2.44：刚切进结算页 → 立刻截，不受间隔与冷却约束（并发仍受 inFlight 保护）
+        val urgent = newPage
+        if (urgent) payCoolUntil = 0L
         // v2.39：paytitle 走独立节流 —— 它不参与同指纹抑制，否则结果页会被输入页的指纹盖住 12 秒
         val minGap = if (payTitle) payTitleGap() else OCR_MIN_INTERVAL_MS
         if (!force) {
@@ -130,7 +142,7 @@ object OcrCapture {
             ) {
                 return
             }
-            if (now - lastOcrAt < minGap) return
+            if (!urgent && now - lastOcrAt < minGap) return
             if (inFlight) return
         }
         synchronized(this) {
@@ -139,7 +151,7 @@ object OcrCapture {
             if (!force) {
                 if (payTitle && now < payCoolUntil) return
                 val g = if (payTitle) payTitleGap() else OCR_MIN_INTERVAL_MS
-                if (now - lastOcrAt < g) return
+                if (!urgent && now - lastOcrAt < g) return
                 if (!payTitle && fingerprint.isNotEmpty() && fingerprint == lastFingerprint &&
                     now - lastOcrAt < OCR_MIN_INTERVAL_MS * 3
                 ) {
@@ -156,7 +168,8 @@ object OcrCapture {
                     payRun = 0
                     Diag.log(
                         svc,
-                        "OCR 连续 ${PAYTITLE_MAX_RUN} 次截屏仍未命中，冷却 30 秒（防自绘页长期停留时反复截屏）"
+                        "OCR 连续 ${PAYTITLE_MAX_RUN} 次截屏仍未命中，冷却 ${PAYTITLE_COOLDOWN_MS / 1000} 秒" +
+                            "（防自绘页长期停留时反复截屏）"
                     )
                 }
             } else {
@@ -259,9 +272,22 @@ object OcrCapture {
         inFlight = false
     }
 
-    /** v2.39：paytitle 的当前重试间隔（前 6 次快试，之后退避到 5 秒） */
+    /** v2.39：paytitle 的当前重试间隔（前 15 次快试 1.2 秒，之后退避到 2.5 秒） */
     private fun payTitleGap(): Long =
         if (payRun >= PAYTITLE_FAST_RUN) PAYTITLE_SLOW_INTERVAL_MS else PAYTITLE_MIN_INTERVAL_MS
+
+    /**
+     * v2.44：OCR 命中目标页之后调用 —— 计数清零并静默 [HIT_QUIET_MS]。
+     *
+     * 间隔缩到 1.2 秒之后，如果结果页还停在屏上，会继续每 1.2 秒截一次屏，
+     * 纯属耗电（同一笔已被查重挡掉）。命中即静默，等页面真换了再重新开始。
+     */
+    fun noteHit() {
+        payRun = 0
+        payCoolUntil = System.currentTimeMillis() + HIT_QUIET_MS
+    }
+
+    private const val HIT_QUIET_MS = 8_000L
 
     /**
      * v2.37：截屏通道的状态（ok / fail:code / unsupported）落进 cfg，
@@ -306,5 +332,13 @@ object OcrCapture {
         return Bitmap.createScaledBitmap(src, nw, nh, true)
     }
 
-    private const val TARGET_PKG = "com.tencent.mm"
+    /**
+     * v2.44：截屏范围扩到支付宝。
+     *
+     * 用户实测：淘宝下单 → 跳支付宝付款 → 付完不弹卡，必须自己进账单点开这笔才弹。
+     * 原因是收银台/结果页是 H5，金额常以图片或自绘形式出现：无障碍读到「支付成功」
+     * 却读不到金额，attempt 的金额闸直接拦下；而这一屏只停留一两秒，返回淘宝就没了。
+     * 只对这两个 App 截屏，桌面/输入法/购物 App 一律不碰。
+     */
+    private val TARGET_PKGS = setOf("com.tencent.mm", "com.eg.android.AlipayGphone")
 }

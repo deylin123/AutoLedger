@@ -174,6 +174,40 @@ class BillAccessibilityService : AccessibilityService() {
          */
         private const val OCR_AMOUNT_MAX_TEXTS = 20
 
+        /**
+         * v2.44：支付标题页允许的最大文本条数。
+         *
+         * 旧条件写死 `allTexts.size < 2` —— 假定自绘页只剩一条窗口标题。
+         * 但真机上转账结果页除了「微信支付」，往往还多一个无障碍能读到的「确定/完成」按钮，
+         * 于是条数变成 2，整个 paytitle 分支被跳过：**结果页一次都不截屏**。
+         * 用户看到的就是「付完不弹，点了确定才弹」——点掉结果页回到聊天页后，
+         * 才由 amount 支路补截到。
+         * 放宽到 6 条足够覆盖「标题 + 确定/完成 + 少量残留」，同时远小于聊天页/列表页的条数。
+         */
+        private const val PAY_TITLE_MAX_TEXTS = 6
+
+        /** v2.44：支付宝结算页「已完成」语汇（OCR 与无障碍共用） */
+        private val ALIPAY_DONE_WORDS = listOf(
+            "支付成功", "付款成功", "交易成功", "支付完成", "付款完成", "扣款成功", "已支付"
+        )
+
+        /** v2.44：支付宝「还没付」语汇 —— 出现任一就绝不当作结果页 */
+        private val ALIPAY_UNPAID_WORDS = listOf(
+            "确认付款", "立即支付", "立即付款", "待付款", "请付款", "支付密码", "输入密码",
+            "确认下单", "去支付", "待支付"
+        )
+
+        /** v2.44：最近一次见到支付宝结算页痕迹的时刻（用于空白页兜底判断） */
+        private var lastAlipayHintAt = 0L
+
+        /**
+         * v2.44：上一拍 OCR 触发原因。用于识别「刚切进支付页」的那一刻，
+         * 好让结果页一出现就立刻截屏，而不是等下一个 1.2 秒节拍。
+         */
+        private var lastOcrWhy: String? = null
+
+        private const val ALIPAY_PKG = "com.eg.android.AlipayGphone"
+
         /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
         private val FIELD_NOISE = listOf(
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
@@ -229,18 +263,22 @@ class BillAccessibilityService : AccessibilityService() {
 
     /**
      * OCR 结果回调：把识别出的文本行送进现有 scan()，复用查重/入库/弹卡全链路。
-     * 只处理两类明确的目标结算页（收款成功 / 付款现场），避免对普通聊天页误记。
+     * 只处理明确的结算页形态，避免对普通聊天页/购物页误记。
+     *
+     * v2.44：不再把 pkg 写死成微信 —— 支付宝结算页（淘宝付款跳过去的收银台结果页）
+     * 也走这条通道，用微信的 app 登记项去判定会把商户/分类/查重全搞错。
      */
-    private val ocrTextsCallback: (List<String>) -> Unit = { lines ->
+    private fun handleOcrResult(pkg: String, lines: List<String>) {
         try {
             val texts = ArrayList(lines)
-            if (isOcrTargetPage(texts)) {
-                Diag.log(this, "OCR 命中目标结算页，送入现有识别链路（${lines.size} 行）")
+            if (isOcrTargetPage(pkg, texts)) {
+                Diag.log(this, "OCR 命中目标结算页（${appLabel(pkg)}），送入现有识别链路（${lines.size} 行）")
                 // 复用已验证的 scan()：金额/方向/商户/查重/入库/弹卡全部走原链路。
-                // pkg 固定微信，app 取微信登记项。
                 // v2.41：fromOcr = true —— 这一页在无障碍树里没有身份，卡片必须 pin，
                 // 否则会被底层聊天窗口解析出的「页面时间」当成换页立刻收掉（详见 OverlayUi.MIN_CARD_LIFE_MS）。
-                scan("com.tencent.mm", texts, PayApps.of("com.tencent.mm"), fromOcr = true)
+                scan(pkg, texts, PayApps.of(pkg), fromOcr = true)
+                // v2.44：命中后静默 8 秒，别对着同一张结果页每 1.2 秒截一次屏。
+                OcrCapture.noteHit()
             } else {
                 Diag.log(this, "OCR 结果未命中目标结算页形态，忽略（${lines.size} 行）")
             }
@@ -258,14 +296,36 @@ class BillAccessibilityService : AccessibilityService() {
      * 整行正则 [PayApps.WAIT_CONFIRM_RECV] 必然失配 —— 通道通了、判据没通，
      * 于是「加了 OCR 还是不弹」。现在判据改由 PayApps 三个语义函数统一裁决，
      * 拆行兜底在 PayApps.isTransferSentPage 内部完成。
+     *
+     * v2.44：新增支付宝分支。只认「明确的完成语 + 金额 + 没有任何未付痕迹」，
+     * 宁可漏也不给收银台/商品页撕开口子（OCR 结果直接进 scan()，绕过 attempt 全部闸门）。
      */
-    private fun isOcrTargetPage(texts: List<String>): Boolean {
+    private fun isOcrTargetPage(pkg: String, texts: List<String>): Boolean {
         // v2.36 纵深防御：OCR 结果直接进 scan()，绕过了 attempt 的全部闸门，
         // 因此商品在售页判据必须在这里独立生效。语义上二者互斥
         // （商品页不会有「资金已存入零钱 + 转账时间」），加这一条不改变既有行为，
         // 只为避免将来放宽 OCR 门槛时重新撕开一个口子。
         if (PayApps.isOnSaleProductPage(texts)) return false
         val amount = PayApps.findAmount(texts) ?: return false
+
+        if (pkg == ALIPAY_PKG) {
+            // 必须出现明确的「已完成」语；任何一个未付词出现就否决（收银台还没点确认）。
+            val done = ALIPAY_DONE_WORDS.firstOrNull { w -> texts.any { it.contains(w) } }
+                ?: return false
+            if (texts.any { t -> ALIPAY_UNPAID_WORDS.any { t.contains(it) } }) return false
+            // v2.18 事故防线：支付宝首页「最近消息」卡片里躺着真实的「付款成功 ¥4.00」，
+            // 形态闸在这里必须独立生效 —— OCR 绕过 attempt，不能指望那边拦。
+            if (PayApps.looksLikeHomeFeed(texts)) return false
+            if (PayApps.looksLikeHome(texts)) return false
+            if (PayApps.looksLikeList(texts)) return false
+            Diag.log(
+                this,
+                "OCR 目标页判定（支付宝）：金额 ¥${amount.value}｜依据「$done」｜" +
+                    "原文：${texts.take(20).joinToString("/").take(220)}"
+            )
+            return true
+        }
+
         // ① 收款成功页（别人转给我）：资金已存入零钱 + 转账/收款时间
         val recv = texts.any { it.contains("资金已存入零钱") || it.contains("已存入零钱") } &&
             texts.any { it.contains("转账时间") || it.contains("收款时间") }
@@ -297,11 +357,38 @@ class BillAccessibilityService : AccessibilityService() {
      * 真实的节流与同页抑制在 OcrCapture 内（4 秒 / 同指纹 12 秒），不会被刷屏。
      */
     private fun shouldTryOcr(pkg: String, allTexts: List<String>, rootPkg: String?): String? {
-        if (pkg != "com.tencent.mm") return null
-        // 活动窗口必须是微信；读不到活动窗口时放行（fail-open，与前台判定同一原则）
+        if (pkg != "com.tencent.mm" && pkg != ALIPAY_PKG) return null
+        // 活动窗口必须是同一个 App；读不到活动窗口时放行（fail-open，与前台判定同一原则）
         if (rootPkg != null && rootPkg != pkg) return null
         if (PayApps.isOnSaleProductPage(allTexts)) return null
         if (PayApps.hasBillStructure(allTexts)) return null
+
+        // ── v2.44：支付宝结算页补盲 ─────────────────────────────────────────
+        // 用户实测：淘宝下单 → 跳到支付宝付完 → 不弹卡，必须自己进账单点开这笔才弹。
+        // 原因是支付宝收银台/结果页是 H5，金额常以图片/自绘形式出现：
+        // 无障碍能读到「支付成功」却读不到金额，attempt 里金额闸直接拦下；
+        // 而结果页停留只有一两秒，返回淘宝后就再也没有这个页面了。
+        // 这里只挑「像结算完成、但无障碍读不全」的那一屏去截，判据在 isOcrTargetPage 里从严。
+        if (pkg == ALIPAY_PKG) {
+            val paid = allTexts.any { t -> ALIPAY_DONE_WORDS.any { t.contains(it) } }
+            if (paid && PayApps.findAmount(allTexts) == null && allTexts.size <= 12) return "alipay_done"
+            if (allTexts.size < 2) {
+                val recent = System.currentTimeMillis() - lastAlipayHintAt <= PAY_HINT_TTL_MS
+                return if (recent) "blank${allTexts.size}" else null
+            }
+            return null
+        }
+
+        // ── 以下为微信 ──────────────────────────────────────────────────────
+        // v2.44：把「支付标题页」判定提到条数判断之前，并放宽到 ≤6 条。
+        // 转账结果页常常多一个可读的「确定/完成」按钮 → 条数=2，旧的 size<2 分支跳过它，
+        // 结果页一次都不截，必须等用户点掉回聊天页才被 amount 支路补上（「点确定后才弹」）。
+        val titleOnly = allTexts.size <= PAY_TITLE_MAX_TEXTS && allTexts.any {
+            val s = it.trim().replace(" ", "")
+            s == "微信支付" || (s.startsWith("微信支付") && s.length <= 8)
+        }
+        if (titleOnly) return "paytitle"
+
         if (allTexts.size < 2) {
             // v2.38：拆开两种情况，别再把「切屏途中」当成支付页。
             //  ① 唯一那条文本含「支付」—— 微信收付款页的窗口标题，直接触发（两次成功都靠它）；
@@ -766,21 +853,38 @@ class BillAccessibilityService : AccessibilityService() {
                 // v2.38：记下最近一次看到「微信支付」窗口标题的时刻。
                 // 它是空白页里唯一能区分「支付页在自绘」与「切屏到桌面」的信号。
                 if (allTexts.any { it.contains("微信支付") }) lastPayHintAt = System.currentTimeMillis()
+                // v2.44：支付宝结算页痕迹（收银台/付款/支付），供空白页兜底判断用
+                if (pkg == ALIPAY_PKG &&
+                    allTexts.any { t -> t.contains("支付宝") || t.contains("收银台") || t.contains("付款") || t.contains("支付") }
+                ) {
+                    lastAlipayHintAt = System.currentTimeMillis()
+                }
                 val ocrWhy = shouldTryOcr(pkg, allTexts, rootPkg)
                 if (ocrWhy != null) {
                     logSkip(
                         "$pkg#ocrTrig#$ocrWhy",
-                        "微信结算页候选（触发=${ocrWhy}，共 ${allTexts.size} 条文本），请求截屏 OCR"
+                        "${appLabel(pkg)} 结算页候选（触发=${ocrWhy}，共 ${allTexts.size} 条文本），请求截屏 OCR"
                     )
                     val ocrSig = "$ocrWhy#" + allTexts.joinToString("\u0001")
                     // v2.39：paytitle = 「微信支付」标题页。真机日志证明转账输入页与结果页
                     // 的无障碍文本完全相同（都只剩这一个窗口标题），同指纹抑制会把结果页
                     // 整段盖住（抑制 12 秒 ≈ 节拍器 12.6 秒），必须等用户手动截屏才解除。
-                    // 这类页改为不参与同指纹抑制、按 2.5 秒重试，其余形态维持原节流不变。
+                    // 这类页改为不参与同指纹抑制、按 1.2 秒重试，其余形态维持原节流不变。
+                    // v2.44：newPage = 刚切进支付页的那一拍 —— 结果页只停留两三秒，
+                    // 这一拍允许立刻截屏（不等间隔），否则就要错过整页。
+                    val entered = lastOcrWhy != ocrWhy
+                    lastOcrWhy = ocrWhy
+                    // v2.44：支付宝结算页也走「快速重试」档 —— 这一屏只停留一两秒，
+                    // 用默认的 4 秒间隔 + 同指纹 12 秒抑制，等于一次都截不到。
+                    val fastPage = ocrWhy == "paytitle" || ocrWhy.startsWith("alipay_")
                     OcrCapture.request(
-                        this, handler, pkg, ocrSig, ocrTextsCallback,
-                        payTitle = ocrWhy == "paytitle"
+                        this, handler, pkg, ocrSig,
+                        { lines -> handleOcrResult(pkg, lines) },
+                        payTitle = fastPage,
+                        newPage = entered
                     )
+                } else {
+                    lastOcrWhy = null
                 }
             }
             if (foreign.isNotEmpty() && registered) {
