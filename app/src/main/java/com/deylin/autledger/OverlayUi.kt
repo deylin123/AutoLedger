@@ -321,6 +321,10 @@ object OverlayUi {
             // （Activity 查得到权限、这里建不了窗），用户因此以为「权限都开了还是不弹」。
             markCardState(app, "no_perm")
             Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
+            // v2.40：把原因补写进同一条通知（只更新不重响），用户一眼就知道该开哪个权限
+            if (recorded == null) {
+                notifyPending(app, id, amount, note, cat, income, "卡片未显示：请开「显示悬浮窗」和「后台弹出界面」")
+            }
             return
         }
         handler.removeCallbacks(hideTask)
@@ -512,6 +516,9 @@ object OverlayUi {
                 app,
                 "addView 失败（${e.javaClass.simpleName}），通知已发。小米/红米请确认「后台弹出界面」权限"
             )
+            if (recorded == null) {
+                notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
+            }
             return
         }
         // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
@@ -519,7 +526,14 @@ object OverlayUi {
             // v2.38：addView 没抛异常但宽为 0，是 MIUI「后台弹出界面」被拒的典型表现 ——
             // 代码以为成功了，用户什么都没看到。这种情况单独落一个 zero 状态，
             // 权限条才能提示到点子上（否则用户会以为识别没工作）。
-            if (v.width == 0) markCardState(app, "zero")
+            if (v.width == 0) {
+                markCardState(app, "zero")
+                // v2.40：宽为 0 = 窗口被系统吞了（MIUI/HyperOS「后台弹出界面」被拒的典型表现），
+                // 代码以为成功、用户什么都看不到 —— 必须把原因写进通知，否则又是「只有通知没有卡片」。
+                if (recorded == null) {
+                    notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
+                }
+            }
             Diag.logCard(
                 app,
                 "卡片尺寸 " + v.width + "x" + v.height +
@@ -584,7 +598,8 @@ object OverlayUi {
         amount: Double,
         note: String,
         cat: String,
-        income: Boolean
+        income: Boolean,
+        hint: String = ""
     ) {
         try {
             val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -612,7 +627,15 @@ object OverlayUi {
             val n = Notification.Builder(app, chId)
                 .setSmallIcon(android.R.drawable.sym_def_app_icon)
                 .setContentTitle((if (income) "识别到收入 ¥" else "识别到消费 ¥") + Ui.money(amount))
-                .setContentText("$note · 分类：$cat · 点此确认")
+                // v2.40：卡片没弹出来时，把原因直接写进通知。
+                // 这样用户不必再导诊断日志就能知道该去开哪个权限 —— 之前这条信息只存在于 logcat/文件里，
+                // 用户看到的现象永远是「只有通知、没有卡片」，只能来回猜。
+                .setContentText(
+                    "$note · 分类：$cat" +
+                        if (hint.isEmpty()) " · 点此确认" else "｜$hint"
+                )
+                // 补写原因属于「更新同一条通知」，不能再次响铃震动
+                .setOnlyAlertOnce(hint.isNotEmpty())
                 .setContentIntent(pi)
                 .setAutoCancel(true)
                 .setCategory(Notification.CATEGORY_REMINDER)

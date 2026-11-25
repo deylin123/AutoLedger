@@ -286,8 +286,14 @@ class MainActivity : Activity() {
     fun showPermDialog() {
         val items = ArrayList(missingPerms())
         // v2.38：权限查询说「已开」但实际建不出窗时，仍然要能从这里跳去开权限
-        if (cardBlocked() && items.none { it.startsWith("悬浮窗") })
-            items.add("悬浮窗（悬浮卡片被系统拦住）")
+        // v2.40：拆成两项。小米/红米要开两道，「后台弹出界面」在「其他权限」里，
+        // 很多人只开了「显示悬浮窗」，卡片依旧不出现（addView 被吞、宽为 0）。
+        if (cardBlocked()) {
+            if (items.none { it.startsWith("悬浮窗") })
+                items.add("悬浮窗（显示在其他应用上层）")
+            if (items.none { it.startsWith("后台弹出") })
+                items.add("后台弹出界面（小米/红米必开，在「其他权限」里）")
+        }
         // v2.37：屏幕截取单独列一项，只影响微信转账结果页这条补充通道
         if (ocrNeedPermission()) items.add("屏幕截取（微信转账结果页识别）")
         if (items.isEmpty()) return
@@ -298,6 +304,7 @@ class MainActivity : Activity() {
                 when {
                     m.startsWith("无障碍") -> openAccessibility()
                     m.startsWith("悬浮窗") -> openOverlay()
+                    m.startsWith("后台弹出") -> openAppDetails()
                     m.startsWith("屏幕截取") -> probeOcr()
                     else -> if (Build.VERSION.SDK_INT >= 33) {
                         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
@@ -324,9 +331,47 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * v2.40：HyperOS / MIUI 上 ACTION_MANAGE_OVERLAY_PERMISSION 常常没有对应页面，
+     * 旧实现只有一条 Intent + 空 catch —— 异常被吞掉，用户看到的就是
+     * 「点了那一行字什么也没发生，弹窗里只剩一个『稍后』」。
+     * 真机反馈（2026-11-25）正是如此。改为逐级降级，并在全部失败时给出手动路径。
+     */
     fun openOverlay() {
+        val pkgUri = Uri.parse("package:$packageName")
+        val candidates = listOf(
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri),
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION),
+            // 应用详情页：HyperOS 的「权限管理 / 其他权限」都在这一层进去
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkgUri)
+        )
+        for (it0 in candidates) {
+            try {
+                if (it0.resolveActivity(packageManager) == null) continue
+                it0.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(it0)
+                return
+            } catch (_: Exception) {
+            }
+        }
+        toast("没跳转成功。请手动：设置 → 应用设置 → 应用管理 → AutoLedger → 权限管理 → 显示悬浮窗")
+    }
+
+    /** 后台弹出界面（小米/红米专有）没有公开 Action，只能进应用详情页再逐层点 */
+    fun openAppDetails() {
         try {
-            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
+            toast("请手动：设置 → 应用设置 → 应用管理 → AutoLedger → 权限管理 → 其他权限 → 后台弹出界面")
+        }
+    }
+
+    private fun toast(msg: String) {
+        try {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
         } catch (_: Exception) {
         }
     }

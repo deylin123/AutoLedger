@@ -166,6 +166,14 @@ class BillAccessibilityService : AccessibilityService() {
         private var lastPayHintAt = 0L
         private const val PAY_HINT_TTL_MS = 60_000L
 
+        /**
+         * v2.40：amount 支路允许截屏的最大文本条数。
+         * 自绘支付结果页在无障碍树里只剩 0–几条文本；上百条文本必然是
+         * 小程序/商城/网页（真机日志：疫苗预约小程序 132 条、152 条），
+         * 这类页 OCR 结果永远不可能命中，只会白耗电。
+         */
+        private const val OCR_AMOUNT_MAX_TEXTS = 20
+
         /** 这些是订单页的字段名而非商户/商品，不能拿来当备注 */
         private val FIELD_NOISE = listOf(
             "乘机人", "乘客", "联系人", "收货人", "收件人", "手机号", "电话", "地址",
@@ -303,7 +311,12 @@ class BillAccessibilityService : AccessibilityService() {
             return if (recent) "blank${allTexts.size}" else null
         }
         if (PayApps.looksLikeTransferSettlement(allTexts)) return "transfer"
-        if (PayApps.findAmount(allTexts) != null) return "amount"
+        // v2.40：amount 支路加文本量上限。
+        // 真机日志（2026-11-25 09:35）在「腾讯健康疫苗预约」小程序页上以
+        // 「触发=amount，共 132/152 条文本」反复触发截屏，OCR 全部空转 ——
+        // 小程序/商城页天然带价格，而自绘支付结果页的文本极少（≤ 十几条）。
+        // 上百条文本的页面绝不可能是自绘结算页，直接不截屏。
+        if (allTexts.size <= OCR_AMOUNT_MAX_TEXTS && PayApps.findAmount(allTexts) != null) return "amount"
         return null
     }
 
