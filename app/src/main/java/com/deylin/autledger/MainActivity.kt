@@ -263,18 +263,11 @@ class MainActivity : Activity() {
     fun cardBlocked(): Boolean {
         val s = cardState()
         if (s.isEmpty()) return false
-        // v2.40 真机事故：用户按引导开完「显示悬浮窗 / 后台弹出界面」，橙条一直挂着不走。
-        // 根因是这里读的是**上一次建窗失败留下的记录**，不是当前系统权限 ——
-        // 权限已经开出来了却还在报「被系统拦住」，比不提示更糟。
-        // 所以 no_perm 必须以当前权限为准：权限在了就作废旧结论，
-        // 真正的验证交给下一笔支付（建窗成功会写回 ok）。
-        if (s == "no_perm") {
-            if (Settings.canDrawOverlays(this)) {
-                clearCardState()
-                return false
-            }
-            return true
-        }
+        // v2.43：**删掉「Activity 里 canDrawOverlays 为真就清掉 no_perm」这段。**
+        // 2026-11-25 11:20 真机日志证明：服务进程里该 API 假阴性（卡片根本没建，10:00/10:52），
+        // Activity 里却是 true（10:15 支付宝建窗成功）。拿 Activity 的结论去否定服务进程的结论，
+        // 等于把唯一的报警信号亲手掐掉 —— 用户看到的就是「橙条不亮、卡片没有、无从下手」。
+        // 现在 no_perm 只能靠三条途径解除：① 真建窗成功写 ok；② 用户实测弹窗成功（PageMine 写 ok）；③ TTL 到期。
         val at = getSharedPreferences("cfg", MODE_PRIVATE).getLong("card_state_at", 0L)
         if (at > 0L && System.currentTimeMillis() - at > CARD_STATE_TTL_MS) {
             clearCardState()

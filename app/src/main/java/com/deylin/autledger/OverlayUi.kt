@@ -375,18 +375,17 @@ object OverlayUi {
         remembered: Boolean,
         pin: Boolean = false
     ) {
-        if (!Settings.canDrawOverlays(app)) {
-            // v2.38：把卡片通道的真实结局落盘，主界面权限条据此提示。
-            // 不能只靠 Settings.canDrawOverlays 在 Activity 里再查一次 —— 真机日志里两者结论不一致
-            // （Activity 查得到权限、这里建不了窗），用户因此以为「权限都开了还是不弹」。
-            markCardState(app, "no_perm")
-            Diag.logCard(app, "跳过：悬浮窗权限未开（通知已发，可在通知栏确认）")
-            // v2.40：把原因补写进同一条通知（只更新不重响），用户一眼就知道该开哪个权限
-            if (recorded == null) {
-                notifyPending(app, id, amount, note, cat, income, "卡片未显示：请开「显示悬浮窗」和「后台弹出界面」")
-            }
-            return
-        }
+        // v2.43：**这里原来有一道 `if (!Settings.canDrawOverlays(app)) return` 的硬闸门，已删除。**
+        // 2026-11-25 11:20 真机日志（v2.41/47）把它钉死了 —— 同一个 APK、同一个进程：
+        //   10:15:24 支付宝 → 「卡片已 addView，1116x562」（canDrawOverlays 返回 true）
+        //   10:00:33 微信   → 「跳过：悬浮窗权限未开」（canDrawOverlays 返回 false）
+        //   10:52:36 微信   → 「跳过：悬浮窗权限未开」
+        // 权限客观上是有的（十几分钟前刚成功建过窗，用户手动测也弹得出来），
+        // 变的只是这个 API 的返回值：服务进程/后台状态下会**假阴性**。
+        // 而假阴性直接 return，卡片永远建不出来；主界面又拿 Activity context 复查到 true
+        // 把报警清掉 —— 于是「App 认为权限在、用户什么都没有」，且橙条不亮，查无可查。
+        // 结论：**绝对不能拿 Settings.canDrawOverlays 当建窗前置条件。**
+        // 唯一权威判定是 addView 自己抛不抛异常（见下面的 catch）。
         handler.removeCallbacks(hideTask)
         removeCard()
 
@@ -573,19 +572,33 @@ object OverlayUi {
             cardPinned = pin
             cardAt = System.currentTimeMillis()
             markCardState(app, "ok")
+            // v2.43：把 canDrawOverlays 的实际返回值一并记下来。既然这一行就是成功建窗的证据，
+            // 若它写着 canDrawOverlays=false，那就是该 API 假阴性的铁证，下次不必重新论证。
             Diag.logCard(
                 app,
                 "卡片已 addView（通知同时已发）" +
-                    if (pin) "｜来自截屏 OCR 通道，已锁定、不接受换页收卡" else ""
+                    (if (pin) "｜来自截屏 OCR 通道，已锁定、不接受换页收卡" else "") +
+                    "｜canDrawOverlays=" + Settings.canDrawOverlays(app)
             )
         } catch (e: Exception) {
-            markCardState(app, "addview:" + e.javaClass.simpleName)
+            // v2.43：addView 抛异常才是「真的没有窗口权限」的唯一证据。
+            // SecurityException / BadTokenException / 文案含 permission = 系统拒绝窗口类型；
+            // 其余异常（inflate、measure 等）与权限无关，不能再误导用户去开权限。
+            val denied = e is SecurityException ||
+                e.javaClass.simpleName.contains("BadToken", ignoreCase = true) ||
+                (e.message ?: "").contains("permission", ignoreCase = true)
+            markCardState(app, if (denied) "no_perm" else "addview:" + e.javaClass.simpleName)
             Diag.logCard(
                 app,
-                "addView 失败（${e.javaClass.simpleName}），通知已发。小米/红米请确认「后台弹出界面」权限"
+                "addView 失败（${e.javaClass.simpleName}" +
+                    (if (denied) "，系统拒绝窗口" else "") + "），通知已发。${e.message ?: ""}"
             )
             if (recorded == null) {
-                notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
+                notifyPending(
+                    app, id, amount, note, cat, income,
+                    if (denied) "卡片未显示：系统拒绝浮窗，请开「显示悬浮窗」和「后台弹出界面」"
+                    else "卡片未显示（建窗异常 ${e.javaClass.simpleName}），可在通知栏确认记账"
+                )
             }
             return
         }

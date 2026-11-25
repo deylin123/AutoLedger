@@ -259,11 +259,10 @@ class PageMine(private val act: MainActivity) {
 
     /** 不依赖抓取，直接验证悬浮窗是否真的能弹出来 */
     private fun testOverlay() {
-        if (!Settings.canDrawOverlays(act)) {
-            Toast.makeText(c, "悬浮窗权限未开启，无法弹窗", Toast.LENGTH_SHORT).show()
-            act.openOverlay()
-            return
-        }
+        // v2.43：这里原来有一道 `if (!Settings.canDrawOverlays(act)) { 提示 + 跳转; return }`，
+        // 已删除。该 API 在服务进程与 Activity 里结论相反（2026-11-25 真机日志），
+        // 用它当闸门只会让人以为「权限没开」而其实开了。真正的判定是 addView 抛不抛异常 ——
+        // 没权限时 buildProbeCard 的 catch 会直接 Toast 出异常名，比查询结果可信。
         // v2.42：拆成「前台」与「后台」两步。
         //
         // 用户 2026-11-25 的决定性对比：微信付款能弹卡、转账不能弹；装了 v2.41 后
