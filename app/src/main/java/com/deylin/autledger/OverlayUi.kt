@@ -116,6 +116,22 @@ object OverlayUi {
     private const val NOTIF_TIMEOUT_MS = 10 * 60_000L
 
     /**
+     * v2.46：建窗被系统**瞬时**拒绝后的自动重试节奏（毫秒，按序取用）。
+     *
+     * 2026-11-25 17:51 用户实测：同一笔微信转账，付完立刻看底部没有卡；
+     * 主界面橙条同时写着「悬浮卡片被系统拦住了（4 分钟前记录）」，
+     * 说明那一次 `addView` 真的抛了异常（card_state=no_perm），不是误报。
+     * 但他点掉结果页「确定」回聊天页后，同一次流程再弹就成功了 ——
+     * **同一权限、同一进程，两次结果相反**，所以不是权限缺失，是窗口/进程的瞬时状态：
+     * HyperOS 在微信切页、本进程刚从冻结态恢复的那一瞬间会拒绝后台窗口。
+     *
+     * 旧代码失败一次就 return，用户看到的就是「非得点掉结果页才弹」。
+     * 三次重试合计约 3.1 秒，覆盖这一段抖动；一旦某次成功就写 ok，橙条自行消失。
+     * 定时器挂在主线程 handler 上，不新开线程。
+     */
+    private val CARD_RETRY_DELAYS = longArrayOf(400L, 900L, 1800L)
+
+    /**
      * 「这一笔已经在账本里」的信息。
      *
      * [status] 1 = 已确认入账；0 = 仍是待确认。
@@ -373,7 +389,8 @@ object OverlayUi {
         recorded: RecordedInfo?,
         pageTs: Long,
         remembered: Boolean,
-        pin: Boolean = false
+        pin: Boolean = false,
+        retry: Int = 0
     ) {
         // v2.43：**这里原来有一道 `if (!Settings.canDrawOverlays(app)) return` 的硬闸门，已删除。**
         // 2026-11-25 11:20 真机日志（v2.41/47）把它钉死了 —— 同一个 APK、同一个进程：
@@ -587,16 +604,51 @@ object OverlayUi {
             val denied = e is SecurityException ||
                 e.javaClass.simpleName.contains("BadToken", ignoreCase = true) ||
                 (e.message ?: "").contains("permission", ignoreCase = true)
+
+            // v2.46：**先重试，再下结论。**
+            // 用户实测：同一笔转账，结果页那一刻没卡；点掉「确定」回聊天页后，同一次流程再弹就成功。
+            // 同一权限、同一进程、两次结果相反 → 这不是权限缺失，是窗口/进程的瞬时状态
+            // （HyperOS 在微信切页、本进程刚从冻结态恢复的那一瞬间会拒绝后台窗口）。
+            // 旧代码失败一次就写 no_perm 并 return，用户看到的就是「非得点掉结果页才弹」。
+            // 重试期间不写 card_state、不重复发通知 —— 三次都用尽才认作真失败。
+            val retryDelay =
+                if (denied && retry < CARD_RETRY_DELAYS.size) CARD_RETRY_DELAYS[retry] else -1L
+            if (retryDelay > 0L && card == null) {
+                Diag.logCard(
+                    app,
+                    "addView 被系统拒绝（第 ${retry + 1} 次，${e.javaClass.simpleName}：" +
+                        "${(e.message ?: "").take(120)}），${retryDelay}ms 后自动重试"
+                )
+                handler.postDelayed({
+                    // 重试前再确认：这期间没有别的通道把卡建好、用户也没处理掉这一笔
+                    if (card == null && !isHandledRecently(id)) {
+                        try {
+                            buildCard(
+                                app, id, amount, note, cat, income, recorded,
+                                pageTs, remembered, pin, retry + 1
+                            )
+                        } catch (t: Exception) {
+                            Diag.logCard(app, "悬浮卡片重试异常（${t.javaClass.simpleName}）")
+                        }
+                    } else {
+                        Diag.logCard(app, "放弃重试 #$id：卡片已由其他通道建立或用户已处理")
+                    }
+                }, retryDelay)
+                return
+            }
+
             markCardState(app, if (denied) "no_perm" else "addview:" + e.javaClass.simpleName)
             Diag.logCard(
                 app,
                 "addView 失败（${e.javaClass.simpleName}" +
-                    (if (denied) "，系统拒绝窗口" else "") + "），通知已发。${e.message ?: ""}"
+                    (if (denied) "，系统拒绝窗口" else "") +
+                    "，已重试 $retry 次），通知已发。${e.message ?: ""}"
             )
             if (recorded == null) {
+                // v2.46：把异常类型写进通知。用户不用导日志，截一张通知就能说清是哪一种失败。
                 notifyPending(
                     app, id, amount, note, cat, income,
-                    if (denied) "卡片未显示：系统拒绝浮窗，请开「显示悬浮窗」和「后台弹出界面」"
+                    if (denied) "卡片未显示：系统拒绝浮窗（${e.javaClass.simpleName}），已重试 $retry 次"
                     else "卡片未显示（建窗异常 ${e.javaClass.simpleName}），可在通知栏确认记账"
                 )
             }
