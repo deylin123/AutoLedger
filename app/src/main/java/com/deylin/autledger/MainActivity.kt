@@ -231,9 +231,37 @@ class MainActivity : Activity() {
     fun cardState(): String =
         getSharedPreferences("cfg", MODE_PRIVATE).getString("card_state", "") ?: ""
 
+    /** v2.40：zero / addview 这类「上次建窗失败」的记录只保留一段时间，避免旧结论长期误报 */
+    private val CARD_STATE_TTL_MS = 30 * 60_000L
+
+    fun clearCardState() {
+        try {
+            getSharedPreferences("cfg", MODE_PRIVATE).edit().remove("card_state").apply()
+        } catch (_: Exception) {
+        }
+    }
+
     fun cardBlocked(): Boolean {
         val s = cardState()
-        return s == "no_perm" || s.startsWith("addview:") || s == "zero"
+        if (s.isEmpty()) return false
+        // v2.40 真机事故：用户按引导开完「显示悬浮窗 / 后台弹出界面」，橙条一直挂着不走。
+        // 根因是这里读的是**上一次建窗失败留下的记录**，不是当前系统权限 ——
+        // 权限已经开出来了却还在报「被系统拦住」，比不提示更糟。
+        // 所以 no_perm 必须以当前权限为准：权限在了就作废旧结论，
+        // 真正的验证交给下一笔支付（建窗成功会写回 ok）。
+        if (s == "no_perm") {
+            if (Settings.canDrawOverlays(this)) {
+                clearCardState()
+                return false
+            }
+            return true
+        }
+        val at = getSharedPreferences("cfg", MODE_PRIVATE).getLong("card_state_at", 0L)
+        if (at > 0L && System.currentTimeMillis() - at > CARD_STATE_TTL_MS) {
+            clearCardState()
+            return false
+        }
+        return true
     }
 
     /**
