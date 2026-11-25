@@ -594,6 +594,11 @@ object OverlayUi {
             // v2.38：addView 没抛异常但宽为 0，是 MIUI「后台弹出界面」被拒的典型表现 ——
             // 代码以为成功了，用户什么都没看到。这种情况单独落一个 zero 状态，
             // 权限条才能提示到点子上（否则用户会以为识别没工作）。
+            // v2.42：补上比「宽为 0」更隐蔽的一种 —— addView 成功、宽高都正常，
+            // 但窗口被系统隐藏（isShown=false）。HyperOS 上「后台弹出界面」被拒时就是这样：
+            // 日志里写着「卡片已 addView」，主界面橙条不亮（因为状态是 ok），
+            // 而用户屏幕上什么都没有。这正是「转账只能在吸顶处出现、底部没卡」的最后一种可能。
+            val shown = try { v.isShown } catch (_: Exception) { true }
             if (v.width == 0) {
                 markCardState(app, "zero")
                 // v2.40：宽为 0 = 窗口被系统吞了（MIUI/HyperOS「后台弹出界面」被拒的典型表现），
@@ -601,12 +606,19 @@ object OverlayUi {
                 if (recorded == null) {
                     notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
                 }
+            } else if (!shown) {
+                markCardState(app, "hidden")
+                if (recorded == null) {
+                    notifyPending(app, id, amount, note, cat, income, "卡片窗口被系统隐藏：请开「后台弹出界面」")
+                }
             }
             Diag.logCard(
                 app,
                 "卡片尺寸 " + v.width + "x" + v.height +
                     "，屏幕宽 " + metrics.widthPixels +
-                    (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了" else "")
+                    "，可见=" + shown +
+                    (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了"
+                    else if (!shown) " ← 建窗成功但窗口不可见（后台弹出界面被拒）" else "")
             )
         }, 500)
         handler.postDelayed(hideTask, CARD_AUTO_HIDE_MS)

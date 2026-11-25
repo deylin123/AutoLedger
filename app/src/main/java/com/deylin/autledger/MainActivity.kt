@@ -203,9 +203,7 @@ class MainActivity : Activity() {
             "自动弹窗还差 ${miss.size} 项权限未开，缺任意一项都不会在别的App上面弹窗：" +
                 miss.joinToString("、")
         )
-        if (cardBad) lines.add(
-            "悬浮卡片被系统拦住了（通知仍可确认记账）：点此开启「显示在其他应用上层 / 后台弹出界面」"
-        )
+        if (cardBad) lines.add(cardBlockedHint())
         if (lines.isEmpty()) {
             // v2.37：截屏是「微信转账结果页」这条补充通道的前提，不影响其它 App 的弹窗，
             // 所以单独提示，不混进上面那句「缺一项都不弹」里，避免吓人。
@@ -238,6 +236,27 @@ class MainActivity : Activity() {
         try {
             getSharedPreferences("cfg", MODE_PRIVATE).edit().remove("card_state").apply()
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * v2.42：橙条文案按「实际失败方式」分开说。
+     *
+     * hidden（addView 成功、尺寸正常、但窗口被系统隐藏）是 HyperOS「后台弹出界面」被拒时
+     * 最难发现的一种表现 —— 旧文案统一说「被系统拦住」，用户根本不知道该动哪个开关，
+     * 也解释了为什么「App 认为一切正常、橙条不亮，而屏幕上什么都没有」。
+     */
+    fun cardBlockedHint(): String {
+        val s = cardState()
+        return when {
+            s.startsWith("addview:") ->
+                "悬浮卡片建窗失败（${s.removePrefix("addview:")}）：点此开启「显示在其他应用上层 / 后台弹出界面」"
+            s == "hidden" ->
+                "卡片窗口被系统隐藏了（建窗成功但没显示）：到「其他权限」里开「后台弹出界面」；也可在「我的 → 测试弹窗 → ② 后台测试」自检"
+            s == "zero" ->
+                "卡片窗口被系统拦掉了（宽 0）：到「其他权限」里开「后台弹出界面」"
+            else ->
+                "悬浮卡片被系统拦住了（通知仍可确认记账）：点此开启「显示在其他应用上层 / 后台弹出界面」"
         }
     }
 

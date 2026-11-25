@@ -264,43 +264,142 @@ class PageMine(private val act: MainActivity) {
             act.openOverlay()
             return
         }
+        // v2.42：拆成「前台」与「后台」两步。
+        //
+        // 用户 2026-11-25 的决定性对比：微信付款能弹卡、转账不能弹；装了 v2.41 后
+        // 转账仍是「只有吸顶通知、底部没有卡」，而主界面橙条不亮 —— 说明 App 认为建窗成功。
+        // 前台弹窗与「微信在前台时的后台弹窗」在 HyperOS 上是**两道不同的系统权限**：
+        //   ① 前台：只需「显示悬浮窗」；
+        //   ② 后台：还要「后台弹出界面」（其他权限里），缺了它 addView 不报错、窗口不显。
+        // 只在前台测一次永远测不出②，这正是这轮反复定位不掉的原因。
+        // 现在②必须由用户切走 5 秒后再弹，弹完把结论写进 card_state，主界面据此提示。
+        AlertDialog.Builder(act)
+            .setTitle("测试悬浮卡片")
+            .setMessage(
+                "分两步测。只有第 ② 步通过，微信/支付宝里的卡才会真的出现在屏幕上。\n\n" +
+                    "① 前台测试：现在直接弹一张卡，3 秒后自动消失。\n\n" +
+                    "② 后台测试：先给你 5 秒切到微信（或桌面），然后我再弹一张 —— " +
+                    "这才是「转账、付款时弹卡」的真实场景。"
+            )
+            .setPositiveButton("① 前台测试") { _, _ -> runProbe(0L) }
+            .setNeutralButton("② 后台测试") { _, _ -> runProbe(5000L) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun runProbe(delayMs: Long) {
+        if (delayMs > 0L) {
+            Toast.makeText(c, "5 秒后在屏幕上弹测试卡，请现在切到微信或桌面", Toast.LENGTH_LONG).show()
+        }
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            buildProbeCard(delayMs > 0L)
+        }, delayMs)
+    }
+
+    /**
+     * v2.42：与 [OverlayUi] 的记账卡走**同一套窗口参数**建一张样例卡，并在 500ms 后自检。
+     *
+     * 自检这一步是本版的核心：HyperOS 的「后台弹出界面」被拒时，addView 既不抛异常、
+     * 宽度也可能是正常值，窗口只是不被系统显示 —— 只看 addView 有没有报错永远发现不了。
+     * 所以这里按 `isShown`（view 附着 + 窗口可见）判定，把结论写进 card_state，
+     * 主界面橙条就能直接告诉用户「卡片窗口被系统隐藏了」。
+     *
+     * @param background true = 后台场景（用户已切走），失败时提示指向「后台弹出界面」
+     */
+    private fun buildProbeCard(background: Boolean) {
+        val tag = if (background) "后台" else "前台"
+        val prev = android.os.Handler(android.os.Looper.getMainLooper())
+        val wm = c.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        val metrics = c.resources.displayMetrics
+
+        val box = Ui.card(c, 16f, 14f)
+        box.setBackground(Ui.round(c, Ui.CARD, 18f, 1f, Ui.LINE))
+        box.addView(Ui.tv(c, "弹窗测试成功（$tag）", 15f, Ui.TEXT, true), Ui.lp(Ui.WC, Ui.WC))
+        box.addView(
+            Ui.tv(
+                c,
+                if (background) "看到这说明「后台弹出界面」已生效，记账卡能在这里弹出来"
+                else "看到这说明「显示悬浮窗」已生效",
+                12f,
+                Ui.SUB
+            ),
+            Ui.lp(Ui.WC, Ui.WC)
+        )
+        val holder = android.widget.FrameLayout(c)
+        holder.setPadding(Ui.dp(c, 14f), 0, Ui.dp(c, 14f), 0)
+        holder.addView(
+            box,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        // 与 OverlayUi.buildCard 完全一致的窗口参数：宽度用明确像素、TYPE_APPLICATION_OVERLAY、
+        // FLAG_NOT_FOCUSABLE、底部对齐、距底 96dp。参数不一致就测不出真实问题。
+        val winW = metrics.widthPixels - Ui.dp(c, 28f)
+        val p = android.view.WindowManager.LayoutParams(
+            winW,
+            android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        p.gravity = Gravity.BOTTOM
+        p.y = Ui.dp(c, 96f)
+
         try {
-            val wm = act.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-            val box = Ui.card(c, 16f, 14f)
-            box.setBackground(Ui.round(c, Ui.CARD, 18f, 1f, Ui.LINE))
-            box.addView(Ui.tv(c, "弹窗测试成功", 15f, Ui.TEXT, true), Ui.lp(Ui.WC, Ui.WC))
-            box.addView(
-                Ui.tv(c, "看到这个卡片说明悬浮窗可用，抓取后就能自动弹", 12f, Ui.SUB),
-                Ui.lp(Ui.WC, Ui.WC)
-            )
-            val holder = android.widget.FrameLayout(c)
-            holder.setPadding(Ui.dp(c, 16f), 0, Ui.dp(c, 16f), 0)
-            holder.addView(
-                box,
-                android.widget.FrameLayout.LayoutParams(
-                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-            val p = android.view.WindowManager.LayoutParams(
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.WRAP_CONTENT,
-                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                android.graphics.PixelFormat.TRANSLUCENT
-            )
-            p.gravity = Gravity.BOTTOM
-            p.y = Ui.dp(c, 120f)
             wm.addView(holder, p)
-            Toast.makeText(c, "已弹出，3 秒后自动消失", Toast.LENGTH_SHORT).show()
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                try {
-                    wm.removeView(holder)
-                } catch (_: Exception) {
-                }
-            }, 3500)
         } catch (e: Exception) {
-            Toast.makeText(c, "弹窗失败：" + e.javaClass.simpleName, Toast.LENGTH_LONG).show()
+            markCardState("addview:" + e.javaClass.simpleName)
+            Diag.log(act, "弹窗自检（$tag）addView 失败：${e.javaClass.simpleName}")
+            Toast.makeText(c, "$tag 弹窗失败：${e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        prev.postDelayed({
+            val shown = try { holder.isShown } catch (_: Exception) { false }
+            val w = holder.width
+            val h = holder.height
+            when {
+                w <= 0 -> {
+                    markCardState("zero")
+                    Diag.log(act, "弹窗自检（$tag）addView 成功但宽为 0（${w}x$h）→ 窗口被系统拦掉")
+                    Toast.makeText(
+                        c,
+                        "$tag 弹窗被系统拦掉（宽 0）：请开「后台弹出界面」",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                !shown -> {
+                    markCardState("hidden")
+                    Diag.log(act, "弹窗自检（$tag）addView 成功、尺寸 ${w}x$h，但 isShown=false → 窗口被系统隐藏")
+                    Toast.makeText(
+                        c,
+                        "$tag 弹窗被系统隐藏：请到「其他权限」开「后台弹出界面」",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                else -> {
+                    markCardState("ok")
+                    Diag.log(act, "弹窗自检（$tag）成功，尺寸 ${w}x$h，isShown=true")
+                }
+            }
+            prev.postDelayed({
+                try { wm.removeView(holder) } catch (_: Exception) {}
+                act.refreshWarn()
+            }, if (background) 5000L else 3000L)
+        }, 500L)
+    }
+
+    /** 与 OverlayUi 写同一组键，主界面读的是这个 */
+    private fun markCardState(v: String) {
+        try {
+            act.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
+                .putString("card_state", v)
+                .putLong("card_state_at", System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {
         }
     }
 
