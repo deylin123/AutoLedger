@@ -73,6 +73,26 @@ object OverlayUi {
     /** 卡片自动收起时间 */
     private const val CARD_AUTO_HIDE_MS = 45_000L
 
+    /**
+     * v2.41：新卡片的**最小存活时间** —— 建窗后这段时间内一律不接受「换页收卡」。
+     *
+     * 修的是「微信转账：顶部通知有了、待确认也记了，屏幕底部却一张卡都没有」。
+     *
+     * 真相链条：微信是单 Activity 多窗口。转账结果页是自绘页，无障碍只能读到「微信支付」
+     * 一个标题，所以卡片是 OCR 通道弹出来的；但**同一时刻底层聊天窗口也在 windows 里**，
+     * 而 [bindPage] 是拿 `PayApps.pageTime()` 判「换页」的 —— `pageTime` 第 ③ 支
+     * 「相邻日期节点 + 时间节点」会把群聊里那条「11月24日 / 21:33」解析成一个时间，
+     * 与这张卡片的页面时间不相同，于是下一拍（700ms 后）就把它当成「换到另一笔了」收掉。
+     * 用户那边看到的就是「一闪都没有」，只剩通知栏那条提醒。
+     *
+     * 为什么付款不会这样：微信收付款页是独立页面，底层没有带日期时间的聊天窗口，
+     * `pageTime` 返回 null，[bindPage] 直接 return —— 所以「付款能弹、转账不能弹」。
+     *
+     * 6 秒的依据：页面驻留节拍器一拍 700ms，用户从看到卡片到伸手点至少需要 1~2 秒，
+     * 6 秒足够覆盖「刚弹出就被误判收掉」的窗口，且远小于 [CARD_AUTO_HIDE_MS]。
+     */
+    private const val MIN_CARD_LIFE_MS = 6_000L
+
     /** 用户点过「取消」的笔，这段时间内同金额不再弹/记 */
     private const val CANCEL_SUPPRESS_MS = 5 * 60_000L
 
@@ -122,6 +142,19 @@ object OverlayUi {
      * 读起来就是「它把两天的账搞混了」。卡片上的内容并没有错，错在它不该还在屏幕上。
      */
     private var cardPageTs = 0L
+
+    /**
+     * v2.41：这张卡是不是「截屏 OCR 通道」弹出来的。
+     *
+     * OCR 目标页（微信转账结果页这类自绘页）在无障碍树里没有页面身份，
+     * 卡片上的 pageTs 来自 OCR 文本，与底层聊天窗口解析出的时间天然不是一回事 ——
+     * 一旦拿它去跟别的窗口比「换页」，必然误收。pin 的卡片只由用户操作 /
+     * 45 秒超时 / 下一张卡覆盖来收，不被 [bindPage] 收走。
+     */
+    private var cardPinned = false
+
+    /** v2.41：建卡时刻，配合 [MIN_CARD_LIFE_MS] 做最小存活保护 */
+    private var cardAt = 0L
 
     /** v2.30：当前卡片对应的记录 id，备注保存后据此实时刷新卡片文案 */
     private var cardRecId = -1L
@@ -204,6 +237,8 @@ object OverlayUi {
         card = null
         cardPageTs = 0L
         cardRecId = -1L
+        cardPinned = false
+        cardAt = 0L
     }
 
     /**
@@ -221,6 +256,27 @@ object OverlayUi {
         val owned = cardPageTs
         if (owned <= 0L || owned == pageTs) return
         val v = card ?: run { cardPageTs = 0L; return }
+        // v2.41：OCR 通道的卡片不接受「换页收卡」。
+        // 它所属的页面（微信转账结果页）在无障碍树里没有身份，卡片时间来自 OCR 文本；
+        // 拿它去跟底层聊天窗口解析出的时间比，必然误判 —— 这正是「顶部有通知、
+        // 底部一张卡都没有」的成因（详见 MIN_CARD_LIFE_MS 注释）。
+        if (cardPinned) {
+            Diag.logCard(
+                v.context,
+                "本窗口时间 ${fmtTs(pageTs)} 与 OCR 卡（${fmtTs(owned)}）不同，但该卡来自截屏 OCR 通道，保留不收"
+            )
+            return
+        }
+        // v2.41：最小存活保护 —— 刚弹出来的卡片先让用户看几秒，再接受换页判定。
+        val age = System.currentTimeMillis() - cardAt
+        if (cardAt > 0L && age < MIN_CARD_LIFE_MS) {
+            Diag.logCard(
+                v.context,
+                "页面已换成另一笔（旧页 ${fmtTs(owned)} → 本页 ${fmtTs(pageTs)}），但卡片才建 ${age}ms，" +
+                    "未到最小存活 ${MIN_CARD_LIFE_MS}ms，先保留"
+            )
+            return
+        }
         Diag.logCard(
             v.context,
             "页面已换成另一笔（旧页 ${fmtTs(owned)} → 本页 ${fmtTs(pageTs)}），立即收掉旧卡"
@@ -237,6 +293,8 @@ object OverlayUi {
      *
      * @param recorded 非空表示这一笔已经在账本里，卡片走「已记录」样式，不写库、不重复响铃。
      * @param pageTs 本页账单的付款时间（0 = 无/通知通道），用于「换页就收掉旧卡」。
+     * @param pin v2.41：true 表示这张卡来自「截屏 OCR 通道」，其页面在无障碍树里没有身份，
+     *            不受「换页收卡」约束（否则微信转账卡会被底层聊天窗口的时间误收）。
      * @return true 表示本次已处理（含「命中去重被跳过」）
      */
     fun show(
@@ -248,7 +306,8 @@ object OverlayUi {
         income: Boolean,
         recorded: RecordedInfo? = null,
         pageTs: Long = 0L,
-        remembered: Boolean = false
+        remembered: Boolean = false,
+        pin: Boolean = false
     ): Boolean {
         val app = ctx.applicationContext
         val now = System.currentTimeMillis()
@@ -296,7 +355,7 @@ object OverlayUi {
         // 通道二：悬浮卡片。addView 必须在主线程。
         handler.post {
             try {
-                buildCard(app, id, amount, note, cat, income, recorded, pageTs, remembered)
+                buildCard(app, id, amount, note, cat, income, recorded, pageTs, remembered, pin)
             } catch (e: Exception) {
                 Diag.logCard(app, "悬浮卡片构建失败（${e.javaClass.simpleName}）")
             }
@@ -313,7 +372,8 @@ object OverlayUi {
         income: Boolean,
         recorded: RecordedInfo?,
         pageTs: Long,
-        remembered: Boolean
+        remembered: Boolean,
+        pin: Boolean = false
     ) {
         if (!Settings.canDrawOverlays(app)) {
             // v2.38：把卡片通道的真实结局落盘，主界面权限条据此提示。
@@ -508,8 +568,16 @@ object OverlayUi {
             cardRecId = id
             // v2.25：记住这张卡属于哪一页（页面付款时间），页面一换就被 bindPage 收掉
             cardPageTs = if (pageTs > 0L) pageTs else 0L
+            // v2.41：记录「这张卡来自哪条通道」与建卡时刻。
+            // pin 的卡（截屏 OCR 通道）不被 bindPage 收；所有卡都受最小存活保护。
+            cardPinned = pin
+            cardAt = System.currentTimeMillis()
             markCardState(app, "ok")
-            Diag.logCard(app, "卡片已 addView（通知同时已发）")
+            Diag.logCard(
+                app,
+                "卡片已 addView（通知同时已发）" +
+                    if (pin) "｜来自截屏 OCR 通道，已锁定、不接受换页收卡" else ""
+            )
         } catch (e: Exception) {
             markCardState(app, "addview:" + e.javaClass.simpleName)
             Diag.logCard(

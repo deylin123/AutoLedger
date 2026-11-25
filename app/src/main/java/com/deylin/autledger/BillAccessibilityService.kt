@@ -238,7 +238,9 @@ class BillAccessibilityService : AccessibilityService() {
                 Diag.log(this, "OCR 命中目标结算页，送入现有识别链路（${lines.size} 行）")
                 // 复用已验证的 scan()：金额/方向/商户/查重/入库/弹卡全部走原链路。
                 // pkg 固定微信，app 取微信登记项。
-                scan("com.tencent.mm", texts, PayApps.of("com.tencent.mm"))
+                // v2.41：fromOcr = true —— 这一页在无障碍树里没有身份，卡片必须 pin，
+                // 否则会被底层聊天窗口解析出的「页面时间」当成换页立刻收掉（详见 OverlayUi.MIN_CARD_LIFE_MS）。
+                scan("com.tencent.mm", texts, PayApps.of("com.tencent.mm"), fromOcr = true)
             } else {
                 Diag.log(this, "OCR 结果未命中目标结算页形态，忽略（${lines.size} 行）")
             }
@@ -1046,7 +1048,7 @@ class BillAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun scan(pkg: String, texts: ArrayList<String>, app: PayApps.App?): Boolean {
+    private fun scan(pkg: String, texts: ArrayList<String>, app: PayApps.App?, fromOcr: Boolean = false): Boolean {
         val appName = app?.name ?: appLabel(pkg)
         val joined = texts.joinToString("|")
 
@@ -1211,7 +1213,7 @@ class BillAccessibilityService : AccessibilityService() {
                     // 用户事后打开这笔的账单详情 —— 这是他主动打开的核对页，必须把确认卡片弹出来，
                     // 否则那笔待确认就一直挂着没人管，用户看到的就是「打开账单详情什么反应都没有」。
                     // showCard 内部按 lastCardId 去重：支付现场的连续重扫不会因此反复闪卡。
-                    showCard(prev.id, amount, merged, cat, income, pageTs, remembered != null)
+                    showCard(prev.id, amount, merged, cat, income, pageTs, remembered != null, fromOcr)
                     return true
                 }
             }
@@ -1249,7 +1251,7 @@ class BillAccessibilityService : AccessibilityService() {
                 this,
                 "$appName ¥$amount $note → 已存为待确认（${if (income) "收入" else "支出"}·$cat，金额强度 ${amt.score}）"
             )
-            showCard(id, amount, note, cat, income, pageTs, remembered != null)
+            showCard(id, amount, note, cat, income, pageTs, remembered != null, fromOcr)
             return true
         } finally {
             db.close()
@@ -1457,8 +1459,10 @@ class BillAccessibilityService : AccessibilityService() {
      * 剥离原因：卡片窗口是 TYPE_APPLICATION_OVERLAY，只需要悬浮窗权限，技术上不依赖无障碍服务。
      * 旧版写在这里，导致无障碍一关（银行 App 要求）两条通道都不弹卡。
      */
-    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, pageTs: Long? = null, remembered: Boolean = false) {
-        OverlayUi.show(this, id, amount, note, cat, income, null, pageTs ?: 0L, remembered)
+    private fun showCard(id: Long, amount: Double, note: String, cat: String, income: Boolean, pageTs: Long? = null, remembered: Boolean = false, fromOcr: Boolean = false) {
+        // v2.41：fromOcr 的卡来自「自绘页截屏 OCR」，其页面在无障碍树里没有身份，
+        // 必须 pin —— 否则底层聊天窗口的日期时间会让 bindPage 把它当换页收掉。
+        OverlayUi.show(this, id, amount, note, cat, income, null, pageTs ?: 0L, remembered, pin = fromOcr)
     }
 
     override fun onInterrupt() {}
