@@ -248,7 +248,24 @@ class MainActivity : Activity() {
      */
     fun cardBlockedHint(): String {
         val s = cardState()
-        return when {
+        // v2.45：把「什么时候记录的」写进文案。
+        // 2026-11-25 12:00 用户看到橙条说卡片被拦住，但卡片其实弹得出来 —— 那是几十分钟前的
+        // 一条失败记录（或一次误判的 hidden）在 TTL 内被一直展示。没有时间，用户无法判断
+        // 这是「现在有问题」还是「历史记录」，只能被误导去翻权限设置。
+        val at = try {
+            getSharedPreferences("cfg", MODE_PRIVATE).getLong("card_state_at", 0L)
+        } catch (_: Exception) {
+            0L
+        }
+        val agoMin = if (at > 0L) ((System.currentTimeMillis() - at) / 60_000L).toInt() else -1
+        val whenText = when {
+            agoMin < 0 -> ""
+            agoMin <= 0 -> "（刚刚记录）"
+            agoMin < 60 -> "（${agoMin} 分钟前记录）"
+            else -> "（${agoMin / 60} 小时前记录）"
+        }
+        val tail = if (agoMin >= 5) "；若最近能正常弹卡，这条可忽略" else ""
+        val base = when {
             s.startsWith("addview:") ->
                 "悬浮卡片建窗失败（${s.removePrefix("addview:")}）：点此开启「显示在其他应用上层 / 后台弹出界面」"
             s == "hidden" ->
@@ -258,6 +275,7 @@ class MainActivity : Activity() {
             else ->
                 "悬浮卡片被系统拦住了（通知仍可确认记账）：点此开启「显示在其他应用上层 / 后台弹出界面」"
         }
+        return base + whenText + tail
     }
 
     fun cardBlocked(): Boolean {

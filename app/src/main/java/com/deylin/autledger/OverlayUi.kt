@@ -604,35 +604,49 @@ object OverlayUi {
         }
         // 记录真实渲染尺寸：万一又变成一个小块，这行日志能直接看出宽高异常
         v.postDelayed({
-            // v2.38：addView 没抛异常但宽为 0，是 MIUI「后台弹出界面」被拒的典型表现 ——
-            // 代码以为成功了，用户什么都没看到。这种情况单独落一个 zero 状态，
-            // 权限条才能提示到点子上（否则用户会以为识别没工作）。
-            // v2.42：补上比「宽为 0」更隐蔽的一种 —— addView 成功、宽高都正常，
-            // 但窗口被系统隐藏（isShown=false）。HyperOS 上「后台弹出界面」被拒时就是这样：
-            // 日志里写着「卡片已 addView」，主界面橙条不亮（因为状态是 ok），
-            // 而用户屏幕上什么都没有。这正是「转账只能在吸顶处出现、底部没卡」的最后一种可能。
-            val shown = try { v.isShown } catch (_: Exception) { true }
-            if (v.width == 0) {
-                markCardState(app, "zero")
-                // v2.40：宽为 0 = 窗口被系统吞了（MIUI/HyperOS「后台弹出界面」被拒的典型表现），
-                // 代码以为成功、用户什么都看不到 —— 必须把原因写进通知，否则又是「只有通知没有卡片」。
-                if (recorded == null) {
-                    notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
+            // v2.45：**先确认这张卡还是当前这张**。
+            //
+            // 2026-11-25 12:00 用户报「首页出现橙条写着悬浮卡片被拦住」，但卡片其实弹出来了。
+            // 原因就在这里：这张 v 可能在 500ms 内被 removeCard（用户点确认 / 换页 / 被新卡顶掉），
+            // 此时 v 已 detach，isShown 恒为 false → 写入 hidden → 主界面橙条长期误报
+            // 「卡片窗口被系统隐藏」，而真相是它正常显示过、正常收起了。
+            // 只有「现在还挂在窗口上的就是这张卡」时，可见性结论才有意义。
+            if (card !== v) {
+                Diag.logCard(
+                    app,
+                    "卡片在建窗自检前已收起（正常换页/确认），不写入可见性结论"
+                )
+            } else {
+                // v2.38：addView 没抛异常但宽为 0，是 MIUI「后台弹出界面」被拒的典型表现 ——
+                // 代码以为成功了，用户什么都没看到。这种情况单独落一个 zero 状态，
+                // 权限条才能提示到点子上（否则用户会以为识别没工作）。
+                // v2.42：补上比「宽为 0」更隐蔽的一种 —— addView 成功、宽高都正常，
+                // 但窗口被系统隐藏（isShown=false）。HyperOS 上「后台弹出界面」被拒时就是这样：
+                // 日志里写着「卡片已 addView」，主界面橙条不亮（因为状态是 ok），
+                // 而用户屏幕上什么都没有。这正是「转账只能在吸顶处出现、底部没卡」的最后一种可能。
+                val shown = try { v.isShown } catch (_: Exception) { true }
+                if (v.width == 0) {
+                    markCardState(app, "zero")
+                    // v2.40：宽为 0 = 窗口被系统吞了（MIUI/HyperOS「后台弹出界面」被拒的典型表现），
+                    // 代码以为成功、用户什么都看不到 —— 必须把原因写进通知，否则又是「只有通知没有卡片」。
+                    if (recorded == null) {
+                        notifyPending(app, id, amount, note, cat, income, "卡片被系统拦住：请开「后台弹出界面」")
+                    }
+                } else if (!shown) {
+                    markCardState(app, "hidden")
+                    if (recorded == null) {
+                        notifyPending(app, id, amount, note, cat, income, "卡片窗口被系统隐藏：请开「后台弹出界面」")
+                    }
                 }
-            } else if (!shown) {
-                markCardState(app, "hidden")
-                if (recorded == null) {
-                    notifyPending(app, id, amount, note, cat, income, "卡片窗口被系统隐藏：请开「后台弹出界面」")
-                }
+                Diag.logCard(
+                    app,
+                    "卡片尺寸 " + v.width + "x" + v.height +
+                        "，屏幕宽 " + metrics.widthPixels +
+                        "，可见=" + shown +
+                        (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了"
+                        else if (!shown) " ← 建窗成功但窗口不可见（后台弹出界面被拒）" else "")
+                )
             }
-            Diag.logCard(
-                app,
-                "卡片尺寸 " + v.width + "x" + v.height +
-                    "，屏幕宽 " + metrics.widthPixels +
-                    "，可见=" + shown +
-                    (if (v.width == 0) " ← 宽为 0，窗口被系统拦掉了"
-                    else if (!shown) " ← 建窗成功但窗口不可见（后台弹出界面被拒）" else "")
-            )
         }, 500)
         handler.postDelayed(hideTask, CARD_AUTO_HIDE_MS)
     }

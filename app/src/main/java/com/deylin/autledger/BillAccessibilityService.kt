@@ -374,7 +374,9 @@ class BillAccessibilityService : AccessibilityService() {
             if (paid && PayApps.findAmount(allTexts) == null && allTexts.size <= 12) return "alipay_done"
             if (allTexts.size < 2) {
                 val recent = System.currentTimeMillis() - lastAlipayHintAt <= PAY_HINT_TTL_MS
-                return if (recent) "blank${allTexts.size}" else null
+                // 前缀必须是 alipay_ —— 服务层按 ocrWhy.startsWith("alipay_") 判「走快速重试档」，
+                // 这里若复用微信的 "blank" 前缀，支付宝空白页就只能用 4 秒间隔，等于慢半拍。
+                return if (recent) "alipay_blank${allTexts.size}" else null
             }
             return null
         }
